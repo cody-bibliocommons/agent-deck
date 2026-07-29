@@ -9,10 +9,10 @@ import (
 // Registry.Match() (and the legacy detectTool() switch) walk.
 var canonicalBuiltins = []string{
 	"claude", "opencode", "gemini", "codex", "pi",
-	"copilot", "crush", "cursor", "hermes", "aider", "shell",
+	"copilot", "crush", "cursor", "hermes", "kiro-cli", "aider", "shell",
 }
 
-func TestRegistry_AllReturnsCanonical11(t *testing.T) {
+func TestRegistry_AllReturnsCanonicalBuiltins(t *testing.T) {
 	all := Init(nil).All()
 	if len(all) != len(canonicalBuiltins) {
 		t.Fatalf("All() returned %d entries, want %d", len(all), len(canonicalBuiltins))

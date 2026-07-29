@@ -60,6 +60,95 @@ func TestDefaultRawPatterns_Gemini(t *testing.T) {
 	}
 }
 
+// TestDefaultRawPatterns_KiroCLI asserts the Kiro CLI busy patterns match the
+// real pane text captured from a live `kiro-cli chat` session, and do NOT match
+// idle/prose content.
+func TestDefaultRawPatterns_KiroCLI(t *testing.T) {
+	raw := DefaultRawPatterns("kiro-cli")
+	if raw == nil {
+		t.Fatal("expected non-nil for kiro-cli")
+	}
+	if len(raw.BusyPatterns) == 0 {
+		t.Fatal("kiro-cli should have busy patterns")
+	}
+
+	resolved, err := CompilePatterns(raw)
+	if err != nil {
+		t.Fatalf("CompilePatterns: %v", err)
+	}
+
+	matches := func(content string) bool {
+		lower := strings.ToLower(content)
+		for _, s := range resolved.BusyStrings {
+			if strings.Contains(lower, strings.ToLower(s)) {
+				return true
+			}
+		}
+		for _, re := range resolved.BusyRegexps {
+			if re.MatchString(content) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Verbatim captures from a live session.
+	busy := []string{
+		"⣹ Thinking... (esc to cancel)",
+		"Kiro is working · Type to steer · Ctrl+S to queue",
+		"⣾ Thinking...",
+	}
+	for _, c := range busy {
+		if !matches(c) {
+			t.Errorf("busy content not detected: %q", c)
+		}
+	}
+
+	// Must NOT be treated as busy: prose mentioning the word, the idle pane, and
+	// an idle input box (the placeholder must never read as busy).
+	notBusy := []string{
+		"I was thinking about the architecture here.",
+		"Here is the answer to your question.",
+		"ask a question or describe a task ↵",
+	}
+	for _, c := range notBusy {
+		if matches(c) {
+			t.Errorf("non-busy content falsely detected as busy: %q", c)
+		}
+	}
+
+	// --- waiting-for-input detection (idle input box placeholder) ---
+	if len(raw.PromptPatterns) == 0 {
+		t.Fatal("kiro-cli should have prompt patterns")
+	}
+	promptMatches := func(content string) bool {
+		lower := strings.ToLower(content)
+		for _, s := range resolved.PromptStrings {
+			if strings.Contains(lower, strings.ToLower(s)) {
+				return true
+			}
+		}
+		for _, re := range resolved.PromptRegexps {
+			if re.MatchString(content) {
+				return true
+			}
+		}
+		return false
+	}
+	if !promptMatches("ask a question or describe a task ↵") {
+		t.Error("idle input box placeholder not detected as waiting")
+	}
+	// Case-insensitivity (the pane may capitalise differently across versions).
+	if !promptMatches("Ask a question or describe a task") {
+		t.Error("capitalised placeholder not detected as waiting")
+	}
+	// Busy is authoritative: if both appear during a redraw, busy must still win.
+	both := "⣹ Thinking... (esc to cancel)\nask a question or describe a task ↵"
+	if !matches(both) {
+		t.Error("busy marker must still be detected when placeholder is also present")
+	}
+}
+
 func TestDefaultRawPatterns_OpenCode(t *testing.T) {
 	raw := DefaultRawPatterns("opencode")
 	if raw == nil {
