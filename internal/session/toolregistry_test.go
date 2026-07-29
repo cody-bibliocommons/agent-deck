@@ -9,7 +9,7 @@ import (
 // Registry.Match() (and the legacy detectTool() switch) walk.
 var canonicalBuiltins = []string{
 	"claude", "opencode", "gemini", "codex", "pi",
-	"copilot", "crush", "cursor", "hermes", "deepseek", "aider", "shell",
+	"copilot", "crush", "cursor", "hermes", "deepseek", "kiro-cli", "aider", "shell",
 }
 
 func TestRegistry_AllReturnsCanonicalBuiltins(t *testing.T) {

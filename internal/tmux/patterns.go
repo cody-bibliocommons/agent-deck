@@ -200,6 +200,38 @@ func DefaultRawPatterns(toolName string) *RawPatterns {
 				"Switch modes",
 			},
 		}
+	case "kiro-cli":
+		// Kiro CLI (AWS). Busy strings captured from a live session:
+		//   main window: "⣹ Thinking... (esc to cancel)"
+		//   prompt bar:  "Kiro is working · Type to steer · Ctrl+S to queue"
+		// "Type to steer" and "Ctrl+S to queue" are only offered while the agent
+		// is working, so they are reliable busy markers alongside the explicit
+		// "Kiro is working".
+		//
+		// The spinner uses 8-dot braille (⣹ = U+28F9), which is OUTSIDE the
+		// 6-dot set in defaultSpinnerChars(), so match the whole braille block
+		// rather than enumerating frames. "Thinking" is deliberately anchored to
+		// a leading spinner instead of being a bare substring, so model prose
+		// containing the word cannot false-positive.
+		//
+		// Waiting state is the idle input box placeholder, captured verbatim:
+		//   "ask a question or describe a task ↵"
+		// The placeholder only renders while the box is empty and accepting input.
+		// Busy patterns are evaluated BEFORE prompt patterns (busy is
+		// authoritative), so a placeholder lingering during a redraw cannot
+		// mask a working agent.
+		return &RawPatterns{
+			BusyPatterns: []string{
+				"Kiro is working",
+				"esc to cancel",
+				"Type to steer",
+				"Ctrl+S to queue",
+				`re:(?m)^\s*[\x{2800}-\x{28FF}]\s*Thinking`,
+			},
+			PromptPatterns: []string{
+				"ask a question or describe a task",
+			},
+		}
 	case "shell":
 		return &RawPatterns{
 			PromptPatterns: []string{"$ ", "# ", "% "},

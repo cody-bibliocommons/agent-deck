@@ -14141,6 +14141,11 @@ func createSessionTool(command string) (string, string) {
 		command = session.GetToolCommand("cursor")
 	case "hermes":
 		tool = "hermes"
+	case "kiro-cli":
+		tool = "kiro-cli"
+		// Bare `kiro-cli` opens a help/menu screen, so resolve the real
+		// invocation (defaults to `kiro-cli chat`, honors [kiro-cli].command).
+		command = session.GetToolCommand("kiro-cli")
 	default:
 		if toolDef := session.GetToolDef(command); toolDef != nil {
 			tool = command
@@ -14391,9 +14396,13 @@ func (h *Home) quickCreateSession() tea.Cmd {
 		tool = "claude"
 	}
 	if command == "" && tool != "shell" {
-		if tool == "cursor" {
+		switch tool {
+		case "cursor":
 			command = session.GetToolCommand("cursor")
-		} else {
+		case "kiro-cli":
+			// Bare `kiro-cli` is a menu, not an agent.
+			command = session.GetToolCommand("kiro-cli")
+		default:
 			command = tool
 		}
 	}
@@ -20100,6 +20109,13 @@ func (h *Home) renderLaunchingState(inst *session.Instance, width int, startTime
 			toolDesc = "Resuming Cursor session..."
 		} else {
 			toolDesc = "Starting Cursor Agent..."
+		}
+	case "kiro-cli":
+		toolName = "Kiro CLI"
+		if isResuming {
+			toolDesc = "Resuming Kiro CLI session..."
+		} else {
+			toolDesc = "Starting Kiro CLI..."
 		}
 	default:
 		toolName = "Shell"
