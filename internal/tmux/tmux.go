@@ -748,7 +748,7 @@ func SupportsHyperlinks() bool {
 }
 
 // Tool detection patterns (used by DetectTool for initial tool identification)
-var toolDetectionOrder = []string{"claude", "gemini", "opencode", "codex", "copilot", "crush", "cursor", "hermes", "deepseek", "pi"}
+var toolDetectionOrder = []string{"claude", "gemini", "opencode", "codex", "copilot", "crush", "cursor", "hermes", "deepseek", "kiro-cli", "pi"}
 
 var toolDetectionPatterns = map[string][]*regexp.Regexp{
 	"claude": {
@@ -811,6 +811,14 @@ var toolDetectionPatterns = map[string][]*regexp.Regexp{
 		regexp.MustCompile(`(?i)\bcursor\s+agent\b`),
 		regexp.MustCompile(`(?i)cursor\s+cli\b`),
 	},
+	"kiro-cli": {
+		// Kiro CLI (AWS). Its banner renders as "kiro-cli (Kiro CLI)" and the
+		// chat binary reports itself as kiro-cli-chat. Anchor on the hyphenated
+		// binary name and the "Kiro CLI" product string rather than bare "kiro",
+		// which would false-match paths like ~/.kiro/ in a shell prompt.
+		regexp.MustCompile(`(?i)\bkiro-cli\b`),
+		regexp.MustCompile(`(?i)\bkiro\s+cli\b`),
+	},
 }
 
 func detectToolFromCommand(command string) string {
@@ -846,6 +854,8 @@ func detectToolFromCommand(command string) string {
 			// DeepSeek Harness. The binary is `dsh`; the agent-deck tool is
 			// named for the vendor.
 			return "deepseek"
+		case "kiro-cli", "kiro-cli-chat", "kiro":
+			return "kiro-cli"
 		case "pi":
 			return "pi"
 		}
@@ -881,6 +891,8 @@ func detectToolFromCommand(command string) string {
 		// `DSH_HOME=… dsh` env prefix agent-deck itself emits), the documented
 		// npx spelling, or a dsh subcommand/launcher flag right after it.
 		return "deepseek"
+	case strings.Contains(cmdLower, "kiro-cli") || strings.Contains(cmdLower, "kiro "):
+		return "kiro-cli"
 	case strings.Contains(cmdLower, " pi ") || strings.HasPrefix(cmdLower, "pi "):
 		return "pi"
 	default:

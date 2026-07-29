@@ -157,6 +157,8 @@ type UserConfig struct {
 
 	// DeepSeek defines DeepSeek Harness (`dsh`) integration settings
 	DeepSeek DeepSeekSettings `toml:"deepseek,omitempty"`
+	// Kiro defines Kiro CLI (AWS) integration settings
+	Kiro KiroSettings `toml:"kiro-cli,omitempty"`
 
 	// Worktree defines git worktree preferences
 	Worktree WorktreeSettings `toml:"worktree,omitempty"`
@@ -2213,6 +2215,27 @@ type CrushSettings struct {
 	YoloMode bool `toml:"yolo_mode,omitempty"`
 }
 
+// KiroSettings contains Kiro CLI (AWS) integration settings.
+type KiroSettings struct {
+	// Command overrides the default binary/invocation for Kiro CLI sessions.
+	// Supports flags (e.g. "kiro-cli chat --model foo"). Default: "kiro-cli chat".
+	// NOTE: bare `kiro-cli` opens a help/menu screen rather than an agent, so a
+	// custom command should normally keep the `chat` subcommand.
+	Command string `toml:"command,omitempty"`
+
+	// EnvFile is a .env file specific to Kiro CLI sessions (sourced before the
+	// command runs, like [gemini].env_file). Optional.
+	EnvFile string `toml:"env_file,omitempty"`
+
+	// Agent passes --agent <name> to start chat with a specific agent/context
+	// profile. Optional.
+	Agent string `toml:"agent,omitempty"`
+
+	// TrustAllTools enables --trust-all-tools (run tools without confirmation
+	// prompts). Default: false
+	TrustAllTools bool `toml:"trust_all_tools,omitempty"`
+}
+
 // WorktreeSettings contains git worktree preferences.
 type WorktreeSettings struct {
 	// AutoCleanup: remove worktree when session is deleted (default: true, nil = true)
@@ -3720,6 +3743,13 @@ func GetToolCommand(toolName string) string {
 			return config.Cursor.Command
 		}
 		return DefaultCursorCommand()
+	case "kiro-cli":
+		if config.Kiro.Command != "" {
+			return config.Kiro.Command
+		}
+		// Bare `kiro-cli` is a help/menu screen, not an agent — default the
+		// tool command to the `chat` subcommand.
+		return kiroDefaultCommand
 	}
 	return toolName
 }
