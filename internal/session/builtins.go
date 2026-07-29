@@ -64,6 +64,13 @@ func builtinTools() []builtinTool {
 		{Name: "crush", Icon: "💘", detectSubstrings: []string{"crush"}},
 		{Name: "cursor", Icon: "📝", detectSubstrings: []string{"cursor"}},
 		{Name: "hermes", Icon: "☤", detectSubstrings: []string{"hermes"}},
+		// Kiro CLI (AWS). The canonical name is the real binary "kiro-cli",
+		// NOT "kiro": runInstalledProbe resolves a built-in by its NAME via
+		// exec.LookPath, and "kiro" is commonly only a shell alias, which
+		// LookPath cannot see. Naming it "kiro" would make
+		// show_only_installed_tools hide it on hosts where it IS installed.
+		// The "kiro" substring is still matched so aliased commands resolve.
+		{Name: "kiro-cli", Icon: "👻", detectSubstrings: []string{"kiro-cli", "kiro"}},
 		{Name: "aider", Icon: "🐚"},
 		{Name: "shell", Icon: "🐚"},
 	}

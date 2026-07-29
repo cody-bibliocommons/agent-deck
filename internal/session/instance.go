@@ -3886,6 +3886,8 @@ func (i *Instance) Start() error {
 		// until the user types.
 		i.seedHermesHookBaseline()
 		command = i.buildHermesCommand(i.Command)
+	case i.Tool == "kiro-cli":
+		command = i.buildKiroCommand(i.Command, false)
 	default:
 		// Check if this is a custom tool with session resume config
 		if toolDef := GetToolDef(i.Tool); toolDef != nil {
@@ -4173,6 +4175,8 @@ func (i *Instance) StartWithMessage(message string) error {
 		// until the user types.
 		i.seedHermesHookBaseline()
 		command = i.buildHermesCommand(i.Command)
+	case i.Tool == "kiro-cli":
+		command = i.buildKiroCommand(i.Command, false)
 	default:
 		// Check if this is a custom tool with session resume config
 		if toolDef := GetToolDef(i.Tool); toolDef != nil {
@@ -7545,6 +7549,11 @@ func (i *Instance) restart(env map[string]string) error {
 			command = i.buildCrushCommand(i.Command)
 		case i.Tool == "cursor":
 			command = i.buildCursorCommand(i.Command, true)
+		case i.Tool == "kiro-cli":
+			// Restart resumes the most recent conversation for this directory
+			// via `--resume` (kiro-cli scopes sessions by cwd, so no stored
+			// session ID is needed). Mirrors the cursor arm above.
+			command = i.buildKiroCommand(i.Command, true)
 		default:
 			// Check if this is a custom tool with session resume config
 			if toolDef := GetToolDef(i.Tool); toolDef != nil {

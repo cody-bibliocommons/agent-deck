@@ -54,7 +54,7 @@ func NewSetupWizard() *SetupWizard {
 		visible:             false,
 		complete:            false,
 		currentStep:         0,
-		toolOptions:         []string{"claude", "gemini", "opencode", "codex", "pi", "shell", "copilot", "crush", "cursor", "hermes"},
+		toolOptions:         []string{"claude", "gemini", "opencode", "codex", "pi", "shell", "copilot", "crush", "cursor", "hermes", "kiro-cli"},
 		selectedTool:        0, // Default to Claude
 		dangerousMode:       false,
 		useDefaultConfigDir: true,
@@ -394,6 +394,7 @@ func (w *SetupWizard) View() string {
 			"crush":    "Crush - Charm's terminal-first AI coding assistant",
 			"shell":    "Shell - No AI tool (plain terminal)",
 			"cursor":   "Cursor Agent - Cursor CLI (cursor agent)",
+			"kiro-cli": "Kiro CLI - AWS agentic CLI (kiro-cli chat)",
 		}
 
 		for i, tool := range w.toolOptions {
