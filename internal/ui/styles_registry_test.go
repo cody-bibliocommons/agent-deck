@@ -34,6 +34,7 @@ func TestToolIconColor_RegistryMatchesLegacySwitch(t *testing.T) {
 		"muse":     {"🔮", ColorGreen},
 		"hermes":   {"☤", ColorYellow},
 		"deepseek": {"🐋", ColorCyan},
+		"kiro-cli": {"👻", ColorGreen},
 		"aider":    {"🐚", ColorRed},
 		"shell":    {"🐚", ColorTextDim},
 	}

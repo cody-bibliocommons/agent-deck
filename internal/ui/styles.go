@@ -534,6 +534,7 @@ func initStyles() {
 		"opencode": lipgloss.NewStyle().Foreground(ColorText),
 		"crush":    lipgloss.NewStyle().Foreground(ColorPurple),
 		"muse":     lipgloss.NewStyle().Foreground(ColorGreen),
+		"kiro-cli": lipgloss.NewStyle().Foreground(ColorGreen),
 	}
 
 	// DefaultToolStyle
@@ -622,6 +623,8 @@ func ToolIcon(tool string) string {
 		return "☤"
 	case "deepseek":
 		return "🐋"
+	case "kiro-cli":
+		return "👻"
 	case "pi":
 		return IconPi
 	case "omp":
@@ -664,6 +667,8 @@ func ToolColor(tool string) lipgloss.Color {
 		return ColorYellow // Gold for Hermes Agent
 	case "deepseek":
 		return ColorCyan // DeepSeek Harness
+	case "kiro-cli":
+		return ColorGreen // Green for AWS Kiro CLI
 	case "pi":
 		return ColorAccent
 	case "omp":

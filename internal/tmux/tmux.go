@@ -848,6 +848,8 @@ func detectToolFromCommand(command string) string {
 			// DeepSeek Harness. The binary is `dsh`; the agent-deck tool is
 			// named for the vendor.
 			return "deepseek"
+		case "kiro-cli", "kiro-cli-chat", "kiro":
+			return "kiro-cli"
 		case "pi":
 			return "pi"
 		case "omp", "oh-my-pi":
@@ -894,6 +896,8 @@ func detectToolFromCommand(command string) string {
 		// `DSH_HOME=… dsh` env prefix agent-deck itself emits), the documented
 		// npx spelling, or a dsh subcommand/launcher flag right after it.
 		return "deepseek"
+	case strings.Contains(cmdLower, "kiro-cli") || strings.Contains(cmdLower, "kiro "):
+		return "kiro-cli"
 	case strings.Contains(cmdLower, " pi ") || strings.HasPrefix(cmdLower, "pi "):
 		return "pi"
 	default:
