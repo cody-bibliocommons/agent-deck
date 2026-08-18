@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 #
-# Agent Deck Installer
-# https://github.com/asheshgoplani/agent-deck
+# Agent Deck Installer (kiro-cli fork)
+# https://github.com/cody-bibliocommons/agent-deck
+#
+# Fork of asheshgoplani/agent-deck that ships Kiro CLI (AWS) as a built-in tool.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/asheshgoplani/agent-deck/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/cody-bibliocommons/agent-deck/feat/kiro-cli-tool-v1.13.0/install.sh | bash
 #
 # Options:
 #   --name <name>       Custom binary name (default: agent-deck)
@@ -88,7 +90,7 @@ NC='\033[0m' # No Color
 BINARY_NAME="agent-deck"
 INSTALL_DIR="${HOME}/.local/bin"
 VERSION="latest"
-REPO="asheshgoplani/agent-deck"
+REPO="cody-bibliocommons/agent-deck"
 SKIP_TMUX_CONFIG=false
 SKIP_OPTIONAL_DEPS=false
 
@@ -552,12 +554,9 @@ if ! curl -fsSL "$DOWNLOAD_URL" -o "$TMP_DIR/agent-deck.tar.gz"; then
     fi
     echo ""
 
-    # Suggest Homebrew first if available (most reliable)
-    if [[ "$OS" == "darwin" ]] && command -v brew &> /dev/null; then
-        echo "Install via Homebrew instead (recommended):"
-        echo "  brew install asheshgoplani/tap/agent-deck"
-        echo ""
-    fi
+    # No Homebrew suggestion here on purpose: this fork publishes no tap, and
+    # upstream's tap (asheshgoplani/tap) installs a build WITHOUT the kiro-cli
+    # tool, which is the exact thing this fork exists to provide.
 
     echo "Or build from source:"
     echo "  git clone https://github.com/${REPO}.git"
@@ -734,7 +733,7 @@ configure_tmux() {
 $MARKER
 $VERSION_MARKER $CURRENT_VERSION
 # Added by agent-deck installer - $(date +%Y-%m-%d)
-# https://github.com/asheshgoplani/agent-deck
+# https://github.com/cody-bibliocommons/agent-deck
 
 # Terminal with true color support
 set -g default-terminal \"tmux-256color\"
