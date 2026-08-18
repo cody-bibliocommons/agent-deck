@@ -20,8 +20,13 @@ import (
 )
 
 const (
-	// GitHubRepo is the repository to check for updates
-	GitHubRepo = "asheshgoplani/agent-deck"
+	// GitHubRepo is the repository to check for updates.
+	//
+	// Repointed from upstream asheshgoplani/agent-deck to this fork so the
+	// update notice, the release URL it prints, and `agent-deck update` all
+	// resolve to builds that actually contain the kiro-cli tool. Pointing at
+	// upstream would offer users a "newer" release that silently drops it.
+	GitHubRepo = "cody-bibliocommons/agent-deck"
 
 	// CacheFileName stores the last update check result
 	CacheFileName = "update-cache.json"
