@@ -6,7 +6,7 @@
 # Fork of asheshgoplani/agent-deck that ships Kiro CLI (AWS) as a built-in tool.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/cody-bibliocommons/agent-deck/feat/kiro-cli-tool-v1.13.0/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/cody-bibliocommons/agent-deck/feat/kiro-cli-tool-v1.15.0/install.sh | bash
 #
 # Options:
 #   --name <name>       Custom binary name (default: agent-deck)
