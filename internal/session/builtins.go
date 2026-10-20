@@ -72,6 +72,13 @@ func builtinTools() []builtinTool {
 		// false-match "dshell", "fdsh", and any path containing those three
 		// letters — the same reason "pi" is token-matched.
 		{Name: "deepseek", Icon: "🐋", detectSubstrings: []string{"deepseek"}, detectTokens: []string{"dsh"}},
+		// Kiro CLI (AWS). The canonical name is the real binary "kiro-cli",
+		// NOT "kiro": runInstalledProbe resolves a built-in by its NAME via
+		// exec.LookPath, and "kiro" is commonly only a shell alias, which
+		// LookPath cannot see. Naming it "kiro" would make
+		// show_only_installed_tools hide it on hosts where it IS installed.
+		// The "kiro" substring is still matched so aliased commands resolve.
+		{Name: "kiro-cli", Icon: "👻", detectSubstrings: []string{"kiro-cli", "kiro"}},
 		{Name: "aider", Icon: "🐚"},
 		{Name: "shell", Icon: "🐚"},
 	}
