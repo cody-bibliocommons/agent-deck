@@ -643,6 +643,8 @@ func (i *Instance) getToolEnvFile() string {
 		return config.OMP.EnvFile
 	case "cursor":
 		return config.Cursor.EnvFile
+	case "kiro-cli":
+		return config.Kiro.EnvFile
 	case "hermes":
 		if name := conductorNameFromInstance(i); name != "" {
 			if conductorEnv := config.GetConductorHermesEnvFile(name); conductorEnv != "" {

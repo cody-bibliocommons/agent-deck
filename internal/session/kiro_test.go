@@ -8,9 +8,16 @@ import (
 )
 
 // withKiroCommandOverride seeds the user-config cache with a [kiro-cli].command
-// override for the duration of the test. The cached mtime is set to the real
-// config path's mtime so LoadUserConfig's fast path returns the seeded value.
+// override for the duration of the test.
 func withKiroCommandOverride(t *testing.T, command string) {
+	t.Helper()
+	withKiroSettings(t, KiroSettings{Command: command})
+}
+
+// withKiroSettings seeds the user-config cache with the given [kiro-cli]
+// settings for the duration of the test. The cached mtime is set to the real
+// config path's mtime so LoadUserConfig's fast path returns the seeded value.
+func withKiroSettings(t *testing.T, kiro KiroSettings) {
 	t.Helper()
 
 	var mtime time.Time
@@ -23,7 +30,7 @@ func withKiroCommandOverride(t *testing.T, command string) {
 	userConfigCacheMu.Lock()
 	prevCache, prevMtime, prevErr := userConfigCache, userConfigCacheMtime, userConfigCacheErr
 	cfg := cloneDefaultUserConfig()
-	cfg.Kiro.Command = command
+	cfg.Kiro = kiro
 	userConfigCache = &cfg
 	userConfigCacheMtime = mtime
 	userConfigCacheErr = nil
@@ -61,6 +68,39 @@ func TestKiroCommandOverrideIsHonored(t *testing.T) {
 	const wrapper = "my-wrapper kiro-cli chat"
 	if got := i.buildKiroCommand(wrapper, false); !strings.HasSuffix(got, wrapper) {
 		t.Errorf("buildKiroCommand(%q) = %q, want passthrough", wrapper, got)
+	}
+}
+
+// TestGetToolEnvFile_Kiro pins that [kiro-cli].env_file is resolved for
+// kiro-cli sessions. It used to be accepted by the config parser but fall
+// through getToolEnvFile's default arm, so it was silently ignored.
+func TestGetToolEnvFile_Kiro(t *testing.T) {
+	withKiroSettings(t, KiroSettings{EnvFile: "/tmp/kiro.env"})
+
+	inst := &Instance{Tool: "kiro-cli"}
+	if got := inst.getToolEnvFile(); got != "/tmp/kiro.env" {
+		t.Errorf("getToolEnvFile() for kiro-cli = %q, want %q", got, "/tmp/kiro.env")
+	}
+}
+
+// TestKiroLaunchSourcesEnvFile checks the end result the user sees: the
+// launch command for a kiro-cli session sources [kiro-cli].env_file before
+// running `kiro-cli chat`.
+func TestKiroLaunchSourcesEnvFile(t *testing.T) {
+	envFile := t.TempDir() + "/kiro.env"
+	if err := os.WriteFile(envFile, []byte("export KIRO_TEST=1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	withKiroSettings(t, KiroSettings{EnvFile: envFile})
+
+	inst := &Instance{Tool: "kiro-cli", ProjectPath: t.TempDir()}
+	cmd := inst.buildKiroCommand("", false)
+	sourceAt := strings.Index(cmd, `source "`+envFile+`"`)
+	if sourceAt < 0 {
+		t.Fatalf("buildKiroCommand() = %q, want it to source %q", cmd, envFile)
+	}
+	if chatAt := strings.LastIndex(cmd, "kiro-cli chat"); chatAt < sourceAt {
+		t.Errorf("buildKiroCommand() = %q, want env_file sourced before kiro-cli chat", cmd)
 	}
 }
 
