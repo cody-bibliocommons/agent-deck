@@ -3,7 +3,6 @@
                                                                                                                                                                                                         
                                                                                                                                                                                                         
                                                                                                                                                                                                         
-                                                                                                                                                                                                        
                                                                      ╭────────────────────────────────────────────────────────────╮                                                                     
                                                                      │                                                            │                                                                     
                                                                      │                                                            │                                                                     
@@ -36,13 +35,14 @@
                                                                      │       🐋 deepseek                                          │                                                                     
                                                                      │       ⌥ omp   Oh My Pi - batteries-included coding         │                                                                     
                                                                      │    agent (omp)                                             │                                                                     
+                                                                     │       👻 kiro-cli   Kiro CLI - AWS agentic CLI (kiro-      │                                                                     
+                                                                     │    cli chat)                                               │                                                                     
                                                                      │                                                            │                                                                     
                                                                      │                                                            │                                                                     
                                                                      │    Up/Down: select | Enter: continue | Esc: back           │                                                                     
                                                                      │                                                            │                                                                     
                                                                      │                                                            │                                                                     
                                                                      ╰────────────────────────────────────────────────────────────╯                                                                     
-                                                                                                                                                                                                        
                                                                                                                                                                                                         
                                                                                                                                                                                                         
                                                                                                                                                                                                         
