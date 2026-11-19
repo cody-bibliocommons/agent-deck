@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
 // childRow is one child in `session children` output — shared by the one-shot
@@ -18,6 +19,9 @@ type childRow struct {
 	DoneStatus  string `json:"done_status,omitempty"`
 	DoneSummary string `json:"done_summary,omitempty"`
 	DoneAt      string `json:"done_at,omitempty"`
+	// BackgroundWork is the in-flight background work keeping the child
+	// running (issue #2473); omitted otherwise. Not part of the --follow diff.
+	BackgroundWork *tmux.BackgroundWork `json:"background_work,omitempty"`
 }
 
 // followEvent is one JSONL line on the --follow stream. Consumers key off
@@ -46,14 +50,47 @@ type followSummary struct {
 	DoneFail int    `json:"done_fail"`
 }
 
+// childRowsSampling says whether buildChildRows may capture each child's pane.
+type childRowsSampling bool
+
+const (
+	// sampleChildPanes: one pane capture per child, the sample the hook-lag
+	// rule needs. The polling surfaces: `session children --json` / `--follow`.
+	sampleChildPanes childRowsSampling = true
+	// cachedChildStatus: no capture. The parent's hook handler
+	// (buildChildrenContextSummary) runs inside Claude Code's
+	// UserPromptSubmit/SessionStart and must not pay N captures per prompt
+	// (review round 4 P2); it reads the light the hook file and the persisted
+	// hook-lag evidence already give.
+	cachedChildStatus childRowsSampling = false
+)
+
 // buildChildRows converts refreshed child instances into rows. Callers must
 // have run session.RefreshInstancesForCLIStatus on kids first so UpdateStatus
 // sees warm tmux caches and hook statuses (issue #610).
-func buildChildRows(kids []*session.Instance) []childRow {
+//
+// With sampleChildPanes each child gets the same single pane capture the
+// other CLI surfaces take (`list --json`, `status`, `session show`): one
+// Substate() per child per call, i.e. one capture-pane subprocess per child
+// that has a live tmux session, taken after UpdateStatus and before the
+// status is read. This is the sample the hook-lag rule (session/hook_lag.go)
+// accumulates, so a conductor whose only poll is `session children --json` /
+// `--follow` still advances it (review round 3 P2-4), and the status printed
+// describes the frame the capture saw. Cost per call: N children × one
+// capture, the same as `list --json` over N sessions; --follow pays it once
+// per interval.
+//
+// With cachedChildStatus nothing is captured: UpdateStatus alone, which on a
+// fresh hook is the hook fast path (no tmux call) and otherwise the cached
+// status pass every CLI surface makes. Hook handlers use this.
+func buildChildRows(kids []*session.Instance, sampling childRowsSampling) []childRow {
 	rows := make([]childRow, 0, len(kids))
 	for _, k := range kids {
 		_ = k.UpdateStatus()
-		row := childRow{ID: k.ID, Title: k.Title, Status: StatusString(k.Status)}
+		if sampling == sampleChildPanes {
+			_ = k.Substate() // before Status: see buildListJSON
+		}
+		row := childRow{ID: k.ID, Title: k.Title, Status: StatusString(k.Status), BackgroundWork: k.BackgroundWorkJSON()}
 		if e, ok := session.ReadLedgerEntry(k.ID); ok {
 			row.DoneStatus = e.Status
 			row.DoneSummary = e.Summary
@@ -110,15 +147,18 @@ func diffChildEvents(prev, curr []childRow) []followEvent {
 	return events
 }
 
-// childTerminal reports whether a child needs no further supervision: it
-// asserted the completion sentinel (ok or fail), or its process is gone.
-// idle WITHOUT a sentinel is not terminal — an agent parked at the prompt may
-// just be between turns, and treating it as done would end --until-done early.
+// childTerminal reports whether the child's current live state needs no further
+// supervision. DoneStatus is historical, so it corroborates terminal state only
+// while the child is idle; it must never override active or unknown live state.
 func childTerminal(r childRow) bool {
-	if r.DoneStatus != "" {
+	switch r.Status {
+	case "waiting", "error", "stopped":
 		return true
+	case "idle":
+		return r.DoneStatus != ""
+	default:
+		return false
 	}
-	return r.Status == "error" || r.Status == "stopped"
 }
 
 func allChildrenTerminal(rows []childRow) bool {
@@ -176,7 +216,7 @@ func loadChildRows(profile, parentID string) ([]childRow, error) {
 
 	kids := childrenOf(parentID, instances)
 	session.RefreshInstancesForCLIStatus(kids)
-	return buildChildRows(kids), nil
+	return buildChildRows(kids, sampleChildPanes), nil
 }
 
 // runChildrenFollow streams child state changes as JSONL until interrupted,

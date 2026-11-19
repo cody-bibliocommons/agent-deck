@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/childenv"
 	"github.com/asheshgoplani/agent-deck/internal/tmuxutf8"
 )
 
@@ -167,6 +169,14 @@ func tmuxArgs(socketName string, args ...string) []string {
 		args = args[1:]
 	}
 	name := strings.TrimSpace(socketName)
+	if name == "" && tmuxEnvNamesConfiguredSocket(os.Getenv) {
+		// A session with no socket name lives on the default server. Without
+		// -L, tmux would follow the inherited $TMUX instead, and inside a pane
+		// on a [tmux.binaries] socket (deck36, say) every call for a
+		// default-server session would go to the wrong server ("session is
+		// not running"). Name the default server explicitly there.
+		name = defaultTmuxSocketName
+	}
 	var out []string
 	if name == "" {
 		out = make([]string, len(args))
@@ -194,12 +204,14 @@ func tmuxExec(socketName string, args ...string) *exec.Cmd {
 	// Refuse, before the subprocess exists, to point a test binary at the
 	// user's live default server. See default_socket_guard.go.
 	assertTmuxSpawnIsolated(socketName, args)
-	// #nosec G204,G702 -- "tmux" is a fixed binary and every dynamic value is
+	// #nosec G204,G702 -- the binary is "tmux" or the user's configured
+	// [tmux.binaries] path for this socket, and every dynamic value is
 	// passed as a distinct argv element, never through a shell. Call sites may
 	// supply user-selected paths, but those cannot alter the executable or argv
 	// boundaries.
-	cmd := exec.Command("tmux", tmuxArgs(socketName, args...)...)
+	cmd := exec.Command(BinaryFor(socketName), tmuxArgs(socketName, args...)...)
 	cmd.WaitDelay = tmuxSubprocessWaitDelay
+	cmd.Env = withSocketBinaryPATH(socketName, childenv.WithoutClaudeJobDir()) // #2683; PATH: see withSocketBinaryPATH
 	return cmd
 }
 
@@ -209,8 +221,9 @@ func tmuxExec(socketName string, args ...string) *exec.Cmd {
 // the -L plumbing centralised for them too.
 func tmuxExecContext(ctx context.Context, socketName string, args ...string) *exec.Cmd {
 	assertTmuxSpawnIsolated(socketName, args)
-	cmd := exec.CommandContext(ctx, "tmux", tmuxArgs(socketName, args...)...)
+	cmd := exec.CommandContext(ctx, BinaryFor(socketName), tmuxArgs(socketName, args...)...)
 	cmd.WaitDelay = tmuxSubprocessWaitDelay
+	cmd.Env = withSocketBinaryPATH(socketName, childenv.WithoutClaudeJobDir()) // #2683; PATH: see withSocketBinaryPATH
 	return cmd
 }
 
@@ -256,7 +269,7 @@ func runSendKeysBounded(cmd *exec.Cmd) error {
 	}
 	cmd.SysProcAttr.Setpgid = true
 
-	if err := cmd.Start(); err != nil {
+	if err := commandStart(cmd); err != nil {
 		return err
 	}
 
@@ -319,7 +332,7 @@ var tmuxPollTimeout = 3 * time.Second
 func runBoundedOutput(socketName string, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), tmuxPollTimeout)
 	defer cancel()
-	return tmuxExecContext(ctx, socketName, args...).Output()
+	return commandOutput(tmuxExecContext(ctx, socketName, args...))
 }
 
 // runBoundedRun runs a short tmux command (typically a status set-option batch)
@@ -328,7 +341,7 @@ func runBoundedOutput(socketName string, args ...string) ([]byte, error) {
 func runBoundedRun(socketName string, args ...string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), tmuxPollTimeout)
 	defer cancel()
-	return tmuxExecContext(ctx, socketName, args...).Run()
+	return commandRun(tmuxExecContext(ctx, socketName, args...))
 }
 
 // runBoundedOutput is the per-Session convenience wrapper, targeting the
@@ -389,7 +402,7 @@ func annotateDeadline(ctxErr, err error) error {
 func runBoundedMutation(socketName string, args ...string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), tmuxMutationTimeout)
 	defer cancel()
-	err := tmuxExecContext(ctx, socketName, args...).Run()
+	err := commandRun(tmuxExecContext(ctx, socketName, args...))
 	return annotateDeadline(ctx.Err(), err)
 }
 

@@ -203,6 +203,18 @@ func paneGoneWithin(inst *Instance, window time.Duration) bool {
 }
 
 func TestMain(m *testing.M) {
+	// #1873 race tests re-execute this binary as a second agent-deck process to
+	// exercise the receipt's cross-process compare-and-swap. Dispatch before
+	// any isolation setup: the child must reach the SAME store directory the
+	// parent passed it, not a fresh isolated HOME of its own.
+	if payload := os.Getenv(ownershipChildEnv); payload != "" {
+		os.Exit(runOwnershipReceiptChild(payload))
+	}
+	// Messaging audit P1-3 cross-process inbox flock tests: same reasoning,
+	// the producer/holder child must share the parent's inbox directory.
+	if mode := os.Getenv(inboxFlockHelperEnv); mode != "" {
+		os.Exit(runInboxFlockHelper(mode))
+	}
 	os.Exit(runTestMain(m))
 }
 
@@ -217,8 +229,17 @@ func runTestMain(m *testing.M) int {
 	// profiles/<p>/state.db, worker-scratch, logs) lands in a temp dir, never
 	// the real ~/.agent-deck (2026-06-04 data-loss incident, S5).
 	// See internal/testutil/homeenv.go for the postmortem.
+	// Pin the Go build and module caches before HOME moves: the in-test
+	// `go build` of agent-deck would otherwise start from an empty cache
+	// under the isolated HOME (see testutil.PinGoCaches).
+	testutil.PinGoCaches()
 	cleanupHome := testutil.IsolateHome()
 	defer cleanupHome()
+	// Most session tests replace HOME per case and remove it immediately.
+	// They exercise the existing writers, not the process-owned bus. Explicitly
+	// opt out here so a writer cannot race a case's TempDir cleanup. Dedicated
+	// events and watcher tests run the real bus, including its shutdown path.
+	_ = os.Setenv("AGENTDECK_EVENTS_BUS", "0")
 
 	// Git hooks export GIT_DIR/GIT_WORK_TREE; clear them so test subprocess git
 	// commands operate on their temp repos instead of the real repository.
@@ -241,9 +262,24 @@ func runTestMain(m *testing.M) int {
 	cleanupBootstrap := bootstrapTmuxServer()
 	defer cleanupBootstrap()
 
+	// Cross-harness previews refuse when the target CLI is not on PATH. CI has
+	// no claude/codex/pi, so resolve every harness as present by default; the
+	// refusal itself is covered by tests that restore exec.LookPath.
+	lookPathHarness = func(command string) (string, error) { return "/usr/bin/" + command, nil }
+
+	// OpenCode launch flags depend on the installed major version. Pin
+	// "unknown" (the 1.x flag set) so a developer's own opencode never changes
+	// a test's command, and stub opencode binaries on PATH are never exec'd
+	// with --version. Version-specific tests set their own answer.
+	probeOpenCodeMajorVersion = func(*Instance) (int, bool) { return 0, false }
+
 	// Force test profile to prevent production data corruption
 	// See CLAUDE.md: "2025-12-11 Incident: Tests with AGENTDECK_PROFILE=work overwrote ALL 36 production sessions"
 	os.Setenv("AGENTDECK_PROFILE", "_test")
+
+	// Overlap the shared agent-deck build with the first tests.
+	waitPrebuild := prebuildForeignTUIBinary()
+	defer waitPrebuild()
 
 	// Run tests
 	code := m.Run()
@@ -284,7 +320,7 @@ func bootstrapTmuxServer() func() {
 	if _, err := exec.LookPath("tmux"); err != nil {
 		return func() {}
 	}
-	cmd := exec.Command("tmux", "new-session", "-d", "-s", bootstrapSessionName, "sh", "-c", "sleep 3600")
+	cmd := exec.Command("tmux", "new-session", "-d", "-s", bootstrapSessionName, "sh", "-c", bootstrapHoldCommand(os.Getpid()))
 	if out, err := cmd.CombinedOutput(); err != nil {
 		fmt.Fprintf(os.Stderr, "bootstrapTmuxServer: new-session failed: %v (%s)\n", err, strings.TrimSpace(string(out)))
 		return func() {}
@@ -292,6 +328,17 @@ func bootstrapTmuxServer() func() {
 	return func() {
 		_ = exec.Command("tmux", "kill-server").Run()
 	}
+}
+
+// bootstrapHoldCommand returns the shell script run inside the bootstrap tmux
+// session. It polls the test binary's PID and exits once that process is gone,
+// so the bootstrap lives exactly as long as the test binary: a fixed
+// `sleep 3600` expired after one hour and broke later tests in long runs
+// (-race -count=N, slow packages). The normal teardown still kill-servers the
+// isolated socket; the PID watch is the backstop if the binary dies without
+// running it, so no idle session is left behind either way.
+func bootstrapHoldCommand(pid int) string {
+	return fmt.Sprintf("while kill -0 %d 2>/dev/null; do sleep 5; done", pid)
 }
 
 // TestTmuxBootstrap_ServerIsRunning pins that TestMain started a tmux server
@@ -308,5 +355,18 @@ func TestTmuxBootstrap_ServerIsRunning(t *testing.T) {
 	}
 	if !strings.Contains(string(out), bootstrapSessionName) {
 		t.Fatalf("bootstrap session %q not present; got: %s", bootstrapSessionName, string(out))
+	}
+}
+
+// TestBootstrapHoldCommand_TiedToTestBinary pins that the bootstrap session's
+// lifetime follows the test binary's PID rather than a fixed sleep.
+func TestBootstrapHoldCommand_TiedToTestBinary(t *testing.T) {
+	pid := os.Getpid()
+	got := bootstrapHoldCommand(pid)
+	if strings.Contains(got, "sleep 3600") {
+		t.Fatalf("bootstrap command still uses a fixed one-hour sleep: %q", got)
+	}
+	if !strings.Contains(got, fmt.Sprintf("kill -0 %d", pid)) {
+		t.Fatalf("bootstrap command does not watch the test process pid %d: %q", pid, got)
 	}
 }

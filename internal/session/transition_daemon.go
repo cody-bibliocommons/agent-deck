@@ -3,17 +3,21 @@ package session
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/comms"
 	"github.com/asheshgoplani/agent-deck/internal/desknotify"
+	"github.com/asheshgoplani/agent-deck/internal/health"
+	"github.com/asheshgoplani/agent-deck/internal/optiming"
+	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
 const (
@@ -33,6 +37,9 @@ const (
 type hookTransitionCandidate struct {
 	ToStatus  string
 	Timestamp time.Time
+	// Event is the hook event behind the candidate (Stop, PermissionRequest,
+	// Notification, ...). Empty for candidates built without one.
+	Event string
 }
 
 type TransitionDaemon struct {
@@ -50,11 +57,23 @@ type TransitionDaemon struct {
 	lastStatus  map[string]map[string]string
 	initialized map[string]bool
 
+	// livePrior carries, per (profile, instance), the verdict the no-live-TUI
+	// probe loop settled on the previous pass plus its pending-flip flag, so
+	// the running→waiting/error debounce survives the per-pass Instance
+	// reload (LoadWithGroups builds fresh objects). See Instance.SeedLiveStatusPrior.
+	livePrior map[string]map[string]liveStatusPrior
+
 	// lastDone tracks the most recently emitted completion sentinel per
 	// (profile, instance) so a finished event (issue #1186) is emitted once
 	// per distinct completion. Re-reading the same done-bearing hook file
 	// across polls — or a later identical Stop — does not re-fire.
 	lastDone map[string]map[string]DoneSignal
+
+	// lastSuppressedDone is lastDone for completions recorded while delivery
+	// is off, keyed on the Stop edge as well as the signal: a later identical
+	// sentinel on a new Stop is a new completion. Kept apart from lastDone so
+	// that once delivery is back on, an identical new completion is delivered.
+	lastSuppressedDone map[string]map[string]suppressedDone
 
 	// lastTurn tracks, per (profile, instance), the last COMPLETED TURN recorded
 	// into the drainable ledgers. Keyed by status + the transcript signal, so a
@@ -63,11 +82,48 @@ type TransitionDaemon struct {
 	// happened to observe the session mid-`running`: see recordTerminalTurns.
 	lastTurn map[string]map[string]string
 
+	// passStatus is the pass's one read of each instance's hook status file
+	// (see statusSnapshot); nil outside SyncOnce.
+	passStatus map[string]*HookStatus
+	// orphansEmitted: per instance, the carried pi runs already emitted (see
+	// recordOrphanedPiRuns).
+	orphansEmitted map[string]map[string]bool
+
+	// journaledRun maps (profile, child) to the turn uuid emitTurn journaled
+	// for it since this daemon last saw the child running (issue #2481). The
+	// snapshot edge that follows a hook-path record of the same run is that
+	// same turn, not a stale-signal turn, so it must not be forced urgent and
+	// journaled again. nil-safe; see forgetJournaledTurnsOfRunning.
+	journaledRun map[string]map[string]string
+	// lastSelfTurn is the last turn emitTurn skipped per top-level conductor
+	// (issue #2481). Those turns are not journaled, so this is what tells a
+	// re-observation of the same turn from a new one.
+	lastSelfTurn map[string]TurnJournalEntry
+
+	// codexTurns is the per-(profile, child) memory of observed Codex runs
+	// that makes every real Codex turn end yield exactly one record
+	// (issue #2900, codex_turn_tracker.go). codexComposerIdle replaces the
+	// fallback's pane probe and codexFallbackAfter its delay in tests (nil
+	// and 0: codexPaneAtComposer and codexTurnFallbackAfter).
+	codexTurns         map[string]map[string]*codexTurnTrack
+	codexComposerIdle  func(*Instance) bool
+	codexFallbackAfter time.Duration // 0: codexTurnFallbackAfter
+
 	// turnLiveCheck decides whether an instance is a live session or a stale
 	// registry row. A seam because the real check probes tmux, which a unit test
 	// cannot and should not do — and testing this logic is the whole point after a
 	// field failure that a passing suite failed to catch.
 	turnLiveCheck func(inst *Instance) bool
+
+	// idleExitPending holds, per (profile, child), the idle status a child
+	// flipped to error from and since when its pane is gone, until a later
+	// pass confirms the death (#2806). idleExitAlive is the pane liveness
+	// seam; nil means idleChildProcessAlive. idleExitTold holds children
+	// the restart sweep already reported failed, so that is not reported
+	// twice (#2813).
+	idleExitPending map[string]map[string]idleExitEntry
+	idleExitAlive   func(inst *Instance) bool
+	idleExitTold    map[string]map[string]bool
 
 	// lastDoneScan tracks, per (profile, instance), the hook-status timestamp
 	// whose pending transcript rescan (issue #1186 flush race) reached a
@@ -87,6 +143,14 @@ type TransitionDaemon struct {
 	// created). Driven by this poll loop — NOT a new daemon (F3: no watchdog
 	// stacking). nil until the first enabled pass.
 	selfheal *selfHealRegistry
+
+	// idleRefresh moves idle sessions onto newer tool builds (ASK-14); see
+	// idle_build_refresh.go. Lazily created.
+	idleRefresh *idleRefreshState
+
+	// restart is the memory of restart tokens (#2792, restart_resume.go).
+	restart     *restartState
+	restartOnce sync.Once
 
 	// lastProbeStall rate-limits the probe-stall breadcrumb per (profile|key)
 	// so a permanently wedged instance — which times out again on every poll —
@@ -111,10 +175,56 @@ type TransitionDaemon struct {
 	// Accessed only from the single-threaded Run loop, like lastProbeStall.
 	lastDesktopNotify map[string]string
 
+	// Comms Ledger (docs/comms.md): one open ledger per profile with its
+	// daemon.lock handle, the time of the last failed open or commit per
+	// profile (retry backoff), the last prompt-start edge seen per child
+	// (the trigger of its next turn), and the last spool prune. Single-
+	// threaded, like the maps above.
+	ledgers          map[string]*comms.Ledger
+	ledgerLocks      map[string]*os.File
+	ledgerOpenFailed map[string]time.Time
+	commsPrompts     map[string]CommsSpoolEntry
+	lastCommsPrune   time.Time
+	lastImportPrune  map[string]time.Time // per profile
+
+	// journalWriters holds the per-profile writer for the session event
+	// journal, resolved once per profile for the daemon's lifetime and nil
+	// when the [health] session_events kill switch is off. It is async so a
+	// slow or wedged health volume can never stall status detection for every
+	// profile. lastJournaled is the status|substate the journal last saw per
+	// (profile, instance), seeded silently on the first pass so a daemon
+	// recycle never replays the fleet. Both accessed only from the
+	// single-threaded Run loop.
+	journalWriters map[string]*health.AsyncWriter
+	lastJournaled  map[string]map[string]string
+
 	// desktopWG tracks in-flight desktop notifications, which are dispatched
 	// off the poll loop so a wedged notifier binary cannot stall session
 	// monitoring. Only tests wait on it.
 	desktopWG sync.WaitGroup
+
+	// recallBackfillMu guards recallBackfillStarted: the daemon/timer path's
+	// one-time trigger for the background initial recall backfill
+	// (docs/recall.md, issue #2329). Per-instance rather than a package
+	// global so tests get a fresh trigger per daemon.
+	recallBackfillMu      sync.Mutex
+	recallBackfillStarted bool
+	// Join the worker before tests replace its shared configuration.
+	recallBackfillWG sync.WaitGroup
+
+	// remoteTalkback schedules the incremental remote drains for remotes
+	// with talkback_interval_secs (transition_daemon_remote.go). Lazily
+	// created by the Run loop.
+	remoteTalkback *remoteTalkbackScheduler
+
+	// ASK-229: empty profiles the daemon has loaded once and whose store has
+	// not changed since (transition_daemon_dormant.go). lastSyncEmpty is set
+	// by syncProfile when the profile it just loaded has no sessions;
+	// lastPassSynced counts the profiles the last SyncOnce fully synced.
+	// Accessed only from the single-threaded Run loop.
+	dormant        map[string]dormantProfile
+	lastSyncEmpty  bool
+	lastPassSynced int
 }
 
 func NewTransitionDaemon() *TransitionDaemon {
@@ -124,11 +234,14 @@ func NewTransitionDaemon() *TransitionDaemon {
 		storages:       map[string]*Storage{},
 		lastStatus:     map[string]map[string]string{},
 		initialized:    map[string]bool{},
+		livePrior:      map[string]map[string]liveStatusPrior{},
 		lastDone:       map[string]map[string]DoneSignal{},
 		lastTurn:       map[string]map[string]string{},
 		turnLiveCheck:  func(inst *Instance) bool { return inst.Exists() },
 		lastDoneScan:   map[string]map[string]time.Time{},
 		lastProbeStall: map[string]time.Time{},
+		journalWriters: map[string]*health.AsyncWriter{},
+		lastJournaled:  map[string]map[string]string{},
 
 		lastDesktopNotify: map[string]string{},
 	}
@@ -138,8 +251,19 @@ func (d *TransitionDaemon) Run(ctx context.Context) error {
 	d.ensureHookWatcher()
 	defer d.shutdown()
 
+	// The daemon/timer path recall's initial backfill trigger asks for
+	// (docs/recall.md, issue #2329), never the TUI's render loop and never
+	// the Stop/SessionEnd hook. Checked once per iteration (cheap: a mutex
+	// and a bool once started) so a config edit that turns recall or
+	// backfill_on_enable on while this daemon is already running is picked
+	// up without a restart. `notify-daemon --once` calls SyncOnce directly
+	// and never reaches this loop, so a single diagnostic pass never starts
+	// a background goroutine it has no way to let finish.
+	d.maybeStartInitialRecallBackfill(ctx)
+
 	// Prime baseline once, then run adaptive loop.
 	interval := d.SyncOnce(ctx)
+	d.tickRemoteTalkback(ctx)
 	if interval <= 0 {
 		interval = notifyPollSlow
 	}
@@ -149,7 +273,9 @@ func (d *TransitionDaemon) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-time.After(interval):
+			d.maybeStartInitialRecallBackfill(ctx)
 			interval = d.SyncOnce(ctx)
+			d.tickRemoteTalkback(ctx)
 			if interval <= 0 {
 				interval = notifyPollSlow
 			}
@@ -164,22 +290,45 @@ func (d *TransitionDaemon) SyncOnce(_ context.Context) time.Duration {
 	if len(profiles) == 0 {
 		return notifyPollSlow
 	}
+	defer optiming.Start("daemon.pass")()
 
 	// Stamp liveness BEFORE the work: the question a drain asks is "is a writer
 	// alive", and a daemon wedged inside a probe should still look alive for one
 	// staleness window rather than flipping to "absent" the moment it stalls.
 	WriteNotifyHeartbeat()
 
+	d.passStatus = map[string]*HookStatus{}
+	defer func() { d.passStatus = nil }()
+	// Issue #1214 replay reads the completions directory once per pass, not
+	// once per profile (ASK-229: thousands of profiles).
+	completions, _ := loadCompletionRecordsByProfile()
+	now := time.Now()
+	rechecks := dormantRechecksPerPass
+	synced := 0
 	nextInterval := notifyPollSlow
 	for _, profile := range profiles {
-		interval := d.syncProfile(profile)
-		if interval < nextInterval {
-			nextInterval = interval
+		// ASK-229: an empty profile whose store is unchanged since the
+		// daemon last loaded it costs two stats, not a store open and a
+		// registry load.
+		if !d.skipDormantProfile(profile, now, &rechecks) {
+			interval := d.syncProfile(profile)
+			if interval < nextInterval {
+				nextInterval = interval
+			}
+			synced++
+			d.releaseEmptyProfileStore(profile, now)
 		}
 		// Issue #1214: replay any durable task-worker completion record whose
 		// parent was down/busy when the worker exited. Restart-safe and
 		// exactly-once via the record's Acked flag.
-		d.ReplayUnackedCompletions(profile)
+		d.replayUnackedCompletions(completions[profile])
+	}
+	d.pruneDormantProfiles(profiles)
+	d.lastPassSynced = synced
+	if synced == 0 {
+		// syncProfile sweeps fresh-start tokens; with every profile dormant
+		// only the orphan-age spend is left to do.
+		d.sweepFreshStartTokens(nil, now)
 	}
 
 	d.maybeSweepInboxTTL()
@@ -199,11 +348,17 @@ func (d *TransitionDaemon) ReplayUnackedCompletions(profile string) {
 	if err != nil {
 		return
 	}
+	d.replayUnackedCompletions(recs)
+}
+
+// replayUnackedCompletions is ReplayUnackedCompletions over records already
+// read (one profile's).
+func (d *TransitionDaemon) replayUnackedCompletions(recs []CompletionRecord) {
 	for _, rec := range recs {
 		if rec.Acked || strings.TrimSpace(rec.Status) == "" {
 			continue
 		}
-		committed, parked := d.notifier.deliverCompletion(rec)
+		committed, parked, reason := d.notifier.deliverCompletion(rec)
 		if committed {
 			_ = AckCompletion(rec.Profile, rec.ChildID)
 			continue
@@ -212,6 +367,13 @@ func (d *TransitionDaemon) ReplayUnackedCompletions(profile string) {
 		// completion record replayable across daemon/parent restart, but do not
 		// spend its dead-letter budget merely because the parent is absent.
 		if parked {
+			continue
+		}
+		// The child is gone from the registry: no retry can ever deliver this,
+		// and a dead letter for it could never be acked (messaging audit P1-4).
+		// The terminal drop already wrote the missed-log line; ack and move on.
+		if reason == deadLetterReasonChildMissing {
+			_ = AckCompletion(rec.Profile, rec.ChildID)
 			continue
 		}
 		// Not committed: the parent is unresolvable (e.g. removed) or a
@@ -272,6 +434,13 @@ var syncPassBudget = 30 * time.Second
 // breadcrumb so a permanently wedged instance doesn't flood the log.
 const probeStallLogInterval = time.Minute
 
+// liveStatusPrior is one pass's settled verdict for an instance, carried to
+// the next pass so the flip debounce can confirm on a second sample.
+type liveStatusPrior struct {
+	status      Status
+	flipPending bool
+}
+
 // statusProbeFunc is the signature of the swappable status-probe seam.
 type statusProbeFunc = func(inst *Instance) error
 
@@ -303,6 +472,20 @@ func init() {
 // bounded in practice because the subprocess context timeouts let the detached
 // probe return within a few seconds.
 func (d *TransitionDaemon) refreshInstanceStatusBounded(profile string, inst *Instance) (timedOut bool) {
+	if refreshStatusBounded(inst, statusProbeBudget) {
+		d.logProbeStall(profile, inst.ID, "probe_budget")
+		return true
+	}
+	return false
+}
+
+// refreshStatusBounded runs the status probe seam (hook-driven state first,
+// pane fallback: (*Instance).UpdateStatus) for inst under budget. It reports
+// timedOut=true when the probe did not finish in time; see
+// refreshInstanceStatusBounded for why the caller must then not touch
+// lock-guarded instance state. Shared by the daemon's sync pass and the
+// wake-nudge idle gate (review round 2, P2-D).
+func refreshStatusBounded(inst *Instance, budget time.Duration) (timedOut bool) {
 	probe := updateInstanceStatus.Load().(statusProbeFunc)
 	done := make(chan struct{})
 	go func() {
@@ -312,8 +495,7 @@ func (d *TransitionDaemon) refreshInstanceStatusBounded(profile string, inst *In
 	select {
 	case <-done:
 		return false
-	case <-time.After(statusProbeBudget):
-		d.logProbeStall(profile, inst.ID, "probe_budget")
+	case <-time.After(budget):
 		return true
 	}
 }
@@ -352,13 +534,8 @@ func (d *TransitionDaemon) logProbeStall(profile, instanceID, reason string) {
 	if err != nil {
 		return
 	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return
-	}
-	_, _ = f.Write(append(line, '\n'))
-	if err := f.Close(); err != nil {
-		fmt.Fprintf(os.Stderr, "logProbeStall: close %s: %v\n", path, err)
+	if err := appendRotatingLogLine(path, line, transitionLogRotation); err != nil {
+		commsLog.Debug("probe_stall_log_write_failed", slog.String("path", path), slog.String("error", err.Error()))
 	}
 }
 
@@ -379,7 +556,12 @@ func profilesForTransitionDaemon() []string {
 	return profiles
 }
 
+// syncProfile runs one status pass over a profile's instances and returns the
+// interval until the next pass. Live-status priors are not seeded into
+// persisted stopped or queued instances, so a stale sample cannot override
+// those decisions (issue #2526).
 func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
+	d.lastSyncEmpty = false
 	storage := d.getStorage(profile)
 	if storage == nil {
 		return notifyPollSlow
@@ -389,14 +571,29 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 	if err != nil {
 		return notifyPollSlow
 	}
+	d.lastSyncEmpty = len(instances) == 0
+	if len(instances) > 0 {
+		// Issue #2770: warm the shared tmux caches once per pass, as the TUI
+		// (backgroundStatusUpdate), web and CLI status paths do once per tick.
+		// Without it every Exists() (hook rebind gate, turn liveness) and
+		// IsPaneDead() (UpdateStatus) below missed the cache and spawned its
+		// own has-session / list-panes: ~5 tmux processes per session per
+		// pass. Exists() still trusts only a positive hit and confirms a miss
+		// (or a session on another socket) with a direct probe.
+		tmux.RefreshExistingSessions()
+		tmux.RefreshPaneInfoCache()
+	}
 
 	byID := make(map[string]*Instance, len(instances))
 	hookCandidates := make(map[string]hookTransitionCandidate, len(instances))
 	hookStatuses := make(map[string]*HookStatus, len(instances))
 	for _, inst := range instances {
 		byID[inst.ID] = inst
-		if IsClaudeCompatible(inst.Tool) || inst.Tool == "codex" || inst.Tool == "gemini" || inst.Tool == "cursor" || inst.Tool == "hermes" {
-			if hs := d.hookStatusForInstance(inst.ID); hs != nil {
+		if HookStatusTool(inst.Tool) {
+			// A record from a Codex subagent or helper thread is not this
+			// pane's turn edge: using it emitted running -> waiting every time
+			// a spawned subagent finished (codexHookFromForeignThread).
+			if hs := d.hookStatusForInstance(inst.ID); hs != nil && !inst.codexHookFromForeignThread(hs) {
 				// Issue #1349: only let a hook status rebind the session id when
 				// the instance is actually LIVE (running/waiting/idle with a real
 				// tmux session). A stopped/removed session keeps a stale
@@ -426,7 +623,13 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 	}
 
 	statuses := map[string]string{}
+	// substates holds the cached substate of instances this pass probed
+	// itself; anything else is unknown to the journal, never "none".
+	substates := map[string]string{}
 	if tuiAlive {
+		// The TUI owns the verdicts while it is alive; a prior carried from an
+		// earlier no-TUI pass would be hours old by the time the TUI exits.
+		delete(d.livePrior, profile)
 		if db != nil {
 			if rows, err := db.ReadAllStatuses(); err == nil {
 				for id, row := range rows {
@@ -451,8 +654,16 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 		// reasoning.
 		passStart := time.Now()
 		passBudgetSpent := false
+		priors := d.livePrior[profile]
+		nextPriors := make(map[string]liveStatusPrior, len(instances))
 		for _, inst := range instances {
 			previousStatus := normalizeStatusString(string(inst.Status))
+			// Persisted stop and queue decisions supersede older live samples.
+			// Keep them intact so UpdateStatus can distinguish an intentional
+			// stop or capacity wait from a vanished pane, while detecting starts.
+			if prior, ok := priors[inst.ID]; ok && inst.Status != StatusStopped && inst.Status != StatusQueued {
+				inst.SeedLiveStatusPrior(prior.status, prior.flipPending)
+			}
 			if passBudgetSpent || time.Since(passStart) > syncPassBudget {
 				if !passBudgetSpent {
 					passBudgetSpent = true
@@ -473,11 +684,33 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 				continue
 			}
 			status := normalizeStatusString(string(inst.GetStatusThreadSafe()))
-			statuses[inst.ID] = status
 			if db != nil && status != previousStatus {
-				_ = db.WriteStatus(inst.ID, status, inst.Tool)
+				applied, err := db.WriteStatusIfCurrent(inst.ID, previousStatus, status, inst.Tool)
+				if err != nil || !applied {
+					// Another writer may have stopped the session while this
+					// probe ran. Publish the committed verdict, not our stale
+					// sample, and drop its debounce prior and substate.
+					statuses[inst.ID] = previousStatus
+					if err == nil {
+						if rows, readErr := db.ReadAllStatuses(); readErr == nil {
+							if row, ok := rows[inst.ID]; ok {
+								statuses[inst.ID] = normalizeStatusString(row.Status)
+							}
+						}
+					}
+					inst.mu.Lock()
+					inst.Status = Status(statuses[inst.ID])
+					inst.mu.Unlock()
+					continue
+				}
+			}
+			statuses[inst.ID] = status
+			substates[inst.ID] = string(inst.CachedSubstate())
+			if st, pending, sampled := inst.LiveStatusPrior(); sampled {
+				nextPriors[inst.ID] = liveStatusPrior{status: st, flipPending: pending}
 			}
 		}
+		d.livePrior[profile] = nextPriors
 	}
 
 	// Self-heal Stage 1 (observe-only): evaluate every instance through the
@@ -487,9 +720,33 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 	// extra capture, no new goroutine (F3). Disabled-by-config → cheap no-op.
 	d.runSelfHealObservePass(profile, instances, statuses, hookStatuses, db, time.Now().UTC())
 
+	// Issue #2900: open a Codex run for every child seen running, before any
+	// emission path of this pass can decide a turn end.
+	d.observeCodexRuns(profile, byID, statuses, time.Now())
+
+	// Issue #2481: a child seen running starts a new run, so the next observed
+	// flip is a new turn unless a path journals one for it first.
+	d.forgetJournaledTurnsOfRunning(profile, statuses)
+
+	// A daemon PROCESS start (first pass for the profile) seeds the turn
+	// baseline from the registry against the persisted last-notified state, so
+	// a recycle does not republish every parked child. See seedTurnBaseline.
+	if !d.initialized[profile] {
+		d.seedTurnBaseline(profile, byID, statuses)
+	}
 	// Runs on EVERY pass, the first scan included — see the FIRST SCAN note on
 	// recordTerminalTurns for why suppressing it would recreate the field bug.
 	d.recordTerminalTurns(profile, byID, statuses, hookStatuses)
+	// Comms Ledger: a second, independent store fed from the producers'
+	// spool. Runs after the inbox path so nothing above changes.
+	d.ingestCommsSpool(profile, byID)
+	// Delivery canary ([comms] consumers): the ledger, not the inbox,
+	// wakes and feeds the listed parents.
+	d.deliverCommsLedger(profile, byID, statuses)
+	d.journalStatusChanges(profile, byID, statuses, substates)
+	if cfg, _ := LoadUserConfig(); cfg != nil && cfg.Macapp.TranscriptEvents {
+		transcriptGrowth.publish(profile, instances)
+	}
 
 	if !d.initialized[profile] {
 		// Cover fast transitions that completed before we observed a running snapshot.
@@ -521,28 +778,215 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 		if !notifyEnabled || !instanceAcceptsTransitionEvents(inst) {
 			continue
 		}
-		event := TransitionNotificationEvent{
-			ChildSessionID: id,
-			ChildTitle:     inst.Title,
-			Profile:        profile,
-			FromStatus:     from,
-			ToStatus:       to,
-			Timestamp:      time.Now(),
-			LastOutputHash: transitionEventOutputHash(inst),
-			// Honest Status v2 observability hook: stamp the additive substate so
-			// the emitted transition event is structured + substate-bearing. Use
-			// the CACHED value (no pane capture) — the daemon's own status poll
-			// just refreshed it, and an extra capture per transition would make
-			// this hot path heavier than the transcript-stat dedup signal above.
-			Substate: string(inst.CachedSubstate()),
-		}
-		_ = d.notifier.NotifyTransition(event)
+		// Issue #2469: every emission path goes through emitTurn, which
+		// classifies the turn from the transcript and journals it once. A
+		// pending (unflushed) turn is picked up by recordTerminalTurns on the
+		// next poll, so skipping the edge here loses nothing.
+		_, _ = d.emitTurn(profile, inst, byID, from, to, time.Now(), true)
 	}
+	// Issue #2806: an idle child whose process died; no turn, so not emitTurn.
+	d.confirmIdleExits(profile, byID, prev, statuses, notifyEnabled, time.Now())
 	d.emitHookTransitionCandidates(profile, byID, prev, statuses, hookCandidates)
+	// Issue #2900: a Codex run that ended at the composer with no record from
+	// the paths above gets exactly one now.
+	d.emitCodexTurnFallbacks(profile, byID, statuses, notifyEnabled, time.Now())
 	d.emitDoneSignals(profile, byID, hookStatuses)
+	d.wakeForInfoDigests(profile, byID, statuses)
+
+	// Last, after this pass's own sends and wakes: idle sessions on an
+	// outdated Claude/Codex build restart onto the new one ([sessions]
+	// auto_refresh_idle_builds, default on).
+	d.runIdleBuildRefreshPass(profile, instances, statuses, substates)
+	d.sweepRestartTokens(profile, byID, statuses, time.Now())
+	d.sweepFreshStartTokens(byID, time.Now())
 
 	d.lastStatus[profile] = copyStatusMap(statuses)
 	return choosePollInterval(statuses)
+}
+
+// wakeForInfoDigests wakes an idle parent once when info records have waited
+// past [inbox] info_digest_minutes (issue #2469, design principle 4). One
+// non-consuming inbox read per parent per pass; parents are few.
+func (d *TransitionDaemon) wakeForInfoDigests(profile string, byID map[string]*Instance, statuses map[string]string) {
+	parents := map[string]bool{}
+	for _, inst := range byID {
+		if inst != nil && inst.ParentSessionID != "" {
+			parents[inst.ParentSessionID] = true
+		}
+	}
+	now := time.Now()
+	for parentID := range parents {
+		parent := byID[parentID]
+		if parent == nil {
+			continue
+		}
+		cfg := ResolveInboxConfigForInstance(parent)
+		window := time.Duration(cfg.GetInfoDigestMinutes()) * time.Minute
+		due, records, children := DigestDue(parentID, window, now)
+		if !due {
+			continue
+		}
+		if st := normalizeStatusString(statuses[parentID]); st != string(StatusIdle) && st != string(StatusWaiting) {
+			continue
+		}
+		if d.notifier.fireDigestNudge(parent, profile, DigestNudgeMessage(records, children)) {
+			markDigestWake(parentID, now)
+			_ = BumpInboxStats(parentID, func(s *InboxStats) { s.WakeupsDigest++ })
+		}
+	}
+}
+
+// journalStatusChanges appends one status event per instance whose observed
+// status or substate differs from what the journal last saw, on the pass that
+// sees it. It reads only what this pass already observed: no tmux call, no
+// pane read. The first pass for a profile seeds the baseline and writes
+// nothing, so `from` is always a status this daemon observed.
+//
+// The write itself goes through the profile's AsyncWriter (see journalWriter),
+// never straight to the journal: this runs on the daemon's only goroutine, the
+// one every other profile's status detection also depends on, so a slow or
+// wedged health volume must not be able to block it.
+func (d *TransitionDaemon) journalStatusChanges(profile string, byID map[string]*Instance, statuses, substates map[string]string) {
+	// The writer (a goroutine and a queue) is resolved on the first event,
+	// so a profile with nothing to journal never starts one (ASK-229).
+	seen, known := d.lastJournaled[profile]
+	if !known {
+		seen = map[string]string{}
+		d.lastJournaled[profile] = seen
+	}
+	now := time.Now()
+	for id, to := range statuses {
+		substate := substates[id]
+		key := to + "|" + substate
+		previous, ok := seen[id]
+		seen[id] = key
+		if !known || !ok || previous == key {
+			continue
+		}
+		from, fromSubstate, _ := strings.Cut(previous, "|")
+		// Recall trigger (docs/recall.md): a running session that stopped
+		// running just finished a turn; queue its transcript for the next
+		// sweep. Handed to the recall notify worker like the journal write
+		// goes to its async writer: resolving the transcript path walks
+		// the recall roots, and nothing on this goroutine may.
+		if from == "running" && to != "running" {
+			RecallNotifyInstanceAsync(byID[id], "turn_end")
+		}
+		writer := d.journalWriter(profile)
+		if writer == nil {
+			continue
+		}
+		event := health.Event{TS: now, SessionID: id, Kind: health.KindStatus, From: from, To: to}
+		detail := map[string]any{}
+		if substate != "" {
+			detail["substate"] = substate
+		}
+		if exitCode := byID[id].ExitCode(); exitCode != nil {
+			detail["exit_code"] = *exitCode
+		}
+		if fromSubstate != "" {
+			detail["substate_from"] = fromSubstate
+		}
+		if len(detail) > 0 {
+			event.Detail = detail
+		}
+		writer.Append(event)
+	}
+	for id := range seen {
+		if _, ok := statuses[id]; !ok {
+			delete(seen, id)
+			delete(d.orphansEmitted, id)
+		}
+	}
+}
+
+// journalWriter resolves the profile's async journal writer, creating it (and
+// the journal behind it) on first use and caching the answer, nil included,
+// for the daemon's lifetime. A nil writer means the session_events kill switch
+// is off for this profile; Append and Stop on it are no-ops.
+func (d *TransitionDaemon) journalWriter(profile string) *health.AsyncWriter {
+	if writer, ok := d.journalWriters[profile]; ok {
+		return writer
+	}
+	var writer *health.AsyncWriter
+	// The kill switch yields a nil *Journal, which must be caught here: boxed
+	// into a health.Appender it would no longer compare equal to nil.
+	if journal := SessionEventJournal(profile); journal != nil {
+		writer = health.NewAsyncWriter(journal, health.DefaultJournalQueueSize)
+	}
+	d.journalWriters[profile] = writer
+	return writer
+}
+
+// turnBaseline returns the per-instance completed-turn map for profile,
+// creating it on first use. Shared by seedTurnBaseline and recordTerminalTurns.
+func (d *TransitionDaemon) turnBaseline(profile string) map[string]string {
+	if d.lastTurn == nil {
+		d.lastTurn = map[string]map[string]string{}
+	}
+	if d.lastTurn[profile] == nil {
+		d.lastTurn[profile] = map[string]string{}
+	}
+	return d.lastTurn[profile]
+}
+
+// seedTurnBaseline runs once per profile, on the daemon's first pass, BEFORE
+// recordTerminalTurns. It marks every child already parked at a recordable
+// status as "seen" so the first pass publishes nothing for it — unless the
+// persisted last-notified state (transition-notify-state.json) says the child
+// was last notified at a DIFFERENT status or transcript signal, in which case
+// the turn happened while the daemon was down and recordTerminalTurns notifies
+// it once.
+//
+// Issue #2240 (field report, v1.16.5): the notify-daemon is recycled by its
+// systemd unit (RuntimeMaxSec) and after every auto-update, and on every start
+// it re-emitted a running→waiting record for EVERY parked child, however old.
+// The consumed-turn ledger collapsed the records on drain, so the conductor saw
+// "No pending events" — but the [INBOX] wake-nudge had already landed: one
+// wasted turn per conductor per restart. The FIRST SCAN note on
+// recordTerminalTurns leaned on that ledger to make the replay free; the nudge
+// made it not free.
+//
+// Rules, per child at a recordable status:
+//   - no persisted record (first-ever start, or a child never notified) → seed
+//     silently. This is deliberately the same on a brand-new install: a fresh
+//     daemon must not present every long-finished session as news.
+//   - persisted record equals the current (status, signal) → already
+//     notified, seed silently.
+//   - persisted record differs → leave unseeded so recordTerminalTurns records
+//     the turn that completed during the downtime, exactly once.
+//
+// A corrupt or unreadable state file loads as empty (logged by loadState), so
+// it degrades to the first-ever-start case rather than a replay storm.
+//
+// Children that appear AFTER this pass are not seeded and are recorded on first
+// sight, which is what keeps the field round-3 race (session launched and
+// finished between two polls) covered. The residual hole is narrow and
+// accepted: a child that had never been notified before and completed its
+// first turn inside the daemon's own restart window is seeded, not notified.
+func (d *TransitionDaemon) seedTurnBaseline(profile string, byID map[string]*Instance, statuses map[string]string) {
+	seen := d.turnBaseline(profile)
+	for id, to := range statuses {
+		if !isRecordableTurnStatus(to) {
+			continue
+		}
+		inst := byID[id]
+		if inst == nil {
+			continue
+		}
+		if _, known := seen[id]; known {
+			continue
+		}
+		signal := d.turnSignal(inst)
+		if lastTo, lastHash, ok := d.notifier.lastNotifiedTurn(id); ok && (lastTo != to || lastHash != signal) &&
+			!(lastTo == to && d.codexRunRecordCovers(inst, to)) {
+			// Changed while down: recordTerminalTurns notifies it once. A
+			// Codex record under a run signal never equals the hook signal
+			// (issue #2900): it is seeded when the hook holds nothing newer.
+			continue
+		}
+		seen[id] = to + "|" + signal
+	}
 }
 
 // recordTerminalTurns records EVERY completed turn into the drainable ledgers,
@@ -605,23 +1049,35 @@ func (d *TransitionDaemon) recordTerminalTurns(
 	hookStatuses map[string]*HookStatus,
 ) {
 	notifyEnabled := GetNotificationsSettings().GetTransitionEventsEnabled()
-	if d.lastTurn == nil {
-		d.lastTurn = map[string]map[string]string{}
-	}
-	if d.lastTurn[profile] == nil {
-		d.lastTurn[profile] = map[string]string{}
-	}
-	seen := d.lastTurn[profile]
+	seen := d.turnBaseline(profile)
 
 	for id, to := range statuses {
+		var snap *HookStatus
+		if pinst := byID[id]; pinst != nil && strings.EqualFold(strings.TrimSpace(pinst.Tool), "pi") {
+			snap = d.statusSnapshot(id) // the one read of this candidate, orphan and verdict alike
+			d.recordOrphanedPiRuns(profile, pinst, byID, snap, notifyEnabled)
+		}
 		if !isRecordableTurnStatus(to) {
+			if notifyEnabled {
+				d.rememberHeldSendFromPoll(byID[id], to)
+			}
 			continue
 		}
 		inst := byID[id]
 		if inst == nil {
 			continue
 		}
-		signal := transitionEventOutputHash(inst)
+		var signal string
+		var pi *piTurnVerdict
+		if strings.EqualFold(strings.TrimSpace(inst.Tool), "pi") {
+			v := piVerdict(inst, snap, to, time.Now())
+			if v.Awaiting {
+				continue // an unsettled turn_end is a status edge, not an inbox turn
+			}
+			pi, signal = &v, v.Signal
+		} else {
+			signal = transitionEventOutputHash(inst)
+		}
 		key := to + "|" + signal
 		previous, known := seen[id]
 		if known && previous == key {
@@ -652,29 +1108,31 @@ func (d *TransitionDaemon) recordTerminalTurns(
 		if !notifyEnabled || !instanceAcceptsTransitionEvents(inst) {
 			continue
 		}
-		// Commit the dedup key only after the observation is eligible. A registry
-		// row can appear before its tmux session, and notification settings can be
-		// enabled while a turn remains parked; neither temporary rejection may
-		// permanently suppress that unchanged turn.
-		seen[id] = key
-
 		// FromStatus is stamped `running` rather than the observed previous
 		// status, matching what emitHookTransitionCandidates already does for
 		// turns too fast to observe: a turn that reached a terminal status ran,
 		// whether or not any poll caught it doing so. It also makes the
 		// fingerprint identical to the snapshot loop's for the same turn, which
 		// is what lets the inbox collapse the pair.
-		event := TransitionNotificationEvent{
-			ChildSessionID: id,
-			ChildTitle:     inst.Title,
-			Profile:        profile,
-			FromStatus:     string(StatusRunning),
-			ToStatus:       to,
-			Timestamp:      time.Now(),
-			LastOutputHash: signal,
-			Substate:       string(inst.CachedSubstate()),
+		//
+		// Issue #2469: emitTurn classifies and journals the turn. A pending
+		// turn (assistant record not flushed yet) leaves the key uncommitted so
+		// this exact observation retries next poll instead of being recorded
+		// under the size signal and then again under the turn signal.
+		var ok bool
+		if pi != nil {
+			_, ok = d.emitTurnWith(profile, inst, byID, string(StatusRunning), to, time.Now(), false, pi)
+		} else {
+			_, ok = d.emitTurn(profile, inst, byID, string(StatusRunning), to, time.Now(), false)
 		}
-		_ = d.notifier.NotifyTransition(event)
+		if !ok {
+			continue
+		}
+		// Commit the dedup key only after the observation is eligible. A registry
+		// row can appear before its tmux session, and notification settings can be
+		// enabled while a turn remains parked; neither temporary rejection may
+		// permanently suppress that unchanged turn.
+		seen[id] = key
 	}
 
 	// Instances that disappeared (stopped, removed) must not keep an entry, or a
@@ -684,6 +1142,49 @@ func (d *TransitionDaemon) recordTerminalTurns(
 			delete(seen, id)
 		}
 	}
+}
+
+// recordOrphanedPiRuns emits each run a pi child's status file carries forward
+// because newer runs overwrote it unsettled (hook-handler's carryOrphanedPiRuns),
+// once, as a waiting turn under that run's own key, whatever the child is doing
+// now. The notifier's persisted pi-run fingerprint is the durable dedupe; the
+// per-instance set here only spares the following polls the work, and keeps just
+// the runs the file still lists.
+func (d *TransitionDaemon) recordOrphanedPiRuns(profile string, inst *Instance, byID map[string]*Instance, hs *HookStatus, notifyEnabled bool) {
+	if hs == nil || hs.PiOrphanCount == 0 {
+		delete(d.orphansEmitted, inst.ID)
+		return
+	}
+	done := d.orphansEmitted[inst.ID]
+	next := map[string]bool{}
+	for _, o := range hs.PiOrphanRuns[:hs.PiOrphanCount] {
+		if o.expired(time.Now()) {
+			continue // its consumed key may be pruned: it must not come back
+		}
+		signal := piRunSignal(o.RunID)
+		if done[signal] {
+			next[signal] = true
+			continue
+		}
+		if d.turnLiveCheck != nil && !d.turnLiveCheck(inst) {
+			continue
+		}
+		if !notifyEnabled || !instanceAcceptsTransitionEvents(inst) {
+			continue
+		}
+		at := time.Now()
+		if o.TurnEndNS > 0 {
+			at = time.Unix(0, o.TurnEndNS)
+		}
+		v := &piTurnVerdict{Signal: signal}
+		if _, ok := d.emitTurnWith(profile, inst, byID, string(StatusRunning), string(StatusWaiting), at, false, v); ok {
+			next[signal] = true
+		}
+	}
+	if d.orphansEmitted == nil {
+		d.orphansEmitted = map[string]map[string]bool{}
+	}
+	d.orphansEmitted[inst.ID] = next
 }
 
 // emitDoneSignals turns a worker-printed completion sentinel (persisted into
@@ -709,12 +1210,42 @@ func (d *TransitionDaemon) emitDoneSignals(profile string, byID map[string]*Inst
 		if !ok {
 			continue
 		}
-		if prev, ok := d.lastDone[profile][id]; ok && prev == sig {
-			continue // already emitted this exact completion
-		}
-
 		inst := byID[id]
+		if inst == nil {
+			continue
+		}
 		if !notifyEnabled || !instanceAcceptsTransitionEvents(inst) {
+			d.recordSuppressedDone(profile, inst, sig, hs.UpdatedAt, notifyEnabled)
+			continue
+		}
+		if prev, ok := d.lastDone[profile][id]; ok && prev == sig {
+			continue // already emitted this exact completion (here or by emitTurn)
+		}
+		if d.suppressedDoneSeen(profile, id, sig, hs.UpdatedAt) {
+			// This hook file's completion was recorded while delivery was
+			// off; delivery is back on, but re-reading the same file is not a
+			// new completion. Only this hook-file path holds it: a child with
+			// a transcript gets the parked turn from emitTurn, as on main.
+			// Not remembered in lastDone, so an identical completion on a
+			// later Stop is delivered.
+			continue
+		}
+		// Issue #2481: after a daemon restart (or for a tool without a
+		// transcript) the durable ledger still recognises a repeat. This
+		// path has no trigger, so it treats the turn as background; for a
+		// child with a readable transcript emitTurn owns the decision (it
+		// knows who started the turn), so a repeat here is held back without
+		// being counted and emitTurn delivers or counts it.
+		at := hs.UpdatedAt
+		if at.IsZero() {
+			at = time.Now()
+		}
+		_, emitTurnOwns := instanceTurnFacts(inst)
+		if repeat, counted := checkDoneRepeat(id, profile, sig, "", true, !emitTurnOwns, at); repeat {
+			if counted {
+				_ = BumpInboxStats(statsParentFor(inst), func(s *InboxStats) { s.DoneRepeats++ })
+			}
+			d.rememberDone(profile, id, sig)
 			continue
 		}
 
@@ -727,11 +1258,7 @@ func (d *TransitionDaemon) emitDoneSignals(profile string, byID map[string]*Inst
 			Timestamp:      hs.UpdatedAt,
 		}
 		_ = d.notifier.NotifyFinished(event)
-
-		if d.lastDone[profile] == nil {
-			d.lastDone[profile] = map[string]DoneSignal{}
-		}
-		d.lastDone[profile][id] = sig
+		d.rememberDone(profile, id, sig)
 
 		// Record the completion to the non-destructive ledger so a parent can
 		// query `session children` without consuming the delivery event.
@@ -745,6 +1272,84 @@ func (d *TransitionDaemon) emitDoneSignals(profile string, byID map[string]*Inst
 			FinishedAt: hs.UpdatedAt,
 		})
 	}
+}
+
+// recordSuppressedDone handles a completion whose delivery is switched off
+// (the child's NoTransitionNotify, or [notifications] transition_events =
+// false). Nothing goes to the parent, but the child did finish: the
+// completion goes to the ledger `session children` reads, and the
+// suppression is logged once so it can be told apart from a lost event.
+// checkDoneRepeat is not consulted: it counts repeats of a delivered
+// completion into the parent's stats, and nothing was delivered. The entry is
+// marked Suppressed so checkDoneRepeat does not treat it as delivered either.
+// One completion is one (signal, Stop edge): re-reads of the same hook file
+// are skipped in-process and, after a daemon restart, against the ledger. It
+// is remembered as handled only once the ledger write succeeds, so a failed
+// write is retried on the next poll.
+func (d *TransitionDaemon) recordSuppressedDone(profile string, inst *Instance, sig DoneSignal, at time.Time, notifyEnabled bool) {
+	if d.suppressedDoneSeen(profile, inst.ID, sig, at) {
+		return
+	}
+	// Muted while the hook file of a completion that was already delivered is
+	// still fresh: that delivered entry stands. Its time is the delivery
+	// (emitTurn) or this Stop edge (hook path), never before the edge; a
+	// later identical Stop has a later edge and is recorded.
+	if prev, ok := ReadLedgerEntry(inst.ID); ok && !prev.Suppressed && sameDelivered(prev, profile, sig) && !prev.FinishedAt.Before(at) {
+		d.rememberSuppressedDone(profile, inst.ID, sig, at)
+		return
+	}
+	reason := deadLetterReasonNoNotify
+	if !notifyEnabled {
+		reason = "transition_events_disabled"
+	}
+	if err := WriteLedgerEntry(CompletionLedgerEntry{
+		ChildID:    inst.ID,
+		Profile:    profile,
+		Title:      inst.Title,
+		Status:     sig.Status,
+		Summary:    sig.Summary,
+		FinishedAt: at,
+		Suppressed: true,
+	}); err != nil {
+		commsLog.Warn("done_suppressed_ledger_write_failed", slog.String("child", inst.ID), slog.String("error", err.Error()))
+		return
+	}
+	d.rememberSuppressedDone(profile, inst.ID, sig, at)
+	commsLog.Info("done_suppressed",
+		slog.String("child", inst.ID),
+		slog.String("profile", profile),
+		slog.String("reason", reason),
+		slog.String("status", sig.Status))
+}
+
+// suppressedDone identifies one completion recorded while delivery was off.
+type suppressedDone struct {
+	sig DoneSignal
+	at  time.Time
+}
+
+// suppressedDoneSeen reports whether sig at this Stop edge was already
+// recorded while delivery was off: in this process, or, after a daemon
+// restart, in the ledger (which it then remembers in-process).
+func (d *TransitionDaemon) suppressedDoneSeen(profile, childID string, sig DoneSignal, at time.Time) bool {
+	if prev, ok := d.lastSuppressedDone[profile][childID]; ok && prev.sig == sig && prev.at.Equal(at) {
+		return true
+	}
+	if prev, ok := ReadLedgerEntry(childID); ok && prev.Suppressed && sameDelivered(prev, profile, sig) && prev.FinishedAt.Equal(at) {
+		d.rememberSuppressedDone(profile, childID, sig, at)
+		return true
+	}
+	return false
+}
+
+func (d *TransitionDaemon) rememberSuppressedDone(profile, childID string, sig DoneSignal, at time.Time) {
+	if d.lastSuppressedDone == nil {
+		d.lastSuppressedDone = map[string]map[string]suppressedDone{}
+	}
+	if d.lastSuppressedDone[profile] == nil {
+		d.lastSuppressedDone[profile] = map[string]suppressedDone{}
+	}
+	d.lastSuppressedDone[profile][childID] = suppressedDone{sig: sig, at: at}
 }
 
 // doneSignalFor resolves a hook status into a completion sentinel, or reports
@@ -855,9 +1460,8 @@ func (d *TransitionDaemon) shutdown() {
 	}
 	// Flush any in-flight async dispatches before closing storage so their
 	// logEvent/logMissed writes aren't lost when the process exits.
-	if d.notifier != nil {
-		d.notifier.Flush()
-	}
+	d.Flush()
+	d.closeCommsLedgers()
 	for _, s := range d.storages {
 		if s != nil {
 			_ = s.Close()
@@ -865,12 +1469,22 @@ func (d *TransitionDaemon) shutdown() {
 	}
 }
 
-// Flush exposes the notifier's in-flight-dispatch wait for callers of
-// SyncOnce that need deterministic log output before returning (e.g., the
-// `agent-deck notify-daemon --once` CLI path).
+// journalFlushTimeout bounds how long a clean shutdown waits for queued
+// journal events to land. Short and fixed: a shutdown must not itself hang on
+// the same wedged volume the async writer exists to protect against.
+const journalFlushTimeout = 2 * time.Second
+
+// Flush exposes the notifier's in-flight-dispatch wait, and drains every
+// profile's journal writer, for callers of SyncOnce that need deterministic
+// on-disk state before returning (e.g., the `agent-deck notify-daemon --once`
+// CLI path, and shutdown above). Draining a journal writer also stops it for
+// good, which suits every caller: they are the paths that exit right after.
 func (d *TransitionDaemon) Flush() {
 	if d.notifier != nil {
 		d.notifier.Flush()
+	}
+	for _, w := range d.journalWriters {
+		w.Stop(journalFlushTimeout)
 	}
 }
 
@@ -908,6 +1522,31 @@ func copyStatusMap(in map[string]string) map[string]string {
 	return out
 }
 
+// statusSnapshot reads an instance's hook status file once per SyncOnce and
+// shares that snapshot with every consumer in the pass (the hook status lookup,
+// recordTerminalTurns and emitTurn), so a file that changes mid-pass cannot give
+// one candidate two different verdicts. Outside a pass it reads directly.
+func (d *TransitionDaemon) statusSnapshot(instanceID string) *HookStatus {
+	if d.passStatus == nil {
+		return readHookStatusForPass(instanceID)
+	}
+	hs, ok := d.passStatus[instanceID]
+	if !ok {
+		hs = readHookStatusForPass(instanceID)
+		d.passStatus[instanceID] = hs
+	}
+	return hs
+}
+
+// turnSignal is transitionEventOutputHash for a pass: a pi child's run key comes
+// from the pass's one status snapshot, never a read of its own.
+func (d *TransitionDaemon) turnSignal(inst *Instance) string {
+	if strings.EqualFold(strings.TrimSpace(inst.Tool), "pi") {
+		return piVerdict(inst, d.statusSnapshot(inst.ID), "", time.Now()).Signal
+	}
+	return transitionEventOutputHash(inst)
+}
+
 func (d *TransitionDaemon) hookStatusForInstance(instanceID string) *HookStatus {
 	var best *HookStatus
 	if d.hookWatcher != nil {
@@ -915,7 +1554,7 @@ func (d *TransitionDaemon) hookStatusForInstance(instanceID string) *HookStatus 
 			best = hs
 		}
 	}
-	if hs := readHookStatusFile(instanceID); hs != nil {
+	if hs := d.statusSnapshot(instanceID); hs != nil {
 		if best == nil || hs.UpdatedAt.After(best.UpdatedAt) {
 			best = hs
 		}
@@ -944,6 +1583,47 @@ func hookStatusFilePath(instanceID string) string {
 	return filepath.Join(hooksDir, instanceID+".json")
 }
 
+// HookTurnSeqSuffix names the file next to the hook file that holds the
+// instance's turn_seq as a decimal (#3012). The hook handler writes it on each
+// turn edge, under the status lock. It outlives <id>.json, which the TUI
+// removes on every attach-return (ClearHookStatus); only the prune of a
+// deleted session's artifacts removes it.
+const HookTurnSeqSuffix = ".turnseq"
+
+// readHookTurnSeq is the instance's turn_seq (#3012): the larger of the hook
+// file's and <id>.turnseq's, 0 when neither has one. Unlike readHookStatusFile
+// it does not check the launch generation: the count belongs to the instance,
+// not to one process, so a token taken before a respawn reads the same counter
+// the new process continues.
+func readHookTurnSeq(instanceID string) uint64 {
+	if strings.TrimSpace(instanceID) == "" {
+		return 0
+	}
+	var seq uint64
+	if data, err := readStatusFileNoFollow(hookStatusFilePath(instanceID)); err == nil {
+		var raw struct {
+			TurnSeq uint64 `json:"turn_seq"`
+		}
+		if json.Unmarshal(data, &raw) == nil {
+			seq = raw.TurnSeq
+		}
+	}
+	// A sandboxed handler writes it in the instance's scope, any other in
+	// the flat dir; a scope can outlive its sandbox, so read both.
+	hooksDir := GetHooksDir()
+	for _, path := range []string{
+		filepath.Join(hooksDir, instanceID+HookTurnSeqSuffix),
+		filepath.Join(hooksDir, "sandbox", instanceID, instanceID+HookTurnSeqSuffix),
+	} {
+		if data, err := readStatusFileNoFollow(path); err == nil {
+			if n, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64); err == nil {
+				seq = max(seq, n)
+			}
+		}
+	}
+	return seq
+}
+
 func readHookStatusFile(instanceID string) *HookStatus {
 	if strings.TrimSpace(instanceID) == "" {
 		return nil
@@ -957,20 +1637,31 @@ func readHookStatusFile(instanceID string) *HookStatus {
 		return nil
 	}
 	var raw struct {
-		Status                   string `json:"status"`
-		SessionID                string `json:"session_id"`
-		Event                    string `json:"event"`
-		Timestamp                int64  `json:"ts"`
-		DoneStatus               string `json:"done_status"`
-		DoneSummary              string `json:"done_summary"`
-		TranscriptPath           string `json:"transcript_path"`
-		Cwd                      string `json:"cwd"`
-		CodexStartedGeneration   string `json:"codex_started_generation"`
-		CodexCompletedGeneration string `json:"codex_completed_generation"`
-		CodexStartedSessionID    string `json:"codex_started_session_id"`
-		CodexCompletedSessionID  string `json:"codex_completed_session_id"`
-		HookGeneration           string `json:"hook_generation"`
-		Sequence                 uint64 `json:"sequence"`
+		Status                   string        `json:"status"`
+		SessionID                string        `json:"session_id"`
+		Event                    string        `json:"event"`
+		Timestamp                int64         `json:"ts"`
+		DoneStatus               string        `json:"done_status"`
+		DoneSummary              string        `json:"done_summary"`
+		TranscriptPath           string        `json:"transcript_path"`
+		Cwd                      string        `json:"cwd"`
+		Platform                 string        `json:"platform"`
+		CodexStartedGeneration   string        `json:"codex_started_generation"`
+		CodexCompletedGeneration string        `json:"codex_completed_generation"`
+		CodexStartedSessionID    string        `json:"codex_started_session_id"`
+		CodexCompletedSessionID  string        `json:"codex_completed_session_id"`
+		CodexStartedSequence     uint64        `json:"codex_started_sequence"`
+		CodexCompletedSequence   uint64        `json:"codex_completed_sequence"`
+		HookGeneration           string        `json:"hook_generation"`
+		Sequence                 uint64        `json:"sequence"`
+		PiSettleTurnID           string        `json:"pi_settle_turn_id"`
+		PiSettleSessionID        string        `json:"pi_settle_session_id"`
+		PiSettledAt              int64         `json:"pi_settled_at"`
+		Settles                  bool          `json:"settles"`
+		PiRunID                  string        `json:"pi_run_id"`
+		PiOrphanRuns             []PiOrphanRun `json:"pi_orphan_runs"`
+		ReceivedAtNS             int64         `json:"received_at_ns"`
+		TurnSeq                  uint64        `json:"turn_seq"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil
@@ -994,15 +1685,49 @@ func readHookStatusFile(instanceID string) *HookStatus {
 		DoneSummary:              raw.DoneSummary,
 		TranscriptPath:           raw.TranscriptPath,
 		Cwd:                      raw.Cwd,
+		Platform:                 raw.Platform,
 		CodexStartedGeneration:   raw.CodexStartedGeneration,
 		CodexCompletedGeneration: raw.CodexCompletedGeneration,
 		CodexStartedSessionID:    raw.CodexStartedSessionID,
 		CodexCompletedSessionID:  raw.CodexCompletedSessionID,
+		CodexStartedSequence:     raw.CodexStartedSequence,
+		CodexCompletedSequence:   raw.CodexCompletedSequence,
 		HookGeneration:           raw.HookGeneration,
 		Sequence:                 raw.Sequence,
+		PiSettleTurnID:           raw.PiSettleTurnID,
+		PiSettleSessionID:        raw.PiSettleSessionID,
+		PiSettledAt:              raw.PiSettledAt,
+		Settles:                  raw.Settles,
+		PiRunID:                  raw.PiRunID,
+		PiOrphanRuns:             orphanArray(raw.PiOrphanRuns), PiOrphanCount: min(len(raw.PiOrphanRuns), PiOrphanRunsMax),
+		ReceivedAt: receivedAtFromNS(raw.ReceivedAtNS),
+		TurnSeq:    raw.TurnSeq,
 	}
 	maskConsumedCodexCompletion(instanceID, hookStatus)
 	return hookStatus
+}
+
+// rememberHeldSendFromPoll remembers the sender of a tagged send whose turn
+// handed off to background work, seen from the poll rather than a Stop hook
+// (issue #2473). A hook-less Claude session ([claude] hooks_enabled = false)
+// never yields a hook candidate, and neither does a Stop the notify daemon
+// missed while it was down; on both, the merged status stays running for the
+// whole workflow, so the send turn is never recorded. Without this the task
+// turn that settles the work would carry no sender and the sender would get
+// no reply. rememberHeldSend is idempotent per turn and skips a turn the
+// journal already holds, so the hook path and this one may both see the same
+// held turn, and a send turn answered during a menu or a lapsed hold is not
+// remembered again when the work resumes.
+func (d *TransitionDaemon) rememberHeldSendFromPoll(inst *Instance, status string) {
+	if inst == nil || normalizeStatusString(status) != string(StatusRunning) {
+		return
+	}
+	if !instanceAcceptsTransitionEvents(inst) || !backgroundWorkHoldsTurn(inst) {
+		return
+	}
+	if facts, ok := instanceTurnFacts(inst); ok {
+		rememberHeldSend(inst.ID, facts)
+	}
 }
 
 func (d *TransitionDaemon) emitHookTransitionCandidates(
@@ -1025,6 +1750,24 @@ func (d *TransitionDaemon) emitHookTransitionCandidates(
 		// signal; suppress poll-inferred candidates for it. Interactive
 		// sessions (no completion record) are unaffected.
 		if CompletionRecordExists(profile, id) {
+			continue
+		}
+
+		// Issue #2473: a Stop hook that ended the turn by handing off to
+		// background work (a Workflow, background agents, shells, a Monitor)
+		// is not a finished turn. The merged status keeps such a session
+		// running; the hook file alone must not emit running -> waiting for
+		// it. The real edge is emitted when the work reports back and the
+		// session settles (snapshot path, trigger "task"). A permission
+		// request or elicitation is never held: the child is blocked on
+		// input while the work runs, and the parent must be told.
+		if !hookEventBlocksTurn(candidate.Event) &&
+			normalizeStatusString(current[id]) == string(StatusRunning) && backgroundWorkHoldsTurn(inst) {
+			// The held turn may be the only one that names a tagged send's
+			// sender; remember it so the turn that settles the work replies.
+			if facts, ok := instanceTurnFacts(inst); ok {
+				rememberHeldSend(inst.ID, facts)
+			}
 			continue
 		}
 
@@ -1061,16 +1804,7 @@ func (d *TransitionDaemon) emitHookTransitionCandidates(
 		// for an interactive agent, so omitting it would miss most alerts.
 		d.notifyDesktop(profile, inst, to)
 
-		event := TransitionNotificationEvent{
-			ChildSessionID: id,
-			ChildTitle:     inst.Title,
-			Profile:        profile,
-			FromStatus:     string(StatusRunning),
-			ToStatus:       to,
-			Timestamp:      candidate.Timestamp,
-			LastOutputHash: transitionEventOutputHash(inst),
-		}
-		_ = d.notifier.NotifyTransition(event)
+		_, _ = d.emitTurn(profile, inst, byID, string(StatusRunning), to, candidate.Timestamp, false)
 	}
 }
 
@@ -1103,24 +1837,41 @@ func terminalHookTransitionCandidate(tool string, hs *HookStatus) (hookTransitio
 	}
 
 	event := strings.ToLower(strings.TrimSpace(hs.Event))
-	switch strings.ToLower(strings.TrimSpace(tool)) {
+	toolKey := strings.ToLower(strings.TrimSpace(tool))
+	if IsCodexCompatible(tool) {
+		// Issue #2900: a custom tool wrapping Codex writes the same notify
+		// hook file; keyed on the literal "codex" its turn ends never
+		// produced a candidate.
+		toolKey = "codex"
+	}
+	switch toolKey {
 	case "claude":
 		// SessionStart is intentionally excluded (initial prompt isn't task completion).
 		if event == "stop" || event == "permissionrequest" || event == "notification" {
-			return hookTransitionCandidate{ToStatus: to, Timestamp: hs.UpdatedAt}, true
+			return hookTransitionCandidate{ToStatus: to, Timestamp: hs.UpdatedAt, Event: hs.Event}, true
 		}
 	case "codex":
 		if isCodexTerminalHookEvent(event) {
-			return hookTransitionCandidate{ToStatus: to, Timestamp: hs.UpdatedAt}, true
+			return hookTransitionCandidate{ToStatus: to, Timestamp: hs.UpdatedAt, Event: hs.Event}, true
 		}
 	case "cursor":
 		// sessionStart is intentionally excluded (initial prompt isn't task completion).
 		if event == "stop" {
-			return hookTransitionCandidate{ToStatus: to, Timestamp: hs.UpdatedAt}, true
+			return hookTransitionCandidate{ToStatus: to, Timestamp: hs.UpdatedAt, Event: hs.Event}, true
 		}
 	case "hermes":
 		if event == "post_llm_call" || event == "postllmcall" || event == "onsessionend" || event == "on_session_end" {
-			return hookTransitionCandidate{ToStatus: to, Timestamp: hs.UpdatedAt}, true
+			return hookTransitionCandidate{ToStatus: to, Timestamp: hs.UpdatedAt, Event: hs.Event}, true
+		}
+	case "pi":
+		// Issue #2665: pi's extension emits turn_end when a turn finishes.
+		// Without this case a pi turn reached the parent only through the
+		// snapshot edge, which needs a polled `running` status. A short turn
+		// answered between two polls (the common case, and every turn after a
+		// revive left the tracked status at error) never produced an event.
+		// session_start is excluded like Claude's SessionStart.
+		if event == "turn_end" || event == "turnend" {
+			return hookTransitionCandidate{ToStatus: to, Timestamp: hs.UpdatedAt, Event: hs.Event}, true
 		}
 	}
 	return hookTransitionCandidate{}, false
@@ -1141,7 +1892,7 @@ func isTerminalHookEvent(event string) bool {
 	norm = strings.NewReplacer(".", "", "-", "", "_", "", "/", "", " ", "").Replace(norm)
 	switch norm {
 	case "sessionend", "sessionended", "sessionclose", "sessionclosed", "sessiondone", "sessionexit", "sessionexited",
-		"onsessionfinalize",
+		"onsessionfinalize", "sessionshutdown",
 		"threadend", "threadended", "threadterminate", "threadterminated", "threadclose", "threadclosed",
 		"threaddone", "threadexit", "threadexited":
 		return true
@@ -1225,6 +1976,13 @@ func (d *TransitionDaemon) notifyDesktop(profile string, inst *Instance, toStatu
 	// Honour the per-session opt-out the parent path already respects, so one
 	// noisy session can be silenced without disabling notifications globally.
 	if inst.NoTransitionNotify {
+		return
+	}
+	// An archived session is one the operator filed away, so it never raises
+	// a banner. Only this operator alert is gated: the parent-inbox path in
+	// the poll loop still records the child's turn, because a conductor
+	// archives a finished worker and still needs its completion record.
+	if inst.IsArchived() {
 		return
 	}
 	// Edge-trigger: notify once per entry into a status, not once per poll

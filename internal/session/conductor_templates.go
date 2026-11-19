@@ -1,5 +1,266 @@
 package session
 
+import "strings"
+
+// previousConductorInstructionsTemplate reconstructs the immediately previous
+// generated template. Installers compare its fully rendered form byte-for-byte
+// before migrating, so any user customization is preserved.
+func previousConductorInstructionsTemplate(template string) string {
+	template = preStandingOrdersConductorInstructionsTemplate(template)
+	template = preArchivedSessionsConductorInstructionsTemplate(template)
+	template = preHarnessControlConductorInstructionsTemplate(template)
+	template = prePlainReadConductorInstructionsTemplate(template)
+	template = preNoOpNoticeRuleConductorInstructionsTemplate(template)
+	template = preBackgroundWorkConductorInstructionsTemplate(template)
+	// Issue #2469 (comms redesign): the heartbeat section gained the
+	// prompt-time drain wording and the record tiers paragraph. Revert them so
+	// a conductor written by v1.16.23 and earlier is recognised as generated.
+	template = strings.Replace(template,
+		`Your hooks drain the same queue
+automatically when your agent supports hooks (Claude Code): at the start of every turn
+(records appear in your context under `+"`"+`[agent-deck inbox]`+"`"+`) and at each turn boundary
+for urgent records, so this heartbeat drain is the fallback — together they guarantee no
+completion is missed. Agents without hooks (Codex, Hermes) get the records only from this drain.
+
+Records are tiered and carry the child's own text (issue #2469): `+"`"+`urgent`+"`"+` (a completion
+sentinel, an error, or an explicit question to you) wakes you;
+`+"`"+`info`+"`"+` (progress in a turn a background task started) waits for your next turn or a
+digest. Act on the text in the record. Do NOT run `+"`"+`session output`+"`"+` on a child whose
+record you already have unless the text is clipped and you need the rest.`,
+		`Your Stop hook drains the same queue
+automatically at each turn boundary, so this heartbeat drain is the idle-conductor
+fallback — together they guarantee no completion is missed whether you are busy or idle.`, 1)
+	template = preHumanTierConductorInstructionsTemplate(template)
+	template = strings.Replace(template,
+		`| `+"`"+`agent-deck -p <PROFILE> status --json`+"`"+` | **Always triage with this compact count summary first:** `+"`"+`{"waiting": N, "running": N, "idle": N, "error": N, "stopped": N, "total": N}`+"`"+` |`,
+		`| `+"`"+`agent-deck -p <PROFILE> status --json`+"`"+` | Get counts: `+"`"+`{"waiting": N, "running": N, "idle": N, "error": N, "stopped": N, "total": N}`+"`"+` |`, 1)
+	template = strings.Replace(template,
+		`| `+"`"+`agent-deck -p <PROFILE> list --json`+"`"+` | Expensive full inventory; use only when the user explicitly needs details for every profile session, never for status triage or polling |`,
+		`| `+"`"+`agent-deck -p <PROFILE> list --json`+"`"+` | List all sessions with details (id, title, path, tool, status, group) |`, 1)
+	template = strings.Replace(template,
+		`| `+"`"+`agent-deck -p <PROFILE> session children --follow --until-done`+"`"+` | Block in one shell call while children run; emits every waiting/error transition and exits when all children are terminal |`+"\n", "", 1)
+	template = strings.Replace(template,
+		`For child work still in flight, wait with one blocking `+"`"+`agent-deck -p <PROFILE> session children --follow --until-done`+"`"+` call. Do not spend turns repeatedly calling `+"`"+`list --json`+"`"+` or `+"`"+`session children --json`+"`"+`.`+"\n\n", "", 1)
+	template = strings.ReplaceAll(template,
+		`4. Only if the compact counts require action, inspect the affected child through `+"`"+`session children`+"`"+`/`+"`"+`session show`+"`"+`; never use `+"`"+`list --json`+"`"+` for triage`,
+		`4. Run `+"`"+`agent-deck -p {PROFILE} list --json`+"`"+` to know what sessions exist`)
+	// The session-creation rows used to be rendered per agent; they are now
+	// agent-neutral so codex and pi can share one AGENTS.md (#2297).
+	template = strings.ReplaceAll(template, `-c <tool>`, `-c {AGENT}`)
+	template = strings.Replace(template,
+		`| Create a new session. `+"`"+`<tool>`+"`"+` is claude, codex, hermes or pi; default to this conductor's own tool. |`,
+		`| Create a new {AGENT_DISPLAY} session |`, 1)
+	template = strings.Replace(template,
+		`| Create a new session with a worktree |`,
+		`| Create a new {AGENT_DISPLAY} session with a worktree |`, 1)
+	return template
+}
+
+// conductorBackgroundWorkGuidance is the sentence issue #2473 added to the
+// shared template's substate paragraph.
+const conductorBackgroundWorkGuidance = " `background-work` (shown as coarse status `running`) means the child's turn ended but a Workflow, background agents, shells or a Monitor it started are still in flight (`background_work` in `session show --json` names the task and its n/m progress); leave it alone, it reports back and settles to `waiting` by itself."
+
+// The conductor reads a child with a plain `session output` (no -q): only a
+// plain read is remembered as the conductor having seen the result, so the
+// inbox notice for that turn withdraws itself. Earlier templates used -q,
+// which never counts (inbox_result_read.go).
+const (
+	conductorPlainReadRow  = "agent-deck -p <PROFILE> session output <id_or_title>"
+	conductorPlainCheckCmd = "agent-deck -p <PROFILE> session output <name>"
+	conductorPlainReadDoc  = " | Get the last response (plain read: the inbox notice for that turn withdraws itself; `-q` only for scripts that grep it) |"
+	conductorQuietReadDoc  = " | Get the last response (raw text, perfect for reading) |"
+)
+
+// prePlainReadConductorInstructionsTemplate reconstructs the template as it
+// was before the reads dropped -q, so a conductor file written then is
+// recognised as generated and migrated. Per-name templates carry neither
+// row: a no-op there.
+func prePlainReadConductorInstructionsTemplate(template string) string {
+	template = strings.Replace(template, "`"+conductorPlainReadRow+"`"+conductorPlainReadDoc, "`"+conductorPlainReadRow+" -q`"+conductorQuietReadDoc, 1)
+	return strings.Replace(template, "`"+conductorPlainCheckCmd+"` and summarize", "`"+conductorPlainCheckCmd+" -q` and summarize", 1)
+}
+
+// conductorNoOpNoticeRule is the paragraph added to the shared template
+// after v1.16.29: no reply to a notice that needs no action (prime-agent's
+// "no reply to no-op notices" rule).
+const conductorNoOpNoticeRule = "\n\n**No-op notices get no reply.** A record or message that needs nothing from you (a pure acknowledgement such as \"ok\", \"thanks\" or \"noted\", or a status ping that changes nothing) is a no-op notice: do not answer it, do not send anything back to the child, just end the turn. Replying only starts another round trip. A `[HEARTBEAT]` is not a no-op notice; answer it in the format below."
+
+// preNoOpNoticeRuleConductorInstructionsTemplate reconstructs the template
+// as v1.16.25-v1.16.29 shipped it, before conductorNoOpNoticeRule, so a
+// conductor written by those releases is recognised as generated and
+// migrated. Per-name templates never carried the rule: a no-op there.
+func preNoOpNoticeRuleConductorInstructionsTemplate(template string) string {
+	return strings.Replace(template, conductorNoOpNoticeRule, "", 1)
+}
+
+// preBackgroundWorkConductorInstructionsTemplate reconstructs the template as
+// v1.16.24 shipped it, before #2473 added the background-work sentence, so a
+// conductor written by v1.16.24 is recognised as generated and migrated.
+// Per-name templates carry no substate paragraph, so this is a no-op there.
+func preBackgroundWorkConductorInstructionsTemplate(template string) string {
+	return strings.Replace(template, conductorBackgroundWorkGuidance, "", 1)
+}
+
+// preSubstateGuidanceConductorInstructionsTemplate reconstructs the shared
+// template's shape from before #1814 added the substate-guidance row: the
+// plain "crashed or missing" error row with no paragraph after it. This is
+// what v1.10.9-v1.10.11 (and earlier, back to the local-first rewrite in
+// v1.9.73) shipped. Per-name templates carried no such row, so this is a
+// no-op for them.
+func preSubstateGuidanceConductorInstructionsTemplate(template string) string {
+	return strings.Replace(template,
+		`| `+"`"+`error`+"`"+` (red) | Crashed, missing, or wedged (auth/model failure) | Check the substate first. Then try `+"`"+`session restart`+"`"+`; if that fails, escalate. |
+
+**Substate (Claude sessions only; refines status in `+"`"+`list`+"`"+`/`+"`"+`show`+"`"+` JSON):** `+"`"+`auth-401`+"`"+` covers two different pane banners. A credential banner (`+"`"+`Please run /login`+"`"+`, `+"`"+`API Error: 401`+"`"+`) means the fleet is HOLDING the session; restarting will NOT fix it. Check `+"`"+`session show --json <id>`+"`"+` for the `+"`"+`auth_hold`+"`"+` object (the authoritative source, present even after the pane exits) and escalate for re-login. A dropped-socket banner (`+"`"+`socket connection closed`+"`"+`) also classifies as `+"`"+`auth-401`+"`"+` but is NOT held and IS restart-recoverable: restart it. `+"`"+`model-unavailable`+"`"+` means the selected model is down (shows as error, not running); self-heal currently only observes this and takes no action, so switch it yourself with `+"`"+`agent-deck -p <PROFILE> session set <id> model <model>`+"`"+` then `+"`"+`agent-deck -p <PROFILE> session restart <id>`+"`"+`. `+"`"+`idle-at-empty-prompt`+"`"+` (shown as coarse status `+"`"+`idle`+"`"+` or `+"`"+`waiting`+"`"+`) means the session is genuinely sitting at its prompt with nothing happening. Never restart-loop an `+"`"+`error`+"`"+` session that `+"`"+`auth_hold`+"`"+` confirms is credential-held.`,
+		`| `+"`"+`error`+"`"+` (red) | Session crashed or missing | Try `+"`"+`session restart`+"`"+`. If that fails, escalate. |`, 1)
+}
+
+// preStrictUrgentRuleConductorInstructionsTemplate restores the urgent-tier
+// sentence v1.16.24 shipped ("or a reply to something you or a human sent").
+func preStrictUrgentRuleConductorInstructionsTemplate(template string) string {
+	return strings.Replace(template,
+		`sentinel, an error, or an explicit question to you) wakes you;`,
+		`sentinel, an error, a question, or a reply to something you or a human sent) wakes you;`, 1)
+}
+
+// preHumanTierConductorInstructionsTemplate reconstructs what v1.16.24
+// shipped: the current template minus the #2469 human-tier reply format
+// ([urgent]/[info] markers, conductor notify). Per-name templates never
+// carried it, so this is a no-op for them.
+func preHumanTierConductorInstructionsTemplate(template string) string {
+	return strings.Replace(template, conductorHeartbeatReplyDoc, conductorHeartbeatReplyDocV0, 1)
+}
+
+// conductorSessionsQuickCommandRow is the `/sessions` quick-command row.
+// Issue #2972 added the archived-skip clause: `list --json` keeps archived
+// sessions with "archived": true, and the bridge's sessions command leaves
+// them out (#2945). conductorSessionsQuickCommandRowV0 is the row every
+// release up to v1.16.34 shipped.
+const (
+	conductorSessionsQuickCommandRow   = "| `/sessions` | Run `agent-deck -p <PROFILE> list --json` and list active sessions with status; skip rows with `\"archived\": true` |\n"
+	conductorSessionsQuickCommandRowV0 = "| `/sessions` | Run `agent-deck -p <PROFILE> list --json` and list active sessions with status |\n"
+)
+
+// preArchivedSessionsConductorInstructionsTemplate reconstructs the template
+// as it was before #2972, so a conductor written then is recognised as
+// generated and migrated. Per-name templates carry no Quick Commands table,
+// so this is a no-op there.
+func preArchivedSessionsConductorInstructionsTemplate(template string) string {
+	return strings.Replace(template, conductorSessionsQuickCommandRow, conductorSessionsQuickCommandRowV0, 1)
+}
+
+// conductorHarnessControlQuickCommandRow is the `/cmd` quick-command row the
+// session command change added to the shared template's Quick Commands table.
+// v1.16.25 through v1.16.29 shipped the template without it.
+const conductorHarnessControlQuickCommandRow = "| `/cmd <session> <slash command>` (also `cmd ...` without the leading slash) | Run a Claude Code client command (`/model <id>`, `/compact`, `/clear`, `/exit`, any slash command or skill) on that session: run `agent-deck -p <PROFILE> session command --json --wait-idle 60s <session> '<slash command>'` (single quotes, so `$(...)` and backticks in the text are never expanded; write a `'` inside it as `'\\''`; add `--background` when `<session>` is you). Reply with one short line from the JSON: `after` or the first `evidence` entry when `ok`, otherwise `code` and `error`. `/cmd <session> what can I run` runs `agent-deck -p <PROFILE> session commands --json <session>` instead. Never type a slash command with `session send` or tmux. |\n"
+
+// preHarnessControlConductorInstructionsTemplate reconstructs the template as
+// v1.16.25 through v1.16.29 shipped it, before the `/cmd` quick command, so a
+// conductor written by those releases is recognised as generated and
+// migrated. Per-name templates carry no Quick Commands table, so this is a
+// no-op there.
+func preHarnessControlConductorInstructionsTemplate(template string) string {
+	return strings.Replace(template, conductorHarnessControlQuickCommandRow, "", 1)
+}
+
+// conductorStandingOrdersSection documents `agent-deck orders` (ORDERS.md)
+// in the shared template. It follows the heartbeat reply format, so a
+// conductor learns that time-based watching does not belong in heartbeat
+// rules (the heartbeat only fires when a child is waiting or errored).
+const conductorStandingOrdersSection = "\n\n## Standing Orders\n\n" +
+	"Time-based watching (\"check X every N, tell me when it changes\") lives in `ORDERS.md` in your conductor directory, not in heartbeat rules: a heartbeat only fires when a child is waiting or errored. When the user says \"watch X\" or \"stop watching X\", run:\n\n" +
+	"```bash\n" +
+	"agent-deck -p <PROFILE> orders add <name> --every 15m --check '<cheap shell command>' --do '<what to do when it changes>' --ask-first 'merge, push'\n" +
+	"agent-deck -p <PROFILE> orders list        # also: orders pause|resume|rm <name>\n" +
+	"```\n\n" +
+	"A timer runs each due check every minute with no AI. You are woken only when its output changes, by a message starting `[ORDER <name>]` with the old and new output, the `do:` text and the ask-first list. In that turn: if the change needs nothing, reply exactly `NO_REPLY`; ask the user (a `NEED:` line or `agent-deck ask`) before anything on the ask-first list, since nobody is watching and a permission prompt is denied; never add, change or remove orders (the CLI refuses from an order-started turn)."
+
+// preStandingOrdersConductorInstructionsTemplate reconstructs the template
+// from before the Standing Orders section, so a conductor written then is
+// recognised as generated and migrated. Per-name templates never carried
+// it, so this is a no-op there.
+func preStandingOrdersConductorInstructionsTemplate(template string) string {
+	return strings.Replace(template, conductorStandingOrdersSection, "", 1)
+}
+
+// conductorHeartbeatReplyDoc is the tail of the heartbeat reply-format
+// example as of #2469 (urgent/info markers, conductor notify);
+// conductorHeartbeatReplyDocV0 is the wording v1.11.0-v1.16.24 shipped.
+const (
+	conductorHeartbeatReplyDoc   = "[info] docs-lane merged its PR\n```\n\nYour response is parsed by tier: `NEED:` / `[urgent]` lines reach the user now (retired after 3 unanswered cycles), `[info]` lines are batched into a digest, everything else (`[STATUS]`, `AUTO:`) stays local.\n\nOutside a heartbeat (a wake-nudge or Stop-block turn) nothing you write reaches the user, so for a decision the user must act on now run `agent-deck conductor notify --tier urgent \"<one line>\"`, and `--tier info \"<one line>\"` for progress worth a digest. At most one urgent per decision."
+	conductorHeartbeatReplyDocV0 = "```\n\nYour response is parsed: if it contains `NEED:` lines, those get forwarded to the user (via remote channels if configured, or visible in the TUI/task-log)."
+)
+
+// conductorInstructionsGenerations reconstructs every prior generated-template
+// generation for the given template, newest first, that
+// writeGeneratedFileOrMigrate should recognise as a migratable predecessor of
+// the current one. Each step reverts one more shipped change; a step that
+// changes nothing (the template never carried that wording) is dropped so
+// migration never checks a duplicate generation.
+//
+// Verified against fixtures rendered from the actual shipped source
+// (testdata/conductor_templates_shipped.tsv): this reconstructs the
+// v1.16.25-v1.16.29 generation (before the /cmd quick command and the no-op notice rule; pinned by
+// TestShippedV11628SharedTemplateMigratesToHarnessControl), the
+// v1.16.24 generation (only the heartbeat reply format differs), the
+// v1.11.0-v1.16.10 generation and the v1.10.9-v1.10.11 generation. It does
+// NOT reconstruct v1.9.73 or v1.9.70, which shipped further template
+// changes (Codex `session approve` docs, the local-first rewrite) that are
+// not reverted here; a conductor instructions file last written by one of
+// those releases is treated as user-edited and left alone.
+func conductorInstructionsGenerations(template string) []string {
+	var gens []string
+	// Newest first: the release before the Standing Orders section.
+	if noOrders := preStandingOrdersConductorInstructionsTemplate(template); noOrders != template {
+		gens = append(gens, noOrders)
+		template = noOrders
+	}
+	// Then the release before the #2972 archived-skip clause.
+	if noArchived := preArchivedSessionsConductorInstructionsTemplate(template); noArchived != template {
+		gens = append(gens, noArchived)
+		template = noArchived
+	}
+	// Then main before the /cmd quick command, then the release
+	// with the no-op notice rule whose conductor reads still used -q, then
+	// what v1.16.25-v1.16.29 shipped (current minus all three). Every older
+	// generation is reconstructed from the latter.
+	if noCmd := preHarnessControlConductorInstructionsTemplate(template); noCmd != template {
+		gens = append(gens, noCmd)
+		template = noCmd
+	}
+	if quiet := prePlainReadConductorInstructionsTemplate(template); quiet != template {
+		gens = append(gens, quiet)
+		template = quiet
+	}
+	if shipped := preNoOpNoticeRuleConductorInstructionsTemplate(template); shipped != template {
+		gens = append(gens, shipped)
+		template = shipped
+	}
+	// Chain from that template: minus the #2473 background-work sentence
+	// (main builds between v1.16.24 and v1.16.25) -> minus the strict urgent
+	// rule (same builds) -> exactly what v1.16.24 shipped. The intermediate
+	// "new sentence with the old reply format" was never released, so it is
+	// not a generation.
+	base := template
+	if noBG := preBackgroundWorkConductorInstructionsTemplate(template); noBG != template {
+		gens = append(gens, noBG)
+		base = noBG
+	}
+	prevRule := preStrictUrgentRuleConductorInstructionsTemplate(base)
+	if prevRule != base {
+		gens = append(gens, prevRule)
+	}
+	if v11624 := preHumanTierConductorInstructionsTemplate(prevRule); v11624 != prevRule {
+		gens = append(gens, v11624)
+	}
+	previous := previousConductorInstructionsTemplate(template)
+	gens = append(gens, previous)
+	if older := preSubstateGuidanceConductorInstructionsTemplate(previous); older != previous {
+		gens = append(gens, older)
+	}
+	return gens
+}
+
 // conductorSharedClaudeMDTemplate is the shared instructions file written to
 // ~/.agent-deck/conductor/<instructions-file> for the selected conductor agent.
 // It contains CLI reference, protocols, and formats shared by all conductors (mechanism).
@@ -15,14 +276,15 @@ Each conductor has its own identity in its subdirectory and its own policy in PO
 ### Status & Listing
 | Command | Description |
 |---------|-------------|
-| ` + "`" + `agent-deck -p <PROFILE> status --json` + "`" + ` | Get counts: ` + "`" + `{"waiting": N, "running": N, "idle": N, "error": N, "stopped": N, "total": N}` + "`" + ` |
-| ` + "`" + `agent-deck -p <PROFILE> list --json` + "`" + ` | List all sessions with details (id, title, path, tool, status, group) |
+| ` + "`" + `agent-deck -p <PROFILE> status --json` + "`" + ` | **Always triage with this compact count summary first:** ` + "`" + `{"waiting": N, "running": N, "idle": N, "error": N, "stopped": N, "total": N}` + "`" + ` |
+| ` + "`" + `agent-deck -p <PROFILE> list --json` + "`" + ` | Expensive full inventory; use only when the user explicitly needs details for every profile session, never for status triage or polling |
+| ` + "`" + `agent-deck -p <PROFILE> session children --follow --until-done` + "`" + ` | Block in one shell call while children run; emits every waiting/error transition and exits when all children are terminal |
 | ` + "`" + `agent-deck -p <PROFILE> session show --json <id_or_title>` + "`" + ` | Full details for one session |
 
 ### Reading Session Output
 | Command | Description |
 |---------|-------------|
-| ` + "`" + `agent-deck -p <PROFILE> session output <id_or_title> -q` + "`" + ` | Get the last response (raw text, perfect for reading) |
+| ` + "`" + conductorPlainReadRow + "`" + ` | Get the last response (plain read: the inbox notice for that turn withdraws itself; ` + "`" + `-q` + "`" + ` only for scripts that grep it) |
 
 ### Sending Messages to Sessions
 | Command | Description |
@@ -38,9 +300,9 @@ Each conductor has its own identity in its subdirectory and its own policy in PO
 | ` + "`" + `agent-deck -p <PROFILE> session start <id_or_title>` + "`" + ` | Start a stopped session |
 | ` + "`" + `agent-deck -p <PROFILE> session stop <id_or_title>` + "`" + ` | Stop a running session |
 | ` + "`" + `agent-deck -p <PROFILE> session restart <id_or_title>` + "`" + ` | Restart a managed session |
-| ` + "`" + `agent-deck -p <PROFILE> add <path> -t "Title" -c {AGENT} -g "group"` + "`" + ` | Create a new {AGENT_DISPLAY} session |
-| ` + "`" + `agent-deck -p <PROFILE> launch <path> -t "Title" -c {AGENT} -g "group" -m "prompt"` + "`" + ` | Create + start + send initial prompt in one command (preferred for new task sessions) |
-| ` + "`" + `agent-deck -p <PROFILE> add <path> -t "Title" -c {AGENT} --worktree feature/branch -b` + "`" + ` | Create a new {AGENT_DISPLAY} session with a worktree |
+| ` + "`" + `agent-deck -p <PROFILE> add <path> -t "Title" -c <tool> -g "group"` + "`" + ` | Create a new session. ` + "`" + `<tool>` + "`" + ` is claude, codex, hermes or pi; default to this conductor's own tool. |
+| ` + "`" + `agent-deck -p <PROFILE> launch <path> -t "Title" -c <tool> -g "group" -m "prompt"` + "`" + ` | Create + start + send initial prompt in one command (preferred for new task sessions) |
+| ` + "`" + `agent-deck -p <PROFILE> add <path> -t "Title" -c <tool> --worktree feature/branch -b` + "`" + ` | Create a new session with a worktree |
 
 ### Session Resolution
 Commands accept: **exact title**, **ID prefix** (e.g., first 4 chars), **path**, or **fuzzy match**.
@@ -54,7 +316,7 @@ Commands accept: **exact title**, **ID prefix** (e.g., first 4 chars), **path**,
 | ` + "`" + `idle` + "`" + ` (gray) | Waiting, but user acknowledged | User knows about it. Skip unless asked. |
 | ` + "`" + `error` + "`" + ` (red) | Crashed, missing, or wedged (auth/model failure) | Check the substate first. Then try ` + "`" + `session restart` + "`" + `; if that fails, escalate. |
 
-**Substate (Claude sessions only; refines status in ` + "`" + `list` + "`" + `/` + "`" + `show` + "`" + ` JSON):** ` + "`" + `auth-401` + "`" + ` covers two different pane banners. A credential banner (` + "`" + `Please run /login` + "`" + `, ` + "`" + `API Error: 401` + "`" + `) means the fleet is HOLDING the session; restarting will NOT fix it. Check ` + "`" + `session show --json <id>` + "`" + ` for the ` + "`" + `auth_hold` + "`" + ` object (the authoritative source, present even after the pane exits) and escalate for re-login. A dropped-socket banner (` + "`" + `socket connection closed` + "`" + `) also classifies as ` + "`" + `auth-401` + "`" + ` but is NOT held and IS restart-recoverable: restart it. ` + "`" + `model-unavailable` + "`" + ` means the selected model is down (shows as error, not running); self-heal currently only observes this and takes no action, so switch it yourself with ` + "`" + `agent-deck -p <PROFILE> session set <id> model <model>` + "`" + ` then ` + "`" + `agent-deck -p <PROFILE> session restart <id>` + "`" + `. ` + "`" + `idle-at-empty-prompt` + "`" + ` (shown as coarse status ` + "`" + `idle` + "`" + ` or ` + "`" + `waiting` + "`" + `) means the session is genuinely sitting at its prompt with nothing happening. Never restart-loop an ` + "`" + `error` + "`" + ` session that ` + "`" + `auth_hold` + "`" + ` confirms is credential-held.
+**Substate (Claude sessions only; refines status in ` + "`" + `list` + "`" + `/` + "`" + `show` + "`" + ` JSON):** ` + "`" + `auth-401` + "`" + ` covers two different pane banners. A credential banner (` + "`" + `Please run /login` + "`" + `, ` + "`" + `API Error: 401` + "`" + `) means the fleet is HOLDING the session; restarting will NOT fix it. Check ` + "`" + `session show --json <id>` + "`" + ` for the ` + "`" + `auth_hold` + "`" + ` object (the authoritative source, present even after the pane exits) and escalate for re-login. A dropped-socket banner (` + "`" + `socket connection closed` + "`" + `) also classifies as ` + "`" + `auth-401` + "`" + ` but is NOT held and IS restart-recoverable: restart it. ` + "`" + `model-unavailable` + "`" + ` means the selected model is down (shows as error, not running); self-heal currently only observes this and takes no action, so switch it yourself with ` + "`" + `agent-deck -p <PROFILE> session set <id> model <model>` + "`" + ` then ` + "`" + `agent-deck -p <PROFILE> session restart <id>` + "`" + `. ` + "`" + `idle-at-empty-prompt` + "`" + ` (shown as coarse status ` + "`" + `idle` + "`" + ` or ` + "`" + `waiting` + "`" + `) means the session is genuinely sitting at its prompt with nothing happening. ` + "`" + `background-work` + "`" + ` (shown as coarse status ` + "`" + `running` + "`" + `) means the child's turn ended but a Workflow, background agents, shells or a Monitor it started are still in flight (` + "`" + `background_work` + "`" + ` in ` + "`" + `session show --json` + "`" + ` names the task and its n/m progress); leave it alone, it reports back and settles to ` + "`" + `waiting` + "`" + ` by itself. Never restart-loop an ` + "`" + `error` + "`" + ` session that ` + "`" + `auth_hold` + "`" + ` confirms is credential-held.
 
 ## Heartbeat Protocol
 
@@ -74,9 +336,19 @@ This pulls any child completions that landed in your durable outbox while you we
 busy (issue #1225/#1226). Delivery is pull, not push: a child that finished mid-turn
 committed its completion to ` + "`" + `~/.agent-deck/inboxes/<your-id>.jsonl` + "`" + ` rather than typing
 into your pane. The drain marks records consumed (exactly-once effects) and prints
-them; act on each before composing your status. Your Stop hook drains the same queue
-automatically at each turn boundary, so this heartbeat drain is the idle-conductor
-fallback — together they guarantee no completion is missed whether you are busy or idle.
+them; act on each before composing your status. Your hooks drain the same queue
+automatically when your agent supports hooks (Claude Code): at the start of every turn
+(records appear in your context under ` + "`" + `[agent-deck inbox]` + "`" + `) and at each turn boundary
+for urgent records, so this heartbeat drain is the fallback — together they guarantee no
+completion is missed. Agents without hooks (Codex, Hermes) get the records only from this drain.
+
+Records are tiered and carry the child's own text (issue #2469): ` + "`" + `urgent` + "`" + ` (a completion
+sentinel, an error, or an explicit question to you) wakes you;
+` + "`" + `info` + "`" + ` (progress in a turn a background task started) waits for your next turn or a
+digest. Act on the text in the record. Do NOT run ` + "`" + `session output` + "`" + ` on a child whose
+record you already have unless the text is clipped and you need the rest.` + conductorNoOpNoticeRule + `
+
+For child work still in flight, wait with one blocking ` + "`" + `agent-deck -p <PROFILE> session children --follow --until-done` + "`" + ` call. Do not spend turns repeatedly calling ` + "`" + `list --json` + "`" + ` or ` + "`" + `session children --json` + "`" + `.
 
 **Your heartbeat response format:**
 
@@ -91,9 +363,7 @@ or:
 
 AUTO: frontend - told it to use the existing auth middleware
 NEED: api-fix - asking whether to run integration tests against staging or prod
-` + "```" + `
-
-Your response is parsed: if it contains ` + "`" + `NEED:` + "`" + ` lines, those get forwarded to the user (via remote channels if configured, or visible in the TUI/task-log).
+` + conductorHeartbeatReplyDoc + conductorStandingOrdersSection + `
 
 ## State Management
 
@@ -169,10 +439,9 @@ You may receive these special commands (from remote channels or the CLI):
 | Command | What to Do |
 |---------|------------|
 | ` + "`" + `/status` + "`" + ` | Run ` + "`" + `agent-deck -p <PROFILE> status --json` + "`" + ` and format a brief summary |
-| ` + "`" + `/sessions` + "`" + ` | Run ` + "`" + `agent-deck -p <PROFILE> list --json` + "`" + ` and list active sessions with status |
-| ` + "`" + `/check <name>` + "`" + ` | Run ` + "`" + `agent-deck -p <PROFILE> session output <name> -q` + "`" + ` and summarize what it's doing |
+` + conductorSessionsQuickCommandRow + `| ` + "`" + `/check <name>` + "`" + ` | Run ` + "`" + conductorPlainCheckCmd + "`" + ` and summarize what it's doing |
 | ` + "`" + `/send <name> <msg>` + "`" + ` | Forward the message to that session via ` + "`" + `agent-deck -p <PROFILE> session send` + "`" + ` |
-| ` + "`" + `/help` + "`" + ` | List available commands |
+` + conductorHarnessControlQuickCommandRow + `| ` + "`" + `/help` + "`" + ` | List available commands |
 
 For any other text, treat it as a conversational message from the user. They might ask about session progress, give instructions for specific sessions, or ask you to create/manage sessions.
 
@@ -305,7 +574,7 @@ When you first start (or after a restart):
 1. Read ` + "`" + `./state.json` + "`" + ` if it exists (restore context)
 2. Read ` + "`" + `./LEARNINGS.md` + "`" + ` and ` + "`" + `../LEARNINGS.md` + "`" + ` if they exist (review past patterns)
 3. Run ` + "`" + `agent-deck -p {PROFILE} status --json` + "`" + ` to get the current state
-4. Run ` + "`" + `agent-deck -p {PROFILE} list --json` + "`" + ` to know what sessions exist
+4. Only if the compact counts require action, inspect the affected child through ` + "`" + `session children` + "`" + `/` + "`" + `session show` + "`" + `; never use ` + "`" + `list --json` + "`" + ` for triage
 5. Log startup in ` + "`" + `./task-log.md` + "`" + `
 6. If any sessions are in error state (NOT stopped), try to restart them. Sessions in "stopped" status were intentionally closed by the user and must NOT be restarted.
 7. Reply: "Conductor {NAME} ({PROFILE}) online. N sessions tracked (X running, Y waiting)."
@@ -403,7 +672,7 @@ When you first start (or after a restart):
 1. Read ` + "`" + `./state.json` + "`" + ` if it exists (restore context)
 2. Read ` + "`" + `./LEARNINGS.md` + "`" + ` and ` + "`" + `../LEARNINGS.md` + "`" + ` if they exist (review past patterns)
 3. Run ` + "`" + `agent-deck -p {PROFILE} status --json` + "`" + ` to get the current state
-4. Run ` + "`" + `agent-deck -p {PROFILE} list --json` + "`" + ` to know what sessions exist
+4. Only if the compact counts require action, inspect the affected child through ` + "`" + `session children` + "`" + `/` + "`" + `session show` + "`" + `; never use ` + "`" + `list --json` + "`" + ` for triage
 5. Run ` + "`" + `hermes kanban list --status blocked --json` + "`" + ` to check for blocked tasks needing attention
 6. Log startup in ` + "`" + `./task-log.md` + "`" + `
 7. If any sessions are in error state (NOT stopped), try to restart them. Sessions in "stopped" status were intentionally closed by the user and must NOT be restarted.

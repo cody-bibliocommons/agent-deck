@@ -50,12 +50,17 @@ import (
 // The rebind gate stops the poisoning at the source; the safety net is the
 // backstop for any binding poisoned before the gate existed or by a path the
 // gate does not cover.
+// Guardian approval review threads have thread_source=guardian_review and a
+// parent_thread_id. Reject them as child threads; if one is already bound,
+// resume its verified user parent instead of forking the reviewer's context.
 
 // codexThreadMeta is the subset of a rollout's session_meta payload the
 // gate/safety-net decisions need.
 type codexThreadMeta struct {
 	ThreadSource   string
 	ParentThreadID string
+	Source         string
+	valid          bool
 }
 
 // codexThreadMetaCache memoizes session_meta head reads. A thread's origin
@@ -82,6 +87,31 @@ func codexRolloutPathInHome(sessionID, codexHome string) string {
 		return ""
 	}
 	return matches[0]
+}
+
+// CodexHomeDirForInstance returns the CODEX_HOME directory that applies to a
+// specific instance, honouring a per-session command override before the
+// process-wide default.
+//
+// It is exported for callers outside this package that must read a session's
+// own Codex state: agent-deck's per-session scratch homes make the process
+// default frequently wrong, and resolving it a second time elsewhere would
+// drift from the launch path.
+func CodexHomeDirForInstance(inst *Instance) string {
+	if inst == nil {
+		return getCodexHomeDir()
+	}
+	return inst.getCodexHomeDir()
+}
+
+// CodexRolloutPathForInstance returns the on-disk rollout JSONL path for a
+// codex-compatible instance, or "" when the session has no flushed rollout
+// (never started, or not yet written).
+func CodexRolloutPathForInstance(inst *Instance) string {
+	if inst == nil || !IsCodexCompatible(inst.Tool) {
+		return ""
+	}
+	return codexRolloutPathInHome(inst.CodexSessionID, CodexHomeDirForInstance(inst))
 }
 
 // readCodexRolloutThreadMeta parses the session_meta head line of a rollout.
@@ -117,7 +147,9 @@ func readCodexRolloutThreadMeta(path string) codexThreadMeta {
 	meta := codexThreadMeta{
 		ThreadSource:   head.Payload.ThreadSource,
 		ParentThreadID: head.Payload.ParentThreadID,
+		valid:          true,
 	}
+	_ = json.Unmarshal(head.Payload.Source, &meta.Source)
 	// Older payloads carry parenthood only inside source.subagent.thread_spawn.
 	if meta.ParentThreadID == "" && len(head.Payload.Source) > 0 {
 		var src struct {
@@ -146,7 +178,11 @@ func codexThreadMetaForSession(sessionID, codexHome string) (codexThreadMeta, bo
 		return codexThreadMeta{}, false
 	}
 	meta := readCodexRolloutThreadMeta(path)
-	codexThreadMetaCache.Store(sessionID, meta)
+	// A rollout can be visible before its session_meta line is complete.
+	// Retry an empty head on the next observation instead of caching it.
+	if meta.valid {
+		codexThreadMetaCache.Store(sessionID, meta)
+	}
 	return meta, true
 }
 
@@ -156,8 +192,117 @@ func codexThreadMetaForSession(sessionID, codexHome string) (codexThreadMeta, bo
 // flushed rollout are allowed through (fail-open, matching the pre-gate
 // behavior for freshly created sessions).
 func (i *Instance) shouldRejectCodexSubagentRebind(candidateID string) bool {
-	meta, ok := codexThreadMetaForSession(candidateID, i.getCodexHomeDir())
-	return ok && meta.ThreadSource == "subagent"
+	return CodexSubagentThread(candidateID, i.getCodexHomeDir())
+}
+
+// CodexSubagentThread reports whether threadID names a non-user child thread.
+// Codex uses thread_source=subagent for collaboration and guardian_review for
+// approval review. A child thread's notify
+// (agent-turn-complete when the child finishes its task) says nothing about
+// the parent turn the pane shows: the parent keeps working, and usually
+// spawned the child from inside that very turn. The notify writer drops such
+// events and the readers refuse records carrying them (codexHookFromForeignThread);
+// otherwise every finished subagent reads as the pane's turn-finished edge
+// and flips a working session running -> waiting (rc feedback 2026-09-23).
+// Threads without a flushed rollout are not subagents here (fail-open).
+func CodexSubagentThread(threadID, codexHome string) bool {
+	threadID = strings.TrimSpace(threadID)
+	if threadID == "" {
+		return false
+	}
+	meta, ok := codexThreadMetaForSession(threadID, codexHome)
+	return ok && codexNonUserThread(meta)
+}
+
+func codexNonUserThread(meta codexThreadMeta) bool {
+	return meta.valid && (meta.ParentThreadID != "" ||
+		meta.ThreadSource == "subagent" || meta.ThreadSource == "guardian_review")
+}
+
+// codexGuardianParentThreadID returns a guardian review's verified user ancestor.
+// Review threads can belong to subagents, so follow only known child sources.
+// A missing parent, unknown source, or cycle must not become a resume target.
+func codexGuardianParentThreadID(sessionID, codexHome string) string {
+	meta, ok := codexThreadMetaForSession(sessionID, codexHome)
+	if !ok || !meta.valid || meta.ThreadSource != "guardian_review" || meta.ParentThreadID == "" {
+		return ""
+	}
+	visited := map[string]bool{sessionID: true}
+	for depth := 0; depth < 32 && meta.ParentThreadID != ""; depth++ {
+		parentID := meta.ParentThreadID
+		if visited[parentID] {
+			return ""
+		}
+		visited[parentID] = true
+		meta, ok = codexThreadMetaForSession(parentID, codexHome)
+		if !ok || !meta.valid {
+			return ""
+		}
+		if (meta.ThreadSource == "user" || meta.ThreadSource == "cli") && meta.ParentThreadID == "" && meta.Source != "exec" {
+			return parentID
+		}
+		if meta.ThreadSource != "subagent" && meta.ThreadSource != "guardian_review" {
+			return ""
+		}
+	}
+	return ""
+}
+
+// codexHookFromForeignThread reports whether a hook status record belongs to a
+// Codex thread other than the one this pane talks to: a subagent thread, or an
+// ephemeral helper whose turn ended without a rollout. Such a record must not
+// drive this instance's status, transition candidates or done signals. Hook
+// files written before the notify writer gained these gates still carry them.
+func (i *Instance) codexHookFromForeignThread(hs *HookStatus) bool {
+	if i == nil || hs == nil || !IsCodexCompatible(i.Tool) {
+		return false
+	}
+	sid := strings.TrimSpace(hs.SessionID)
+	if sid == "" || sid == i.CodexSessionID {
+		return false
+	}
+	home := i.getCodexHomeDir()
+	return CodexSubagentThread(sid, home) || CodexUnbackedTurnEnd(sid, hs.Event, home)
+}
+
+// shouldRejectCodexUnbackedTurnEnd reports whether a turn-end notify names a
+// thread with no rollout in this instance's Codex home. Codex runs ephemeral
+// helper threads (thread-title generation) that fire the same
+// agent-turn-complete notify with their own id but never write a rollout. When
+// that notify lands after the main thread's, binding it points the instance
+// at a thread no rollout will ever exist for, and every exact-acceptance send
+// is refused until another main-thread turn completes. A real thread's rollout
+// is on disk from its turn start, so a turn-end without one is never the
+// thread the pane talks to. Earlier events (thread start, prompt submit) can
+// legitimately precede the rollout and keep the fail-open binding.
+func (i *Instance) shouldRejectCodexUnbackedTurnEnd(candidateID, event string) bool {
+	return CodexUnbackedTurnEnd(candidateID, event, i.getCodexHomeDir())
+}
+
+// CodexUnbackedTurnEnd reports whether a turn-end notify for threadID comes
+// from a thread with no rollout under codexHome: an ephemeral helper thread
+// (thread-title generation), never the thread the pane talks to. The notify
+// writer uses it to drop such events before they touch the hook status or
+// anchor; UpdateHookStatus uses it to reject them from older status files.
+func CodexUnbackedTurnEnd(threadID, event, codexHome string) bool {
+	if strings.TrimSpace(threadID) == "" || !codexHookEventEndsTurn(event) {
+		return false
+	}
+	_, flushed := codexThreadMetaForSession(threadID, codexHome)
+	return !flushed
+}
+
+func codexHookEventEndsTurn(event string) bool {
+	canon := strings.NewReplacer(".", "/", "-", "/", "_", "/").Replace(strings.ToLower(strings.TrimSpace(event)))
+	if !strings.Contains(canon, "turn") {
+		return false
+	}
+	for _, end := range []string{"complete", "fail", "abort", "cancel", "ended"} {
+		if strings.Contains(canon, end) {
+			return true
+		}
+	}
+	return false
 }
 
 func (i *Instance) filterCodexProcessProbeCandidate(candidateID string) string {
@@ -176,17 +321,15 @@ func (i *Instance) filterCodexProcessProbeCandidate(candidateID string) string {
 }
 
 // codexSessionNeedsFork reports whether the bound session id names a
-// subagent-sourced thread, which `codex resume` would load but never accept
-// operator input on. buildCodexCommand launches such bindings with `codex
-// fork <sid>` instead: the fork carries the thread's full context into a
-// fresh thread_source=user thread, and the live-process probe rebinds the
-// instance to the fork's new id once the process is up. Bindings without a
-// flushed rollout return false (the #756 existence gate already handled
-// them).
+// non-user child thread, which `codex resume` would load but never accept
+// operator input on. buildCodexCommand resumes a verified Guardian user ancestor
+// or forks the child into a user thread when that parent is unavailable.
+// Bindings without a flushed rollout return false (the #756 existence gate
+// already handled them).
 func codexSessionNeedsFork(sessionID, codexHome string) bool {
 	path := codexRolloutPathInHome(sessionID, codexHome)
 	if path == "" {
 		return false
 	}
-	return readCodexRolloutThreadMeta(path).ThreadSource == "subagent"
+	return codexNonUserThread(readCodexRolloutThreadMeta(path))
 }

@@ -103,6 +103,37 @@ type toolDataBlob struct {
 	MultiRepoWorktrees []multiRepoWorktreeBlob `json:"multi_repo_worktrees,omitempty"`
 	// Presentation
 	Color string `json:"color,omitempty"` // issue #391 — per-session TUI row tint
+
+	// ContextLevel is the per-session context-level override (issue #2260),
+	// written/read via internal/session/context_level_persist.go. Listed here
+	// (not used directly by MigrateFromJSON) purely so toolDataKnownKeys sees
+	// it as typed-schema-authoritative: an explicit clear (`session set <id>
+	// context-level ""`, which omits the key) must win over the stored row,
+	// the same way Color and other omitempty scalar fields already in this
+	// struct do — MergeToolDataExtras would otherwise treat the omission as
+	// "a binary that doesn't know this key" and resurrect the old value.
+	ContextLevel string `json:"context_level,omitempty"`
+	// PromptSuggestions is the per-session prompt-suggestions override
+	// (internal/session/prompt_suggestions.go), listed for the same reason as
+	// ContextLevel: clearing it must not be undone by MergeToolDataExtras.
+	PromptSuggestions string `json:"prompt_suggestions,omitempty"`
+	// WaitTimeout is the per-session wait timer (internal/session/
+	// wait_timer.go), listed for the same reason as ContextLevel: clearing it
+	// must not be undone by MergeToolDataExtras.
+	WaitTimeout string `json:"wait_timeout,omitempty"`
+	// IntendedSwitch is the per-session intended account/model switch record
+	// (internal/session/intended_switch.go), listed for the same reason as
+	// ContextLevel: clearing it must not be undone by MergeToolDataExtras.
+	IntendedSwitch json.RawMessage `json:"intended_switch,omitempty"`
+	// LimitVerdictResetAt is when the session's account or model last changed
+	// (internal/session/limit_verdict_reset.go), listed for the same reason as
+	// ContextLevel: clearing it must not be undone by MergeToolDataExtras.
+	LimitVerdictResetAt json.RawMessage `json:"limit_verdict_reset_at,omitempty"`
+	// QueuedMessage is a queued session's pending -m prompt
+	// (internal/session/queued_start.go), listed for the same reason as
+	// ContextLevel: clearing it once delivered must not be undone by
+	// MergeToolDataExtras, or a later save would resurrect it.
+	QueuedMessage string `json:"queued_message,omitempty"`
 }
 
 // multiRepoWorktreeBlob is the JSON representation of a multi-repo worktree in tool_data.

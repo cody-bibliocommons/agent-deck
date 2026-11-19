@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/health"
 )
 
 // Issue #1214: kernel-exact task-worker completion.
@@ -87,7 +89,7 @@ func WriteCompletionRecord(rec CompletionRecord) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(rec, "", "  ")
@@ -95,7 +97,7 @@ func WriteCompletionRecord(rec CompletionRecord) error {
 		return err
 	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)
@@ -131,6 +133,17 @@ func CompletionRecordExists(profile, childID string) bool {
 
 // LoadCompletionRecords returns every record for the given profile.
 func LoadCompletionRecords(profile string) ([]CompletionRecord, error) {
+	byProfile, err := loadCompletionRecordsByProfile()
+	if err != nil {
+		return nil, err
+	}
+	return byProfile[profile], nil
+}
+
+// loadCompletionRecordsByProfile reads the completions directory once and
+// groups its records by profile, so a daemon pass over many profiles parses
+// each record once instead of once per profile (ASK-229).
+func loadCompletionRecordsByProfile() (map[string][]CompletionRecord, error) {
 	dir, err := completionsDir()
 	if err != nil {
 		return nil, err
@@ -142,7 +155,7 @@ func LoadCompletionRecords(profile string) ([]CompletionRecord, error) {
 		}
 		return nil, err
 	}
-	var out []CompletionRecord
+	var out map[string][]CompletionRecord
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
 			continue
@@ -155,10 +168,10 @@ func LoadCompletionRecords(profile string) ([]CompletionRecord, error) {
 		if err := json.Unmarshal(data, &rec); err != nil {
 			continue
 		}
-		if rec.Profile != profile {
-			continue
+		if out == nil {
+			out = map[string][]CompletionRecord{}
 		}
-		out = append(out, rec)
+		out[rec.Profile] = append(out[rec.Profile], rec)
 	}
 	return out, nil
 }
@@ -212,11 +225,12 @@ func deriveCompletion(childID, profile, title, output string, exitCode int) Comp
 // error; a returned error means the wrapper itself failed (record write, etc.).
 func RunTaskWorker(childID, profile, title string, cmd *exec.Cmd) (CompletionRecord, error) {
 	// Claim: an empty-Status record present for the whole run.
+	claimedAt := time.Now()
 	_ = WriteCompletionRecord(CompletionRecord{
 		ChildID:   childID,
 		Profile:   profile,
 		Title:     title,
-		CreatedAt: time.Now(),
+		CreatedAt: claimedAt,
 	})
 
 	var buf bytes.Buffer
@@ -244,9 +258,30 @@ func RunTaskWorker(childID, profile, title string, cmd *exec.Cmd) (CompletionRec
 	}
 
 	rec := deriveCompletion(childID, profile, title, buf.String(), exitCode)
+	// The finished record keeps the claim time so created->finished is the
+	// worker's real completion time, not zero.
+	rec.CreatedAt = claimedAt
 	if err := WriteCompletionRecord(rec); err != nil {
 		return rec, err
 	}
+	if RecallEnabled() {
+		if st, err := NewStorageWithProfile(profile); err == nil {
+			if instances, err := st.Load(); err == nil {
+				for _, inst := range instances {
+					if inst.ID == childID {
+						RecallNotifyInstance(inst, health.KindWorkerDone)
+					}
+				}
+			}
+			st.Close()
+		}
+	}
+	_ = SessionEventJournal(profile).Append(health.Event{TS: rec.FinishedAt, SessionID: childID, Kind: health.KindWorkerDone, Detail: map[string]any{
+		"status":      rec.Status,
+		"exit_code":   rec.ExitCode,
+		"created_at":  rec.CreatedAt.UTC().Format(time.RFC3339Nano),
+		"duration_ms": health.Milliseconds(rec.FinishedAt.Sub(rec.CreatedAt)),
+	}})
 	// Mirror the finished completion into the non-destructive ledger so the
 	// task-worker fleet shows up in `session children` alongside interactive
 	// children. Best-effort; never fail the run on a ledger write.
@@ -279,16 +314,16 @@ func RunTaskWorker(childID, profile, title string, cmd *exec.Cmd) (CompletionRec
 // longer acked when it merely reached a volatile in-process retry queue; it is
 // acked only once provably committed to the durable inbox.
 func (n *TransitionNotifier) DeliverCompletion(rec CompletionRecord) bool {
-	committed, _ := n.deliverCompletion(rec)
+	committed, _, _ := n.deliverCompletion(rec)
 	return committed
 }
 
 // deliverCompletion also reports whether the completion was copied to the
 // discovery-only _unowned ledger. A parked copy is durable, but is not delivery
 // to the parent and therefore must never authorize acknowledging rec.
-func (n *TransitionNotifier) deliverCompletion(rec CompletionRecord) (committed, parked bool) {
+func (n *TransitionNotifier) deliverCompletion(rec CompletionRecord) (committed, parked bool, reason string) {
 	if strings.TrimSpace(rec.Status) == "" {
-		return false, false // still running; nothing to deliver
+		return false, false, "" // still running; nothing to deliver
 	}
 	event := TransitionNotificationEvent{
 		ChildSessionID: strings.TrimSpace(rec.ChildID),
@@ -300,7 +335,7 @@ func (n *TransitionNotifier) deliverCompletion(rec CompletionRecord) (committed,
 		Timestamp:      time.Now(),
 	}
 	if event.ChildSessionID == "" || event.Profile == "" {
-		return false, false
+		return false, false, ""
 	}
 	// Conductor self-suppression is applied DOWNSTREAM in resolveParentIDForInbox
 	// (keyed on the child's real ParentSessionID): a top-level/self conductor
@@ -308,12 +343,13 @@ func (n *TransitionNotifier) deliverCompletion(rec CompletionRecord) (committed,
 	// real parent is a legitimate completion and MUST be delivered. The removed
 	// title-only pre-filter here silently dropped that legitimate parented case.
 	// The replay path (ReplayUnackedCompletions) handles the not-committed case
-	// via the bounded dead-letter sink, so the terminal reason is discarded here.
-	committed, _, reason := n.commitEventToInbox(event)
+	// via the bounded dead-letter sink; it needs the terminal reason only to
+	// tell a removed child (log-only, ack) from a retryable miss.
+	committed, _, reason = n.commitEventToInbox(event)
 	if committed && isUnownedReason(reason) {
-		return false, true
+		return false, true, reason
 	}
-	return committed, false
+	return committed, false, reason
 }
 
 // ShouldRecycleForVersion reports whether a long-lived daemon should exit so

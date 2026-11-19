@@ -1,0 +1,315 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-deck/session.list/v1/out",
+  "title": "session.list output",
+  "type": "object",
+  "properties": {
+    "profile": {
+      "description": "Resolved profile name (single-profile listing)",
+      "type": "string"
+    },
+    "profile_count": {
+      "type": "integer"
+    },
+    "profiles": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/core.ProfileSessions"
+      }
+    },
+    "sessions": {
+      "description": "Sessions of the single profile; empty with all_profiles",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/core.SessionRow"
+      }
+    }
+  },
+  "required": [
+    "sessions"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "core.ProfileSessions": {
+      "type": "object",
+      "properties": {
+        "profile": {
+          "type": "string"
+        },
+        "sessions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/core.SessionRow"
+          }
+        }
+      },
+      "required": [
+        "profile",
+        "sessions"
+      ],
+      "additionalProperties": false
+    },
+    "core.SessionRow": {
+      "type": "object",
+      "properties": {
+        "account": {
+          "type": "string"
+        },
+        "archived": {
+          "description": "live",
+          "type": "boolean"
+        },
+        "archived_at": {
+          "description": "live",
+          "type": "string",
+          "format": "date-time"
+        },
+        "background_work": {
+          "$ref": "#/$defs/tmux.BackgroundWork",
+          "description": "live; in-flight background work (workflow, agent, bash, monitor) behind substate background-work"
+        },
+        "channels": {
+          "description": "live",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "claude_session_id": {
+          "type": "string"
+        },
+        "codex_session_id": {
+          "type": "string"
+        },
+        "color": {
+          "description": "live",
+          "type": "string"
+        },
+        "command": {
+          "type": "string"
+        },
+        "conductor_name": {
+          "description": "stable conductor name of a conductor session (survives renames); absent for other sessions",
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "exit_code": {
+          "description": "live",
+          "type": "integer"
+        },
+        "extra_args": {
+          "description": "live",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "favorite": {
+          "description": "live",
+          "type": "boolean"
+        },
+        "group": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "intended_switch": {
+          "$ref": "#/$defs/session.IntendedSwitchJSON",
+          "description": "intended account/model switch: the switch is intended while account and model equal it and now \u003c expires_at; absent when none or expired"
+        },
+        "last_activity_at": {
+          "description": "live",
+          "type": "string"
+        },
+        "model": {
+          "description": "live",
+          "type": "string"
+        },
+        "model_id": {
+          "description": "live",
+          "type": "string"
+        },
+        "model_version": {
+          "description": "live",
+          "type": "string"
+        },
+        "parent_project_path": {
+          "type": "string"
+        },
+        "parent_session_id": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "profile": {
+          "type": "string"
+        },
+        "resolved_codex_home": {
+          "type": "string"
+        },
+        "ssh_host": {
+          "type": "string"
+        },
+        "ssh_remote_path": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "status_source": {
+          "description": "cached for an absent historical row whose stored status was used; live after a status refresh; stale when the refresh could not capture the pane (batched capture timed out): status is the last observation or the default, substate last known or absent",
+          "type": "string"
+        },
+        "substate": {
+          "description": "live",
+          "type": "string"
+        },
+        "substate_detail": {
+          "description": "live",
+          "type": "string"
+        },
+        "superseded_by": {
+          "description": "live",
+          "type": "string"
+        },
+        "supersedes": {
+          "description": "live",
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "tmux_binary": {
+          "description": "the [tmux.binaries] client for that socket; absent when none applies (run the bare tmux)",
+          "type": "string"
+        },
+        "tmux_session": {
+          "description": "live",
+          "type": "string"
+        },
+        "tmux_socket_name": {
+          "description": "tmux -L socket the session lives on; absent on the default server",
+          "type": "string"
+        },
+        "tool": {
+          "type": "string"
+        },
+        "transcript_path": {
+          "type": "string"
+        },
+        "viewers": {
+          "description": "live; absent when tmux could not be asked",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/tmux.Viewer"
+          }
+        }
+      },
+      "required": [
+        "account",
+        "archived",
+        "created_at",
+        "group",
+        "id",
+        "path",
+        "profile",
+        "status",
+        "title",
+        "tool"
+      ],
+      "additionalProperties": false
+    },
+    "session.IntendedSwitchJSON": {
+      "type": "object",
+      "properties": {
+        "account": {
+          "type": "string"
+        },
+        "at": {
+          "type": "string"
+        },
+        "expires_at": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "account",
+        "at",
+        "expires_at",
+        "model",
+        "reason"
+      ],
+      "additionalProperties": false
+    },
+    "tmux.BackgroundWork": {
+      "type": "object",
+      "properties": {
+        "count": {
+          "type": "integer"
+        },
+        "elapsed": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "step": {
+          "type": "integer"
+        },
+        "steps": {
+          "type": "integer"
+        },
+        "task": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "tmux.Viewer": {
+      "type": "object",
+      "properties": {
+        "activity": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "height": {
+          "type": "integer"
+        },
+        "name": {
+          "type": "string"
+        },
+        "tty": {
+          "type": "string"
+        },
+        "user": {
+          "type": "string"
+        },
+        "width": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "activity",
+        "height",
+        "name",
+        "tty",
+        "width"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

@@ -22,10 +22,9 @@
 // Surfaces with a tmux fallback (CLI/TUI via Instance.UpdateStatus) call
 // Derive with AllowStaleWaiting=false: stale "waiting" hooks fall through
 // so the fallback can run. The web read-path has no per-request tmux
-// budget, so it calls Derive with AllowStaleWaiting=true: a stale waiting
-// hook is treated as a durable proxy for the tmux signal it would have
-// observed (preserving the v1.8.0 #867 behavior that fixes the web
-// stale-error class).
+// budget, so it calls Derive with AllowStaleWaiting=true for tools that emit
+// both start and stop edges. Legacy Codex notify emits only completion, so its
+// web overlay lets waiting expire and trusts the refreshed snapshot (#2189).
 package sessionstatus
 
 import (
@@ -40,7 +39,7 @@ import (
 const (
 	HookFastPathWindow             = 2 * time.Minute
 	CodexHookRunningFastPathWindow = 20 * time.Second
-	CodexHookWaitingFastPathWindow = 2 * time.Minute
+	CodexHookWaitingFastPathWindow = 5 * time.Second
 )
 
 // Input is the value-typed input to Derive. Surfaces construct it from
@@ -76,6 +75,12 @@ type Input struct {
 	// "waiting" hook overrides any non-stopped PriorStatus regardless of
 	// freshness. When false, stale hooks fall through. See package doc.
 	AllowStaleWaiting bool
+
+	// InstanceID, when set, lets a fresh "dead" hook from a process older
+	// than the instance's newest spawn be ignored, as Instance.UpdateStatus
+	// does (session.HookDeadFromEarlierSpawn, issue #2853). Empty: the dead
+	// hook is taken at face value.
+	InstanceID string
 }
 
 // Decision is the result of Derive. Status is the post-hook visible status;
@@ -87,14 +92,10 @@ type Decision struct {
 }
 
 // IsHookEmittingTool returns true for tools that emit lifecycle hook files.
-// Mirrors the gate at internal/session/instance.go:2854 + 2873.
-// Hermes uses the same shell hook model as Claude Code and Gemini; hooks are
-// injected via `agent-deck hermes-hooks install` into ~/.hermes/config.yaml.
+// Delegates to session.HookStatusTool, the single registry of hook-driven
+// tools (#2222 was a hand-written copy of this predicate missing pi).
 func IsHookEmittingTool(tool string) bool {
-	if session.IsClaudeCompatible(tool) {
-		return true
-	}
-	return tool == "codex" || tool == "gemini" || tool == "hermes" || tool == "cursor"
+	return session.HookStatusTool(tool)
 }
 
 // freshnessFor returns the freshness window for a (tool, hookStatus) pair.
@@ -154,7 +155,7 @@ func Derive(in Input) Decision {
 		return Decision{Status: session.StatusWaiting, Applied: true}
 
 	case "dead":
-		if !fresh {
+		if !fresh || session.HookDeadFromEarlierSpawn(in.InstanceID, in.Hook.Status, in.Hook.UpdatedAt) {
 			return keep
 		}
 		return Decision{Status: session.StatusError, Applied: true}

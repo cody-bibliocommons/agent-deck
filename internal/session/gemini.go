@@ -24,7 +24,7 @@ func GetGeminiConfigDir() string {
 		return geminiConfigDirOverride
 	}
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".gemini")
+	return sandboxedToolDir("Gemini config dir", filepath.Join(home, ".gemini"))
 }
 
 // HashProjectPath generates SHA256 hash of absolute project path
@@ -220,8 +220,12 @@ func UpdateGeminiAnalyticsFromDisk(projectPath, sessionID string, analytics *Gem
 			Type   string `json:"type"`
 			Model  string `json:"model,omitempty"`
 			Tokens struct {
-				Input  int `json:"input"`
-				Output int `json:"output"`
+				Input    int `json:"input"`
+				Output   int `json:"output"`
+				Cached   int `json:"cached"`   // subset of Input served from cache
+				Thoughts int `json:"thoughts"` // reasoning tokens
+				Tool     int `json:"tool"`
+				Total    int `json:"total"` // Gemini's own sum: input+output+thoughts+tool
 			} `json:"tokens"`
 		} `json:"messages"`
 	}
@@ -246,20 +250,34 @@ func UpdateGeminiAnalyticsFromDisk(projectPath, sessionID string, analytics *Gem
 		analytics.Duration = lastUpdated.Sub(startTime)
 	}
 
-	// Reset and accumulate tokens
+	// Reset and accumulate tokens. Every counter Gemini records is kept:
+	// dropping thoughts/tool understates the session total, and dropping cached
+	// hides how much of the prompt was served from cache.
 	analytics.InputTokens = 0
 	analytics.OutputTokens = 0
+	analytics.CachedTokens = 0
+	analytics.ThoughtsTokens = 0
+	analytics.ToolTokens = 0
+	analytics.ReportedTotalTokens = 0
+	analytics.CurrentContextTokens = 0
+	analytics.CurrentContextCachedTokens = 0
 	analytics.TotalTurns = 0
 	analytics.Model = ""
 	for _, msg := range session.Messages {
 		if msg.Type == "gemini" {
 			analytics.InputTokens += msg.Tokens.Input
 			analytics.OutputTokens += msg.Tokens.Output
+			analytics.CachedTokens += msg.Tokens.Cached
+			analytics.ThoughtsTokens += msg.Tokens.Thoughts
+			analytics.ToolTokens += msg.Tokens.Tool
+			analytics.ReportedTotalTokens += msg.Tokens.Total
 			analytics.TotalTurns++
 
 			// For Gemini, the input tokens of the last message represent the total context size
-			// including history and current prompt.
+			// including history and current prompt. The cached portion is a subset
+			// of that same number, tracked alongside it rather than added to it.
 			analytics.CurrentContextTokens = msg.Tokens.Input
+			analytics.CurrentContextCachedTokens = msg.Tokens.Cached
 
 			// Extract model from the last gemini message that has one
 			if msg.Model != "" {
@@ -329,9 +347,16 @@ func GetAvailableGeminiModels() ([]string, error) {
 	}
 
 	client := &http.Client{Timeout: 5 * time.Second}
-	// #nosec G704 -- URL is a hardcoded Google API endpoint; only the API key
-	// query param is interpolated, sourced from the local GOOGLE_API_KEY env.
-	resp, err := client.Get("https://generativelanguage.googleapis.com/v1beta/models?key=" + apiKey)
+	// The key goes in the x-goog-api-key header, not the URL: a URL is what
+	// proxies, access logs and *url.Error messages record.
+	req, err := http.NewRequest(http.MethodGet, "https://generativelanguage.googleapis.com/v1beta/models", nil)
+	if err != nil {
+		return geminiModelFallback, fmt.Errorf("API request failed: %w", err)
+	}
+	req.Header.Set("x-goog-api-key", apiKey)
+	// #nosec G704 -- URL is a hardcoded Google API endpoint; the API key
+	// travels only in a header, sourced from the local GOOGLE_API_KEY env.
+	resp, err := client.Do(req)
 	if err != nil {
 		return geminiModelFallback, fmt.Errorf("API request failed: %w", err)
 	}

@@ -36,14 +36,23 @@ export const ICONS = {
   settings:'M12 8a4 4 0 100 8 4 4 0 000-8z M12 2v2 M12 20v2 M4.93 4.93l1.41 1.41 M17.66 17.66l1.41 1.41 M2 12h2 M20 12h2 M4.93 19.07l1.41-1.41 M17.66 6.34l1.41-1.41',
   chev:    'M6 9l6 6 6-6',
   chevR:   'M9 6l6 6-6 6',
+  chevL:   'M15 6l-6 6 6 6',
   x:       'M6 6l12 12 M6 18L18 6',
   zap:     'M13 2L3 14h8l-1 8 10-12h-8l1-8z',
   wifi:    'M5 12a10 10 0 0114 0 M8.5 15.5a5 5 0 017 0 M12 19h.01',
   send:    'M22 2L11 13 M22 2l-7 20-4-9-9-4 20-7z',
   book:    'M4 4h12a4 4 0 014 4v12H8a4 4 0 01-4-4z M4 4v16',
+  folder:  'M3 7V5a2 2 0 012-2h4l2 2h8a2 2 0 012 2v12a2 2 0 01-2 2H5a2 2 0 01-2-2V7z',
   term:    'M4 4h16v16H4z M8 9l3 3-3 3 M13 15h4',
   // edit (pencil) — used by Sidebar SessionItem to open EditSessionDialog.
   edit:    'M12 20h9 M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4 12.5-12.5z',
+  // archive (lid + box + handle slot). Replaces the ⌂ house glyph the sidebar
+  // used, which is the *home* symbol and read as anything but archiving.
+  archive: 'M21 8v13H3V8 M1 3h22v5H1z M10 12h4',
+  // merge (two nodes, branch curving into the trunk) — worktree finish, which
+  // merges the branch and cleans up. Replaces the ⎇✓ text glyph. Circles are
+  // drawn as paired arcs because Icon renders a single <path>.
+  merge:   'M15 18a3 3 0 106 0 3 3 0 10-6 0 M3 6a3 3 0 106 0 3 3 0 10-6 0 M6 21V9a9 9 0 009 9',
 }
 
 export function Dot({ status, size = 7 }) {

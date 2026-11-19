@@ -46,6 +46,7 @@ func TestHermesDetectionDoesNotWriteConfigBeforeConsent(t *testing.T) {
 			previousWorkers := homeBackgroundWorkersEnabled
 			homeBackgroundWorkersEnabled = true
 			t.Cleanup(func() { homeBackgroundWorkersEnabled = previousWorkers })
+			stubLogMaintenance(t)
 			previousDB := statedb.GetGlobal()
 			statedb.SetGlobal(nil)
 			t.Cleanup(func() { statedb.SetGlobal(previousDB) })
@@ -119,17 +120,19 @@ func TestHermesHooksDialogDisclosesMutationAndDefaultsToSkip(t *testing.T) {
 	}
 }
 
-func TestPendingHookPromptsAreSequencedClaudeThenHermes(t *testing.T) {
+// ASK-211: the Claude hooks question is the hooks line in the New Session
+// form, not a box, so an open Claude question no longer holds the Hermes box
+// back and never shows a Claude box itself.
+func TestPendingHookPromptsShowHermesBoxButNoClaudeBox(t *testing.T) {
 	home := &Home{
-		confirmDialog:            NewConfirmDialog(),
-		pendingHooksPrompt:       true,
-		pendingHermesHooksPrompt: true,
+		confirmDialog:      NewConfirmDialog(),
+		pendingHooksPrompt: true,
 	}
 	home.showPendingHooksPrompt()
-	if got := home.confirmDialog.GetConfirmType(); got != ConfirmInstallHooks {
-		t.Fatalf("first prompt = %v, want Claude hooks", got)
+	if home.confirmDialog.IsVisible() {
+		t.Fatalf("a Claude hooks box was shown (%v); the question lives in the New Session form", home.confirmDialog.GetConfirmType())
 	}
-	home.pendingHooksPrompt = false
+	home.pendingHermesHooksPrompt = true
 	home.showPendingHooksPrompt()
 	if got := home.confirmDialog.GetConfirmType(); got != ConfirmInstallHermesHooks {
 		t.Fatalf("second prompt = %v, want Hermes hooks", got)
@@ -237,6 +240,7 @@ func TestAcceptedHermesHooksRemovedLaterAreNotReinstalled(t *testing.T) {
 	previousWorkers := homeBackgroundWorkersEnabled
 	homeBackgroundWorkersEnabled = true
 	t.Cleanup(func() { homeBackgroundWorkersEnabled = previousWorkers })
+	stubLogMaintenance(t)
 
 	home := NewHome()
 	t.Cleanup(func() {

@@ -11,8 +11,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/health"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
+	"github.com/asheshgoplani/agent-deck/internal/termtext"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
@@ -46,19 +48,32 @@ type InstanceData struct {
 	IsConductor        bool   `json:"is_conductor,omitempty"`         // True if this session is a conductor orchestrator
 	NoTransitionNotify bool   `json:"no_transition_notify,omitempty"` // Suppress transition event dispatch
 	TitleLocked        bool   `json:"title_locked,omitempty"`         // #697: block Claude session-name sync into Title
+	// Acknowledged and AcknowledgedAt carry the user's "seen" mark from the
+	// acknowledged columns into a rebuilt session, so a reload does not undo it.
+	Acknowledged   bool      `json:"-"`
+	AcknowledgedAt time.Time `json:"-"`
+	// ConductorName mirrors Instance.ConductorName, the stable conductor key.
+	// Lives in the tool_data extras zone (conductor_identity.go).
+	ConductorName string `json:"conductor_name,omitempty"`
 	// SubcommandPassthrough mirrors Instance.SubcommandPassthrough (#1821).
 	// Persisted via the tool_data extras zone (see
 	// WriteSubcommandPassthroughToToolData), not a dedicated SQL column, so
 	// it round-trips across binary versions without a schema migration.
-	SubcommandPassthrough bool      `json:"subcommand_passthrough,omitempty"`
-	AutoName              bool      `json:"auto_name,omitempty"`             // marks Title as a machine-generated quick-session handle
-	AutoNameDescription   string    `json:"auto_name_description,omitempty"` // last captured Claude task description for an AutoName session
-	Command               string    `json:"command"`
-	Wrapper               string    `json:"wrapper,omitempty"`
-	Tool                  string    `json:"tool"`
-	Status                Status    `json:"status"`
-	CreatedAt             time.Time `json:"created_at"`
-	LastAccessedAt        time.Time `json:"last_accessed_at,omitempty"`
+	SubcommandPassthrough bool `json:"subcommand_passthrough,omitempty"`
+	TrackCommandExit      bool `json:"track_command_exit,omitempty"`
+	// PiSocketExported mirrors Instance.PiSocketExported (tool_data extras zone).
+	PiSocketExported bool `json:"pi_socket_exported,omitempty"`
+	// LaunchedTool mirrors Instance.LaunchedTool (tool_data extras zone, written
+	// only by the launch's targeted write).
+	LaunchedTool        string    `json:"launched_tool,omitempty"`
+	AutoName            bool      `json:"auto_name,omitempty"`             // marks Title as a machine-generated quick-session handle
+	AutoNameDescription string    `json:"auto_name_description,omitempty"` // last captured Claude task description for an AutoName session
+	Command             string    `json:"command"`
+	Wrapper             string    `json:"wrapper,omitempty"`
+	Tool                string    `json:"tool"`
+	Status              Status    `json:"status"`
+	CreatedAt           time.Time `json:"created_at"`
+	LastAccessedAt      time.Time `json:"last_accessed_at,omitempty"`
 	// LastStartedAt mirrors Instance.LastStartedAt (issue #30 / #1704 fix).
 	// Persisted via the tool_data extras zone (see last_started_persist.go),
 	// not a typed SQL column. Zero means unknown (old record or never
@@ -76,8 +91,13 @@ type InstanceData struct {
 	// last_activity_persist.go). Zero means unknown (old record or never
 	// active).
 	LastActivityAt time.Time `json:"last_activity_at,omitempty"`
-	ArchivedAt     time.Time `json:"archived_at,omitempty"`
-	TmuxSession    string    `json:"tmux_session"`
+	// HookLag mirrors Instance.hookLag (status-light audit defect B): the
+	// persisted completed-turn samples, extras zone (see hook_lag.go).
+	HookLag      hookLagRecord `json:"hook_lag,omitempty"`
+	ArchivedAt   time.Time     `json:"archived_at,omitempty"`
+	SupersededBy string        `json:"superseded_by,omitempty"`
+	Supersedes   string        `json:"supersedes,omitempty"`
+	TmuxSession  string        `json:"tmux_session"`
 	// TmuxSocketName is the tmux -L selector captured at Instance creation
 	// (issue #687, v1.7.50). Empty for pre-v1.7.50 rows — those keep hitting
 	// the default server after upgrade.
@@ -172,11 +192,48 @@ type InstanceData struct {
 
 	// IdleTimeoutSecs mirrors Instance.IdleTimeoutSecs (#1143). 0 = disabled.
 	IdleTimeoutSecs int64 `json:"idle_timeout_secs,omitempty"`
+	// Favorite mirrors Instance.Favorite (tool_data extras zone).
+	Favorite bool `json:"favorite,omitempty"`
+
+	// IdentityInjectionDisabled mirrors Instance.IdentityInjectionDisabled.
+	// Lives in the tool_data extras zone (identity_injection_persist.go).
+	IdentityInjectionDisabled bool `json:"identity_injection_disabled,omitempty"`
+
+	// ContextLevel mirrors Instance.ContextLevel (issue #2260). Lives in the
+	// tool_data extras zone (context_level_persist.go).
+	ContextLevel string `json:"context_level,omitempty"`
+
+	// QueuedMessage mirrors Instance.QueuedMessage (tool_data extras zone,
+	// queued_start.go).
+	QueuedMessage string `json:"queued_message,omitempty"`
+
+	// PromptSuggestions mirrors Instance.PromptSuggestions (tool_data extras
+	// zone, prompt_suggestions.go).
+	PromptSuggestions string `json:"prompt_suggestions,omitempty"`
+
+	// WaitTimeout mirrors Instance.WaitTimeout (tool_data extras zone,
+	// wait_timer.go).
+	WaitTimeout string `json:"wait_timeout,omitempty"`
+
+	// IntendedSwitch mirrors Instance.IntendedSwitch (tool_data extras zone,
+	// intended_switch.go).
+	IntendedSwitch *IntendedSwitch `json:"intended_switch,omitempty"`
+
+	// LimitVerdictResetAt mirrors Instance.LimitVerdictResetAt (tool_data
+	// extras zone, limit_verdict_reset.go).
+	LimitVerdictResetAt time.Time `json:"limit_verdict_reset_at,omitempty"`
 
 	// DeepSeekTask mirrors Instance.DeepSeekTask (PR #1942 review, P1c).
 	// Persisted via the tool_data extras zone (see deepseek_task_persist.go).
 	// Empty for every profile but headless.
 	DeepSeekTask string `json:"deepseek_task,omitempty"`
+
+	// HermesSessionID mirrors Instance.HermesSessionID (issue #2582), stored in
+	// the tool_data extras zone (hermes_session_persist.go).
+	HermesSessionID string `json:"hermes_session_id,omitempty"`
+	// HermesDetectedAt is when the binding was recorded (tool_data
+	// hermes_detected_at); restart compares it with the hook record.
+	HermesDetectedAt time.Time `json:"-"`
 }
 
 // GroupData represents serializable group data
@@ -236,6 +293,12 @@ func NewStorageWithProfile(profile string) (*Storage, error) {
 		return nil, err
 	}
 
+	// A brand-new store is only created when the profile has no store under
+	// the other data root (stray XDG store incidents, 2026-09-19/20).
+	if err := guardNewProfileStore(effectiveProfile, profileDir); err != nil {
+		return nil, err
+	}
+
 	// Ensure directory exists with secure permissions (0700 = owner only)
 	if err := os.MkdirAll(profileDir, 0700); err != nil {
 		return nil, fmt.Errorf("failed to create storage directory: %w", err)
@@ -254,6 +317,15 @@ func NewStorageWithProfile(profile string) (*Storage, error) {
 	if err := migrateStateDBWithRetry(db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to migrate state database: %w", err)
+	}
+
+	// Identity check after the schema migration (which only creates or
+	// upgrades tables) and before any session row is read or written: the
+	// store must belong to the profile this process resolved (see
+	// statedb.BindProfile).
+	if err := db.BindProfile(statedb.ProfileNameForDir(profileDir)); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("profile %q: %w", effectiveProfile, err)
 	}
 
 	// Auto-migrate from sessions.json if state.db is empty
@@ -278,6 +350,14 @@ func NewStorageWithProfile(profile string) (*Storage, error) {
 		}
 	}
 
+	if err := pruneImageUploadsOnStartup(profileDir); err != nil {
+		storageLog.Warn("image_upload_cleanup_failed", slog.String("error", err.Error()))
+	}
+
+	if err := pruneHookArtifactsOnStartup(); err != nil {
+		storageLog.Warn("hook_cleanup_failed", slog.String("error", err.Error()))
+	}
+
 	return &Storage{
 		db:      db,
 		dbPath:  dbPath,
@@ -289,6 +369,16 @@ func NewStorageWithProfile(profile string) (*Storage, error) {
 // creating directories/files, migrating schema, changing SQLite journal
 // state, or checkpointing WAL files.
 func NewReadOnlyStorageWithProfile(profile string) (*Storage, error) {
+	return newReadOnlyStorageWithProfile(profile, statedb.OpenReadOnly)
+}
+
+// NewLiveReadOnlyStorageWithProfile reads committed WAL state for authoritative
+// live catalogs and preflight. It does not initialize schema or write rows.
+func NewLiveReadOnlyStorageWithProfile(profile string) (*Storage, error) {
+	return newReadOnlyStorageWithProfile(profile, statedb.OpenReadOnlyLive)
+}
+
+func newReadOnlyStorageWithProfile(profile string, open func(string) (*statedb.StateDB, error)) (*Storage, error) {
 	effectiveProfile, err := ResolveProfileForStorage(profile)
 	if err != nil {
 		return nil, err
@@ -297,9 +387,18 @@ func NewReadOnlyStorageWithProfile(profile string) (*Storage, error) {
 	if err != nil {
 		return nil, err
 	}
-	db, err := statedb.OpenReadOnly(dbPath)
+	db, err := open(dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open state database read-only: %w", err)
+	}
+	// A read-only handle cannot write to the wrong store, so a stamp it cannot
+	// confirm is a warning, never a refusal: the statusline, the remote
+	// catalog and other readers keep working while the writable open reports
+	// the mismatch.
+	if err := db.BindProfile(statedb.ProfileNameForDir(filepath.Dir(dbPath))); err != nil {
+		storageLog.Warn("profile_stamp_unconfirmed_read_only",
+			slog.String("profile", effectiveProfile),
+			slog.String("error", err.Error()))
 	}
 	return &Storage{db: db, dbPath: dbPath, profile: effectiveProfile}, nil
 }
@@ -384,10 +483,12 @@ func (s *Storage) saveWithGroups(instances []*Instance, groupTree *GroupTree) ([
 	UpdateClaudeSessionsWithDedup(instances)
 	updates := make([]statedb.InstanceSnapshot, len(instances))
 	clearIntents := make([]bool, len(instances))
+	launchesWritten := make([]bool, len(instances))
 	for i, inst := range instances {
 		if inst == nil {
 			return nil, fmt.Errorf("nil instance")
 		}
+		launchesWritten[i] = inst.launchUnrecorded.Load()
 		row, err := instanceToRow(inst)
 		if err != nil {
 			return nil, err
@@ -411,6 +512,9 @@ func (s *Storage) saveWithGroups(instances []*Instance, groupTree *GroupTree) ([
 		// Only the submitted representation was saved. Reading the live model
 		// again here could acknowledge edits made while this save was in flight.
 		original := statedb.CloneInstanceRow(updates[i].Desired)
+		if launchesWritten[i] {
+			inst.launchUnrecorded.CompareAndSwap(true, false) // the save recorded the launch
+		}
 		if clearIntents[i] {
 			inst.genericSessionIDCleared = false
 			original.ToolData = WriteGenericSessionIDToToolData(original.ToolData, "", time.Time{}, false)
@@ -428,15 +532,141 @@ func (s *Storage) saveWithGroups(instances []*Instance, groupTree *GroupTree) ([
 // can still hold stale unedited fields, which must not become future edit intent.
 type instanceStorageSnapshot struct {
 	dbPath   string
+	profile  string // the Storage's profile: where a queued message is sent
 	original *statedb.InstanceRow
 	stored   *statedb.InstanceRow
 }
 
+// ForgetStorageSnapshot drops what the instance remembers of its stored row.
+// An undoable delete calls it once the row is gone: an undo then re-saves the
+// session as a new row instead of failing the registry's stale-deletion
+// check against a row that no longer exists.
+func (i *Instance) ForgetStorageSnapshot() {
+	if i != nil {
+		i.storageSnapshot = nil
+	}
+}
+
 func (s *Storage) rememberInstanceSnapshot(inst *Instance, original, stored *statedb.InstanceRow) {
+	inst.restartDB.Store(s.db)
 	inst.storageSnapshot = &instanceStorageSnapshot{
 		dbPath:   s.dbPath,
+		profile:  s.profile,
 		original: statedb.CloneInstanceRow(original),
 		stored:   statedb.CloneInstanceRow(stored),
+	}
+}
+
+// CommitNativeHarnessSwitch persists a same-harness switch after its lifecycle
+// work has completed. Unlike SaveWithGroups, it does not replay a full stale
+// registry snapshot: it compare-and-swaps the source identity and writes only
+// account, tool, and native-ID fields. Monitor status changes and unrelated
+// sessions/edits therefore survive, while a changed account, command, path, or
+// native ID refuses recovery rather than overwriting a newer operation.
+func (s *Storage) CommitNativeHarnessSwitch(inst *Instance, result *HarnessSwitchResult) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("storage database not initialized")
+	}
+	if inst == nil || result == nil || !result.Committed || result.nativeSource.InstanceID == "" || result.nativeTarget.InstanceID == "" {
+		return fmt.Errorf("native harness switch commit is incomplete")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	source := nativeSwitchStorageIdentity(result.nativeSource)
+	target := nativeSwitchStorageIdentity(result.nativeTarget)
+	// A move of the conversation to another account or harness resets the
+	// transcript limit verdict in the same CAS (the moved transcript still
+	// ends in the old account's rejection); a rollback restores what the
+	// move replaced. An acknowledgement writes nothing.
+	var limitState *limitSwitchState
+	if !result.nativeStorageAcknowledgement {
+		switch {
+		case result.nativeRevert:
+			st := result.nativeRevertLimit
+			limitState = &st
+		case source.Account != target.Account || source.Tool != target.Tool:
+			st := limitSwitchStateAfterMove(captureLimitSwitchState(inst), target.Account, time.Now())
+			limitState = &st
+		}
+	}
+	if limitState != nil {
+		target.ToolDataExtras = limitSwitchToolData(*limitState)
+	}
+	var (
+		committed *statedb.InstanceRow
+		err       error
+	)
+	if result.nativeStorageAcknowledgement {
+		// The CAS already succeeded, but writing its journal acknowledgement
+		// failed. A reloaded target can only confirm that exact durable target;
+		// it must not retry the source-bound CAS or replay lifecycle work.
+		committed, err = s.db.ConfirmNativeHarnessSwitchTarget(target)
+	} else {
+		committed, err = s.db.CommitNativeHarnessSwitch(source, target)
+	}
+	if err != nil {
+		return fmt.Errorf("commit native harness switch: %w", err)
+	}
+	// A completed-journal retry starts from the old registry row. Reconcile the
+	// exact already-executed mutation here; no stop/start/prompt lifecycle work
+	// is replayed merely to repair storage.
+	inst.Tool, inst.Account = result.nativeTarget.Tool, result.nativeTarget.Account
+	inst.ClaudeSessionID, inst.CodexSessionID = result.nativeTarget.ClaudeID, result.nativeTarget.CodexID
+	if limitState != nil {
+		inst.applyLimitSwitchState(*limitState)
+	}
+	desired, err := instanceToRow(inst)
+	if err != nil {
+		return err
+	}
+	s.rememberInstanceSnapshot(inst, desired, committed)
+	if err := completeNativeHarnessSwitchJournal(result); err != nil {
+		return err
+	}
+	_ = s.db.Touch()
+	return nil
+}
+
+// FinalizeCrossHarnessSupersession is the durable replacement boundary for a
+// ready fresh target. It updates only the exact source and target rows in one
+// SQLite transaction: source becomes archived with a reversible successor ID,
+// and target becomes active with its predecessor ID. No transcript/runtime is
+// deleted or overwritten, and a failed CAS leaves the source visible.
+func (s *Storage) FinalizeCrossHarnessSupersession(source, target *Instance) error {
+	if s == nil || s.db == nil || source == nil || target == nil {
+		return fmt.Errorf("cross-harness supersession storage is incomplete")
+	}
+	if source.ID == "" || target.ID == "" || source.ID == target.ID {
+		return fmt.Errorf("cross-harness supersession has invalid source/target IDs")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sourceIdentity := statedb.NativeHarnessSwitchIdentity{
+		ID: source.ID, Tool: source.Tool, Account: source.Account, ProjectPath: source.ProjectPath, Command: source.Command,
+		ClaudeSessionID: source.ClaudeSessionID, CodexSessionID: source.CodexSessionID, ParentSessionID: source.ParentSessionID,
+	}
+	targetIdentity := statedb.NativeHarnessSwitchIdentity{
+		ID: target.ID, Tool: target.Tool, Account: target.Account, ProjectPath: target.ProjectPath, Command: target.Command,
+		ClaudeSessionID: target.ClaudeSessionID, CodexSessionID: target.CodexSessionID, ParentSessionID: target.ParentSessionID,
+	}
+	_, _, err := s.db.CommitCrossHarnessSupersession(sourceIdentity, targetIdentity, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("commit cross-harness supersession: %w", err)
+	}
+	_ = s.db.Touch()
+	return nil
+}
+
+func nativeSwitchStorageIdentity(identity switchIdentity) statedb.NativeHarnessSwitchIdentity {
+	tool := identity.StorageTool
+	if tool == "" { // version-2 journals stored only the canonical harness.
+		tool = identity.Tool
+	}
+	return statedb.NativeHarnessSwitchIdentity{
+		ID: identity.InstanceID, Tool: tool, Account: identity.Account,
+		ProjectPath: identity.ProjectPath, Command: identity.Command,
+		ClaudeSessionID: identity.ClaudeID, CodexSessionID: identity.CodexID,
 	}
 }
 
@@ -465,19 +695,40 @@ func (s *Storage) UpdateTitleIfUnlocked(id, title string) (applied bool, err err
 // DeleteInstance removes a single instance from the database by ID.
 // This ensures the row is immediately removed, preventing resurrection on reload.
 func (s *Storage) DeleteInstance(id string) error {
+	cleanup, err := s.DeleteInstanceDeferredCleanup(id)
+	if err != nil {
+		return err
+	}
+	cleanup()
+	return nil
+}
+
+// DeleteInstanceDeferredCleanup commits the registry deletion and returns its
+// best-effort hook cleanup separately. UI callers must run cleanup in a command
+// so filesystem scans and registry contention cannot block the message handler.
+// On deletion failure no cleanup is returned. The cleanup does not use Storage
+// and can run after it closes.
+func (s *Storage) DeleteInstanceDeferredCleanup(id string) (func(), error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.db == nil {
-		return fmt.Errorf("storage database not initialized")
+		return nil, fmt.Errorf("storage database not initialized")
 	}
-
 	if err := s.db.DeleteInstance(id); err != nil {
-		return fmt.Errorf("failed to delete instance %s: %w", id, err)
+		return nil, fmt.Errorf("failed to delete instance %s: %w", id, err)
 	}
-
 	_ = s.db.Touch()
-	return nil
+	profileDir := filepath.Dir(s.dbPath)
+	return func() {
+		if err := cleanupImageUploads(profileDir, id); err != nil {
+			storageLog.Warn("image_upload_cleanup_failed", slog.String("id", strings.ReplaceAll(strings.ReplaceAll(logging.SanitizeValue(id), "\n", ""), "\r", "")), slog.String("error", strings.ReplaceAll(strings.ReplaceAll(logging.SanitizeValue(err.Error()), "\n", ""), "\r", "")))
+		}
+		if err := pruneHookArtifacts(id); err != nil {
+			storageLog.Warn("hook_cleanup_failed", slog.String("id", strings.ReplaceAll(strings.ReplaceAll(logging.SanitizeValue(id), "\n", ""), "\r", "")), slog.String("error", strings.ReplaceAll(strings.ReplaceAll(logging.SanitizeValue(err.Error()), "\n", ""), "\r", "")))
+		}
+		removeLaunchEnvFiles(id)
+	}, nil
 }
 
 // DeleteGroupSubtree removes a group and all of its descendants from the groups
@@ -626,9 +877,15 @@ func (s *Storage) InsertSessionAndVerify(newInstance *Instance, groupTree *Group
 	if newInstance == nil {
 		return fmt.Errorf("nil instance")
 	}
-	if err := s.SaveWithGroups([]*Instance{newInstance}, groupTree); err != nil {
+	rows, err := s.saveWithGroups([]*Instance{newInstance}, groupTree)
+	if err != nil {
 		return err
 	}
+	s.refreshCommittedGroupTitles([]*Instance{newInstance}, rows)
+	// Issue #2209: the post-start save merges with a concurrent detector's
+	// committed liveness observation instead of aborting. The instance the
+	// launch goes on to report must describe that merged row.
+	adoptCommittedLiveness(newInstance, rows[0])
 	exists, err := s.InstanceExists(newInstance.ID)
 	if err != nil {
 		return fmt.Errorf("verify insert of %s: %w", newInstance.ID, err)
@@ -637,6 +894,36 @@ func (s *Storage) InsertSessionAndVerify(newInstance *Instance, groupTree *Group
 		return fmt.Errorf("%w: concurrent deletion conflict for instance %s", ErrInsertNotPersistent, newInstance.ID)
 	}
 	return nil
+}
+
+// adoptCommittedLiveness copies the liveness values the snapshot merge may
+// have resolved in favour of a concurrent writer (statedb liveness_merge.go)
+// back onto the in-memory instance: pane-derived status, activity time, and
+// the detection stamps. Everything else was written as submitted.
+func adoptCommittedLiveness(inst *Instance, row *statedb.InstanceRow) {
+	if inst == nil || row == nil {
+		return
+	}
+	inst.Status = Status(row.Status)
+	inst.LastAccessedAt = row.LastAccessed
+	var stamps struct {
+		Claude   int64 `json:"claude_detected_at"`
+		Gemini   int64 `json:"gemini_detected_at"`
+		OpenCode int64 `json:"opencode_detected_at"`
+		Codex    int64 `json:"codex_detected_at"`
+	}
+	if len(row.ToolData) == 0 || json.Unmarshal(row.ToolData, &stamps) != nil {
+		return
+	}
+	adopt := func(dst *time.Time, unix int64) {
+		if unix > 0 && dst.Unix() != unix {
+			*dst = time.Unix(unix, 0)
+		}
+	}
+	adopt(&inst.ClaudeDetectedAt, stamps.Claude)
+	adopt(&inst.GeminiDetectedAt, stamps.Gemini)
+	adopt(&inst.OpenCodeDetectedAt, stamps.OpenCode)
+	adopt(&inst.CodexDetectedAt, stamps.Codex)
 }
 
 // SyncInstanceCwd swaps the persisted project_path for id to newCwd, but ONLY
@@ -844,7 +1131,7 @@ func instanceToRow(inst *Instance) (*statedb.InstanceRow, error) {
 	}
 	tmuxName := ""
 	if inst.tmuxSession != nil {
-		tmuxName = inst.tmuxSession.Name
+		tmuxName = inst.tmuxSession.TmuxName()
 	}
 	var sandboxJSON json.RawMessage
 	if inst.Sandbox != nil {
@@ -887,11 +1174,34 @@ func instanceToRow(inst *Instance) (*statedb.InstanceRow, error) {
 	// the positional MarshalToolData signature so legacy binaries that don't
 	// know the key preserve it via MergeToolDataExtras.
 	toolData = WriteIdleTimeoutSecsToToolData(toolData, inst.IdleTimeoutSecs)
+	toolData = WriteFavoriteToToolData(toolData, inst.Favorite, inst.favoriteCleared)
 	// #1821: subcommand_passthrough lives in the same extras zone — see
 	// Instance.SubcommandPassthrough's doc for why losing it on reload must
 	// never silently re-enable claude/codex account-routing treatment for a
 	// command that was never explicitly validated as one.
 	toolData = WriteSubcommandPassthroughToToolData(toolData, inst.SubcommandPassthrough)
+	toolData = writeTrackCommandExitToToolData(toolData, inst.TrackCommandExit)
+	// The launch decision is the launch's to write (pi_socket_persist.go); a
+	// save writes it only for a launch that found no row (a session started
+	// before its first save). Otherwise it is left out, and the stored one is
+	// carried forward.
+	if inst.launchUnrecorded.Load() {
+		toolData = writeLaunchDecisionToToolData(toolData, tmuxName, inst.LaunchedTool, inst.PiSocketExported)
+	}
+	// Identity-injection opt-out lives in the same extras zone so a restart
+	// from any process honours `--no-identity`.
+	toolData = WriteIdentityInjectionDisabledToToolData(toolData, inst.IdentityInjectionDisabled)
+	// Stable conductor identity (conductor_identity.go). Never cleared, so an
+	// empty value leaves the stored key to MergeToolDataExtras.
+	toolData = WriteConductorNameToToolData(toolData, inst.storedConductorName())
+	// #2260: the per-session context-level override lives in the same extras
+	// zone so a restart from any process honours `session set ... context-level`.
+	toolData = WriteContextLevelToToolData(toolData, inst.ContextLevel)
+	toolData = WriteQueuedMessageToToolData(toolData, inst.QueuedMessage)
+	toolData = WritePromptSuggestionsToToolData(toolData, inst.PromptSuggestions)
+	toolData = WriteWaitTimeoutToToolData(toolData, inst.WaitTimeout)
+	toolData = WriteIntendedSwitchToToolData(toolData, inst.IntendedSwitch)
+	toolData = WriteLimitVerdictResetToToolData(toolData, inst.LimitVerdictResetAt)
 	// #1815: the resume-identity taint travels with the id it describes, so a
 	// writer that saves a discovered conversation id without ever passing
 	// through the resume builder (e.g. `switch-account --no-restart`) cannot
@@ -932,6 +1242,8 @@ func instanceToRow(inst *Instance) (*statedb.InstanceRow, error) {
 	// zone. For a one-shot the task IS the invocation, so a row that forgets it
 	// can only ever be "restarted" into dsh's usage error.
 	toolData = WriteDeepSeekTaskToToolData(toolData, inst.DeepSeekTask)
+	toolData = WriteHermesSessionIDToToolData(toolData, inst.HermesSessionID)
+	toolData = WriteCrossHarnessLineageToToolData(toolData, inst.SupersededBy, inst.Supersedes)
 
 	return &statedb.InstanceRow{
 		ID:                  inst.ID,
@@ -946,7 +1258,7 @@ func instanceToRow(inst *Instance) (*statedb.InstanceRow, error) {
 		TmuxSession:         tmuxName,
 		TmuxSocketName:      inst.TmuxSocketName,
 		CreatedAt:           inst.CreatedAt,
-		LastAccessed:        inst.LastAccessedAt,
+		LastAccessed:        inst.GetLastAccessedAtThreadSafe(),
 		ParentSessionID:     inst.ParentSessionID,
 		IsConductor:         inst.IsConductor,
 		NoTransitionNotify:  inst.NoTransitionNotify,
@@ -957,7 +1269,7 @@ func instanceToRow(inst *Instance) (*statedb.InstanceRow, error) {
 		WorktreeRepo:        inst.WorktreeRepoRoot,
 		WorktreeBranch:      inst.WorktreeBranch,
 		Account:             inst.Account,
-		ArchivedAt:          inst.ArchivedAt,
+		ArchivedAt:          inst.ArchivedAtThreadSafe(),
 		Pin:                 string(inst.Pin),
 		ToolData:            toolData,
 	}, nil
@@ -1010,7 +1322,9 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 	}
 
 	// Load from SQLite
+	queryStarted := time.Now()
 	snapshot, err := s.db.LoadRegistrySnapshot()
+	health.RecordDBQuery(time.Since(queryStarted))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1040,7 +1354,7 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 
 		instances[i] = &InstanceData{
 			ID:                        r.ID,
-			Title:                     r.Title,
+			Title:                     termtext.Clean(r.Title),
 			ProjectPath:               r.ProjectPath,
 			GroupPath:                 r.GroupPath,
 			Order:                     r.Order,
@@ -1093,7 +1407,19 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 			AutoLinkedChannels:        autoLinkedChannels2,
 			Color:                     color2,
 			IdleTimeoutSecs:           ReadIdleTimeoutSecsFromToolData(r.ToolData),
+			Favorite:                  ReadFavoriteFromToolData(r.ToolData),
 			SubcommandPassthrough:     ReadSubcommandPassthroughFromToolData(r.ToolData),
+			TrackCommandExit:          readTrackCommandExitFromToolData(r.ToolData),
+			PiSocketExported:          rowPiSocketExported(r),
+			LaunchedTool:              rowLaunchedTool(r),
+			IdentityInjectionDisabled: ReadIdentityInjectionDisabledFromToolData(r.ToolData),
+			ConductorName:             ReadConductorNameFromToolData(r.ToolData),
+			ContextLevel:              ReadContextLevelFromToolData(r.ToolData),
+			QueuedMessage:             ReadQueuedMessageFromToolData(r.ToolData),
+			PromptSuggestions:         ReadPromptSuggestionsFromToolData(r.ToolData),
+			WaitTimeout:               ReadWaitTimeoutFromToolData(r.ToolData),
+			IntendedSwitch:            ReadIntendedSwitchFromToolData(r.ToolData),
+			LimitVerdictResetAt:       ReadLimitVerdictResetFromToolData(r.ToolData),
 			ClaudeSessionIDUnverified: ReadClaudeSessionUnverifiedFromToolData(r.ToolData),
 			LastStartedAt:             ReadLastStartedAtFromToolData(r.ToolData),
 			GenericSessionID:          ReadGenericSessionIDFromToolData(r.ToolData),
@@ -1102,7 +1428,12 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 			GenericSessionCommand:     genericScopeCommand(r.ToolData),
 			GenericSessionLocation:    genericScopeLocation(r.ToolData),
 			LastActivityAt:            ReadLastActivityAtFromToolData(r.ToolData),
+			HookLag:                   ReadHookLagFromToolData(r.ToolData),
 			DeepSeekTask:              ReadDeepSeekTaskFromToolData(r.ToolData),
+			HermesSessionID:           ReadHermesSessionIDFromToolData(r.ToolData),
+			HermesDetectedAt:          ReadHermesDetectedAtFromToolData(r.ToolData),
+			SupersededBy:              ReadCrossHarnessSupersededByFromToolData(r.ToolData),
+			Supersedes:                ReadCrossHarnessSupersedesFromToolData(r.ToolData),
 		}
 	}
 
@@ -1139,7 +1470,9 @@ func (s *Storage) LoadWithGroupsSnapshot() ([]*Instance, []*GroupData, *statedb.
 	}
 
 	// Load from SQLite
+	queryStarted := time.Now()
 	snapshot, err := s.db.LoadRegistrySnapshot()
+	health.RecordDBQuery(time.Since(queryStarted))
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -1171,7 +1504,7 @@ func (s *Storage) LoadWithGroupsSnapshot() ([]*Instance, []*GroupData, *statedb.
 
 		data.Instances[i] = &InstanceData{
 			ID:                        r.ID,
-			Title:                     r.Title,
+			Title:                     termtext.Clean(r.Title),
 			ProjectPath:               r.ProjectPath,
 			GroupPath:                 r.GroupPath,
 			Order:                     r.Order,
@@ -1224,7 +1557,19 @@ func (s *Storage) LoadWithGroupsSnapshot() ([]*Instance, []*GroupData, *statedb.
 			AutoLinkedChannels:        autoLinkedChannels,
 			Color:                     color,
 			IdleTimeoutSecs:           ReadIdleTimeoutSecsFromToolData(r.ToolData),
+			Favorite:                  ReadFavoriteFromToolData(r.ToolData),
 			SubcommandPassthrough:     ReadSubcommandPassthroughFromToolData(r.ToolData),
+			TrackCommandExit:          readTrackCommandExitFromToolData(r.ToolData),
+			PiSocketExported:          rowPiSocketExported(r),
+			LaunchedTool:              rowLaunchedTool(r),
+			IdentityInjectionDisabled: ReadIdentityInjectionDisabledFromToolData(r.ToolData),
+			ConductorName:             ReadConductorNameFromToolData(r.ToolData),
+			ContextLevel:              ReadContextLevelFromToolData(r.ToolData),
+			QueuedMessage:             ReadQueuedMessageFromToolData(r.ToolData),
+			PromptSuggestions:         ReadPromptSuggestionsFromToolData(r.ToolData),
+			WaitTimeout:               ReadWaitTimeoutFromToolData(r.ToolData),
+			IntendedSwitch:            ReadIntendedSwitchFromToolData(r.ToolData),
+			LimitVerdictResetAt:       ReadLimitVerdictResetFromToolData(r.ToolData),
 			ClaudeSessionIDUnverified: ReadClaudeSessionUnverifiedFromToolData(r.ToolData),
 			LastStartedAt:             ReadLastStartedAtFromToolData(r.ToolData),
 			GenericSessionID:          ReadGenericSessionIDFromToolData(r.ToolData),
@@ -1233,7 +1578,12 @@ func (s *Storage) LoadWithGroupsSnapshot() ([]*Instance, []*GroupData, *statedb.
 			GenericSessionCommand:     genericScopeCommand(r.ToolData),
 			GenericSessionLocation:    genericScopeLocation(r.ToolData),
 			LastActivityAt:            ReadLastActivityAtFromToolData(r.ToolData),
+			HookLag:                   ReadHookLagFromToolData(r.ToolData),
 			DeepSeekTask:              ReadDeepSeekTaskFromToolData(r.ToolData),
+			HermesSessionID:           ReadHermesSessionIDFromToolData(r.ToolData),
+			HermesDetectedAt:          ReadHermesDetectedAtFromToolData(r.ToolData),
+			SupersededBy:              ReadCrossHarnessSupersededByFromToolData(r.ToolData),
+			Supersedes:                ReadCrossHarnessSupersedesFromToolData(r.ToolData),
 		}
 	}
 
@@ -1248,6 +1598,25 @@ func (s *Storage) LoadWithGroupsSnapshot() ([]*Instance, []*GroupData, *statedb.
 			DefaultPath:   g.DefaultPath,
 			MaxConcurrent: g.MaxConcurrent,
 		}
+	}
+
+	// The "seen" mark lives outside the registry snapshot on purpose: putting it
+	// in the snapshot would make every acknowledgment write trigger a reload.
+	// Read it once per load instead. Best effort: without it the session is
+	// rebuilt from its stored status alone, as before.
+	if acks, ackErr := s.db.ReadAllStatuses(); ackErr == nil {
+		for _, d := range data.Instances {
+			// Running/starting stays authoritative, as in
+			// SetAcknowledgedFromShared: no seen mark and no visit time.
+			if d.Status == StatusRunning || d.Status == StatusStarting {
+				continue
+			}
+			if sr, ok := acks[d.ID]; ok && sr.Acknowledged {
+				d.Acknowledged, d.AcknowledgedAt = true, sr.AcknowledgedAt
+			}
+		}
+	} else {
+		storageLog.Warn("ack_read_failed", slog.String("error", ackErr.Error()))
 	}
 
 	instances, groups, err := s.convertToInstances(data)
@@ -1325,7 +1694,11 @@ func (s *Storage) LoadRecentSessions() ([]*statedb.RecentSessionRow, error) {
 		return nil, fmt.Errorf("storage database not initialized")
 	}
 
-	return s.db.LoadRecentSessions()
+	rows, err := s.db.LoadRecentSessions()
+	for _, r := range rows {
+		r.Title = termtext.Clean(r.Title) // rendered in the TUI's recent list
+	}
+	return rows, err
 }
 
 // GetDBPathForProfile returns the path to the state.db file for a specific profile.
@@ -1427,6 +1800,11 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			// server for a session that lives on an isolated socket and
 			// report it as dead (issue #687, v1.7.50).
 			tmuxSess.SocketName = instData.TmuxSocketName
+			// A stored "waiting" rebuilds as unseen; the user's saved visit
+			// overrides that so a reload does not turn the dot back to waiting.
+			if instData.Acknowledged {
+				tmuxSess.ApplySharedAcknowledged(true)
+			}
 			// Issue #663: for multi-repo sessions ProjectPath is a symlink
 			// inside MultiRepoTempDir (see home.go:7255-7364), so the
 			// restart pane must cwd into the parent dir — not the symlink
@@ -1442,6 +1820,7 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			tmuxSess.InstanceID = instData.ID
 			tmuxSess.SetInjectStatusLine(GetTmuxSettings().GetInjectStatusLine())
 			tmuxSess.SetMouse(GetTmuxSettings().GetMouse())
+			tmuxSess.SetIndicZeroWidthMarks(GetTmuxSettings().IndicZeroWidthMarks)
 			tmuxSess.SetClearOnRestart(GetTmuxSettings().ClearOnRestart)
 			tmuxSess.SetTerminalChromeEnabled(GetTerminalSettings().GetITermBadge())
 			// Note: EnableMouseMode and ConfigureStatusBar are deferred to EnsureConfigured()
@@ -1478,7 +1857,7 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 
 		inst := &Instance{
 			ID:                           instData.ID,
-			Title:                        instData.Title,
+			Title:                        termtext.Clean(instData.Title),
 			ProjectPath:                  projectPath,
 			GroupPath:                    groupPath,
 			Order:                        instData.Order,
@@ -1495,6 +1874,8 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			CreatedAt:                    instData.CreatedAt,
 			LastAccessedAt:               instData.LastAccessedAt,
 			ArchivedAt:                   instData.ArchivedAt,
+			SupersededBy:                 instData.SupersededBy,
+			Supersedes:                   instData.Supersedes,
 			WorktreePath:                 instData.WorktreePath,
 			WorktreeRepoRoot:             instData.WorktreeRepoRoot,
 			WorktreeBranch:               instData.WorktreeBranch,
@@ -1523,8 +1904,22 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			AutoLinkedChannels:           instData.AutoLinkedChannels,
 			Color:                        instData.Color,
 			IdleTimeoutSecs:              instData.IdleTimeoutSecs,
+			Favorite:                     instData.Favorite,
 			DeepSeekTask:                 instData.DeepSeekTask,
+			HermesSessionID:              instData.HermesSessionID,
+			hermesBoundAt:                instData.HermesDetectedAt,
 			SubcommandPassthrough:        instData.SubcommandPassthrough,
+			TrackCommandExit:             instData.TrackCommandExit,
+			PiSocketExported:             instData.PiSocketExported,
+			LaunchedTool:                 instData.LaunchedTool,
+			IdentityInjectionDisabled:    instData.IdentityInjectionDisabled,
+			ConductorName:                instData.ConductorName,
+			ContextLevel:                 instData.ContextLevel,
+			QueuedMessage:                instData.QueuedMessage,
+			PromptSuggestions:            instData.PromptSuggestions,
+			WaitTimeout:                  instData.WaitTimeout,
+			IntendedSwitch:               instData.IntendedSwitch,
+			LimitVerdictResetAt:          instData.LimitVerdictResetAt,
 			LastStartedAt:                instData.LastStartedAt,
 			GenericSessionID:             instData.GenericSessionID,
 			GenericDetectedAt:            instData.GenericDetectedAt,
@@ -1536,6 +1931,9 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			// throttle has an accurate baseline.
 			lastActivityAt:        instData.LastActivityAt,
 			lastActivityPersisted: instData.LastActivityAt,
+			hookLag:               instData.HookLag,
+			hookLagPersisted:      instData.HookLag,
+			hookLagDB:             s.db,
 			Sandbox:               instData.Sandbox,
 			SandboxContainer:      instData.SandboxContainer,
 			SSHHost:               instData.SSHHost,
@@ -1545,6 +1943,9 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			MultiRepoTempDir:      instData.MultiRepoTempDir,
 			tmuxSession:           tmuxSess,
 		}
+		// Restore configured detection without restarting the running harness.
+		inst.loadCustomPatternsFromConfig()
+
 		// Convert multi-repo worktree data
 		for _, wt := range instData.MultiRepoWorktrees {
 			inst.MultiRepoWorktrees = append(inst.MultiRepoWorktrees, MultiRepoWorktree{
@@ -1569,6 +1970,10 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 		// Session ID syncing (SetEnvironment calls) will happen on EnsureConfigured()
 		// or when the session is restarted. This saves 0-4 subprocess calls per session.
 
+		inst.acknowledgedAt = instData.AcknowledgedAt
+		// A stale fork pair persisted by an older build (a session
+		// that already has its own conversation id) is removed on load.
+		inst.healStaleClaudeSelectorExtraArgs("load")
 		instances[i] = inst
 	}
 
@@ -1603,4 +2008,18 @@ func decodeSandboxConfig(data json.RawMessage) *SandboxConfig {
 		return nil
 	}
 	return &cfg
+}
+
+// rowPiSocketExported is the row's launch decision about the pi socket, trusted
+// only while the row names the tmux session it was made for.
+func rowPiSocketExported(r *statedb.InstanceRow) bool {
+	exported, _ := ReadLaunchDecisionFromToolData(r.ToolData, r.TmuxSession)
+	return exported
+}
+
+// rowLaunchedTool is the tool the row's last recorded launch ran, under the same
+// binding as rowPiSocketExported; "" falls back to the stored tool.
+func rowLaunchedTool(r *statedb.InstanceRow) string {
+	_, tool := ReadLaunchDecisionFromToolData(r.ToolData, r.TmuxSession)
+	return tool
 }

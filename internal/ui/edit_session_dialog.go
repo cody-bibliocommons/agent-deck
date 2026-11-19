@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -42,11 +43,21 @@ type EditSessionDialog struct {
 	sessionID     string
 	sessionTitle  string
 	groupName     string
+	sourceTool    string
+	sourceAccount string
 	width         int
 	height        int
 	fields        []editField
 	focusIndex    int
 	validationErr string
+
+	// remoteName is set when the dialog edits a session that a remote deck
+	// owns (Shift+P on a remote row). Its account pills then come from that
+	// remote's own `accounts` (remoteAccounts, keyed by canonical harness),
+	// never from local config, and every save is forwarded to the remote.
+	remoteName           string
+	remoteAccounts       map[string][]string
+	remoteAccountsLoaded bool
 }
 
 func NewEditSessionDialog() *EditSessionDialog {
@@ -57,18 +68,21 @@ func NewEditSessionDialog() *EditSessionDialog {
 // non-claude tools — friendlier than letting SetField reject the submit.
 func (d *EditSessionDialog) Show(inst *session.Instance) {
 	d.visible = true
+	d.remoteName, d.remoteAccounts, d.remoteAccountsLoaded = "", nil, false
 	d.sessionID = inst.ID
 	d.sessionTitle = inst.Title
 	d.groupName = displayGroupName(inst.GroupPath)
+	d.sourceTool = inst.Tool
+	d.sourceAccount = inst.Account
 	d.validationErr = ""
 	d.focusIndex = 0
 
-	tools, toolCursor := toolPillsForInstance(inst.Tool)
+	tools, toolCursor := toolPillsForInstance(fieldInitialValue(inst, session.FieldTool))
 
 	d.fields = []editField{
 		{key: session.FieldTitle, label: "Title", kind: editFieldText,
 			input: mkInput("Session title", MaxNameLength, inst.Title)},
-		{key: session.FieldTool, label: "Tool (restart)", kind: editFieldPills,
+		{key: session.FieldTool, label: "Harness (choose destination first)", kind: editFieldPills,
 			pillOptions: tools, pillCursor: toolCursor},
 		// Pin position — anchors the session to the top/bottom of its group,
 		// exempt from the status/recency sort (pin-sessions feature). Applies
@@ -78,18 +92,23 @@ func (d *EditSessionDialog) Show(inst *session.Instance) {
 			pillLabels:  []string{"Off", "Top", "Bottom"},
 			pillCursor:  pinCursorFor(inst.Pin)},
 	}
-	// Named account slot (#924). Strictly claude-only: committing this row
-	// runs session.SwitchAccount, whose conversation migration is specific to
-	// `claude --resume` reading a .jsonl out of the account's config dir.
-	// Hidden when the machine has no [profiles.<name>.claude].config_dir
-	// blocks — there would be nothing to switch between.
-	if inst.Tool == "claude" {
+	// Account slots are shown when the source can participate in a supported
+	// Claude/Codex/Pi transfer. The picker is a configured slot picker, not an
+	// OAuth verifier: labels disclose that authentication is not checked until
+	// the destination harness starts.
+	if session.IsClaudeCompatible(inst.Tool) || session.IsCodexCompatible(inst.Tool) || inst.Tool == "pi" {
 		cfg, _ := session.LoadUserConfig()
-		if accounts := session.ConfiguredAccountNames(cfg); len(accounts) > 0 {
+		// Create the target account row whenever any supported destination has
+		// configured slots. Pi has no source-account abstraction, but changing
+		// its target tool to Claude or Codex must expose that target's slots.
+		// The initial target is still the current tool, and tool-pill changes
+		// refresh the options below.
+		if len(session.ConfiguredAccountNamesForSwitch(cfg)) > 0 {
+			accounts := session.ConfiguredAccountNamesForHarness(cfg, inst.Tool)
 			opts, labels, cursor := accountPillsForInstance(inst.Account, accounts)
 			d.fields = append(d.fields, editField{
 				key:         session.FieldAccount,
-				label:       "Claude account (restart, moves the conversation)",
+				label:       accountFieldLabel(inst.Tool),
 				kind:        editFieldPills,
 				pillOptions: opts,
 				pillLabels:  labels,
@@ -110,6 +129,11 @@ func (d *EditSessionDialog) Show(inst *session.Instance) {
 				label: "Extra args (restart, claude) — space-separated",
 				kind:  editFieldText,
 				input: mkInput("--model opus --verbose", 512, strings.Join(inst.ExtraArgs, " "))},
+			// ASK-119: live; empty uses [sessions] wait_timeout.
+			editField{key: session.FieldWaitTimeout,
+				label: "Wait timer (claude) — 5m, off, empty = config",
+				kind:  editFieldText,
+				input: mkInput("e.g. 5m", 16, inst.WaitTimeout)},
 		)
 		// Plugins (RFC docs/rfc/PLUGIN_ATTACH.md §4.8). v1 ships a CSV
 		// text input matching the ExtraArgs shape; full multi-checkbox
@@ -220,8 +244,76 @@ func mkInput(placeholder string, charLimit int, initial string) textinput.Model 
 	return ti
 }
 
+// ShowRemote opens the dialog for a session owned by remoteName. The remote
+// row carries title, harness and account slot, so those are the editable
+// rows: title through the remote's rename, harness/account through the
+// remote's own switch engine (see Home.commitRemoteEditSession). Runtime
+// flags that live only in the remote's registry are edited on that host.
+// Account pills start with the row's own slot and are replaced by the
+// remote's configured slots once SetRemoteAccounts delivers them.
+func (d *EditSessionDialog) ShowRemote(info session.RemoteSessionInfo, remoteName string) {
+	d.visible = true
+	d.remoteName, d.remoteAccounts, d.remoteAccountsLoaded = remoteName, nil, false
+	d.sessionID = info.ID
+	d.sessionTitle = info.Title
+	d.groupName = displayGroupName(info.Group)
+	d.sourceTool = info.Tool
+	d.sourceAccount = info.Account
+	d.validationErr = ""
+	d.focusIndex = 0
+
+	tools, toolCursor := toolPillsForInstance(info.Tool)
+	d.fields = []editField{
+		{key: session.FieldTitle, label: "Title", kind: editFieldText,
+			input: mkInput("Session title", MaxNameLength, info.Title)},
+		{key: session.FieldTool, label: "Harness (choose destination first)", kind: editFieldPills,
+			pillOptions: tools, pillCursor: toolCursor},
+	}
+	if session.CanonicalSwitchHarnessForUI(info.Tool) != "" {
+		opts, labels, cursor := accountPillsForInstance(info.Account, nil)
+		d.fields = append(d.fields, editField{
+			key:         session.FieldAccount,
+			label:       accountFieldLabel(info.Tool),
+			kind:        editFieldPills,
+			pillOptions: opts,
+			pillLabels:  labels,
+			pillCursor:  cursor,
+		})
+	}
+	d.updateFocus()
+}
+
+// IsRemote reports whether the open dialog edits a remote deck's session.
+func (d *EditSessionDialog) IsRemote() bool { return d != nil && d.remoteName != "" }
+
+// RemoteName is the remote the dialog edits on ("" for a local session).
+func (d *EditSessionDialog) RemoteName() string { return d.remoteName }
+
+// SetRemoteAccounts hands the remote's configured slots (keyed by canonical
+// harness: "claude", "codex") to an open remote dialog and rebuilds the
+// account pills for the currently selected harness. A late answer for a
+// closed dialog or another remote/session is dropped by the caller.
+func (d *EditSessionDialog) SetRemoteAccounts(accounts map[string][]string) {
+	if !d.IsRemote() {
+		return
+	}
+	d.remoteAccounts, d.remoteAccountsLoaded = accounts, true
+	target := d.selectedPill(session.FieldTool)
+	if target == "" {
+		target = d.sourceTool
+	}
+	d.refreshTargetAccountPills(target)
+}
+
+// remoteEditInstance is the row as an Instance carrying only the fields the
+// remote dialog edits, so GetChanges diffs a remote row the same way.
+func remoteEditInstance(info session.RemoteSessionInfo) *session.Instance {
+	return &session.Instance{ID: info.ID, Title: info.Title, Tool: info.Tool, Account: info.Account}
+}
+
 func (d *EditSessionDialog) Hide() {
 	d.visible = false
+	d.remoteName, d.remoteAccounts, d.remoteAccountsLoaded = "", nil, false
 	for i := range d.fields {
 		if d.fields[i].kind == editFieldText {
 			d.fields[i].input.Blur()
@@ -312,6 +404,9 @@ func fieldInitialValue(inst *session.Instance, field string) string {
 	case session.FieldTitle:
 		return inst.Title
 	case session.FieldTool:
+		if inst.Tool == "opencode" {
+			return inst.OpenCodeCommandName()
+		}
 		return inst.Tool
 	case session.FieldExtraArgs:
 		return strings.Join(inst.ExtraArgs, " ")
@@ -327,6 +422,8 @@ func fieldInitialValue(inst *session.Instance, field string) string {
 		return string(inst.Pin)
 	case session.FieldAccount:
 		return inst.Account
+	case session.FieldWaitTimeout:
+		return inst.WaitTimeout
 	}
 	return ""
 }
@@ -376,6 +473,9 @@ func (d *EditSessionDialog) Update(msg tea.Msg) (*EditSessionDialog, tea.Cmd) {
 			if f.pillCursor < 0 {
 				f.pillCursor = len(f.pillOptions) - 1
 			}
+			if f.key == session.FieldTool {
+				d.refreshTargetAccountPills(f.pillOptions[f.pillCursor])
+			}
 			return d, nil
 		}
 
@@ -383,6 +483,9 @@ func (d *EditSessionDialog) Update(msg tea.Msg) (*EditSessionDialog, tea.Cmd) {
 		if d.isPillsFocused() {
 			f := &d.fields[d.focusIndex]
 			f.pillCursor = (f.pillCursor + 1) % len(f.pillOptions)
+			if f.key == session.FieldTool {
+				d.refreshTargetAccountPills(f.pillOptions[f.pillCursor])
+			}
 			return d, nil
 		}
 
@@ -407,10 +510,165 @@ func (d *EditSessionDialog) Update(msg tea.Msg) (*EditSessionDialog, tea.Cmd) {
 	return d, nil
 }
 
+func (d *EditSessionDialog) refreshTargetAccountPills(targetHarness string) {
+	var accounts []string
+	if d.IsRemote() {
+		accounts = d.remoteAccounts[session.CanonicalSwitchHarnessForUI(targetHarness)]
+	} else {
+		cfg, _ := session.LoadUserConfig()
+		accounts = session.ConfiguredAccountNamesForHarness(cfg, targetHarness)
+	}
+	for index := range d.fields {
+		field := &d.fields[index]
+		if field.key != session.FieldAccount {
+			continue
+		}
+		selected := ""
+		if field.pillCursor >= 0 && field.pillCursor < len(field.pillOptions) {
+			selected = field.pillOptions[field.pillCursor]
+		}
+		opts, labels, cursor := accountPillsForInstance(selected, accounts)
+		// A slot unavailable on the selected target is not carried forward as
+		// a hidden stale choice; the confirmation/backend receives only a
+		// target-harness configured account or the explicit default.
+		if selected != "" {
+			found := false
+			for _, account := range accounts {
+				found = found || account == selected
+			}
+			if !found {
+				opts, labels, cursor = accountPillsForInstance("", accounts)
+			}
+		}
+		field.pillOptions, field.pillLabels, field.pillCursor = opts, labels, cursor
+		field.label = accountFieldLabel(targetHarness)
+		return
+	}
+}
+
+func accountFieldLabel(harness string) string {
+	switch session.CanonicalSwitchHarnessForUI(harness) {
+	case "pi":
+		return "Account for Pi (default only)"
+	case "claude", "codex":
+		return "Account for selected harness (configured; auth unverified)"
+	default:
+		return "Account (select a supported harness first)"
+	}
+}
+
+// FocusField moves focus to the row with the given field key (no-op when the
+// row is not shown), so a cancelled switch confirmation lands the user back
+// on the row they were changing.
+func (d *EditSessionDialog) FocusField(key string) {
+	for i := range d.fields {
+		if d.fields[i].key == key {
+			d.focusIndex = i
+			d.updateFocus()
+			return
+		}
+	}
+}
+
+// switchPending reports whether saving now would run a harness/account
+// switch (the transactional path in handleEditSessionDialogKey) rather than
+// plain field writes.
+func (d *EditSessionDialog) switchPending() bool {
+	if target := d.selectedPill(session.FieldTool); target != "" && session.CanonicalToolName(target) != session.CanonicalToolName(d.sourceTool) {
+		return true
+	}
+	account := d.selectedPill(session.FieldAccount)
+	return account != "" && account != d.sourceAccount
+}
+
+// footerHint says what the keys do on the focused row. The harness and
+// account rows are where "save" becomes a switch (restart, conversation
+// carried over), so their footer says that Enter asks first.
+func (d *EditSessionDialog) footerHint(compact bool) string {
+	if d.focusIndex < 0 || d.focusIndex >= len(d.fields) {
+		return "Enter save │ Esc cancel │ Tab next"
+	}
+	f := d.fields[d.focusIndex]
+	sep := " │ "
+	if compact {
+		sep = " · "
+	}
+	switch {
+	case f.key == session.FieldAccount || f.key == session.FieldTool:
+		what := "account"
+		if f.key == session.FieldTool {
+			what = "harness"
+		}
+		if d.switchPending() {
+			return strings.Join([]string{"←/→ " + what, "Enter switch (asks first)", "Esc cancel"}, sep)
+		}
+		return strings.Join([]string{"←/→ " + what, "Enter save", "Tab next", "Esc cancel"}, sep)
+	case f.kind == editFieldPills:
+		return strings.Join([]string{"←/→ choose", "Enter save", "Tab next", "Esc cancel"}, sep)
+	case f.kind == editFieldCheckbox:
+		return strings.Join([]string{"Space toggle", "Enter save", "Tab next", "Esc cancel"}, sep)
+	default:
+		return strings.Join([]string{"Type to edit", "Enter save", "Tab next", "Esc cancel"}, sep)
+	}
+}
+
 func (d *EditSessionDialog) isPillsFocused() bool {
 	return d.focusIndex >= 0 && d.focusIndex < len(d.fields) &&
 		d.fields[d.focusIndex].kind == editFieldPills &&
 		len(d.fields[d.focusIndex].pillOptions) > 0
+}
+
+func (d *EditSessionDialog) selectedPill(key string) string {
+	for _, field := range d.fields {
+		if field.key == key && field.pillCursor >= 0 && field.pillCursor < len(field.pillOptions) {
+			return field.pillOptions[field.pillCursor]
+		}
+	}
+	return ""
+}
+
+func (d *EditSessionDialog) hasField(key string) bool {
+	for _, field := range d.fields {
+		if field.key == key {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *EditSessionDialog) switchSummary() string {
+	targetHarness := d.selectedPill(session.FieldTool)
+	if targetHarness == "" {
+		targetHarness = d.sourceTool
+	}
+	targetAccount := d.selectedPill(session.FieldAccount)
+	if !d.hasField(session.FieldAccount) && session.CanonicalSwitchHarnessForUI(targetHarness) == session.CanonicalSwitchHarnessForUI(d.sourceTool) {
+		targetAccount = d.sourceAccount
+	}
+	source := fmt.Sprintf("%s/%s", d.sourceTool, displayEditAccount(d.sourceAccount))
+	target := fmt.Sprintf("%s/%s", targetHarness, displayEditAccount(targetAccount))
+	if session.CanonicalSwitchHarnessForUI(targetHarness) == session.CanonicalSwitchHarnessForUI(d.sourceTool) {
+		return "Current: " + source + " → " + target + "\nsame-harness resume"
+	}
+	return "Current: " + source + " → NEW " + target + "\nsource kept"
+}
+
+func displayEditAccount(account string) string {
+	if strings.TrimSpace(account) == "" {
+		return "default"
+	}
+	return account
+}
+
+func clipEditDialogText(text string, maxRunes int) string {
+	if maxRunes < 2 {
+		return ""
+	}
+	runes := []rune(text)
+	if len(runes) <= maxRunes {
+		return text
+	}
+	return string(runes[:maxRunes-1]) + "…"
 }
 
 func (d *EditSessionDialog) View() string {
@@ -427,11 +685,16 @@ func (d *EditSessionDialog) View() string {
 
 	dialogWidth := 60
 	if d.width > 0 && d.width < dialogWidth+10 {
-		dialogWidth = d.width - 10
-		if dialogWidth < 40 {
-			dialogWidth = 40
+		dialogWidth = d.width - 4
+		if dialogWidth < 24 {
+			dialogWidth = 24
 		}
 	}
+	lineWidth := dialogWidth - 8
+	if lineWidth < 12 {
+		lineWidth = 12
+	}
+	compact := dialogWidth < 45
 
 	dialogStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
@@ -440,44 +703,73 @@ func (d *EditSessionDialog) View() string {
 		Padding(2, 4).
 		Width(dialogWidth)
 
+	// The head (title, group, switch summary), one body section per field and
+	// the foot are kept apart so renderFittedDialog can scroll the fields on a
+	// short terminal while the title and the key hints stay on screen.
 	var content strings.Builder
-	content.WriteString(titleStyle.Render("Edit Session"))
+	if d.IsRemote() {
+		content.WriteString(titleStyle.Render("Edit Session on " + d.remoteName))
+	} else {
+		content.WriteString(titleStyle.Render("Edit Session"))
+	}
 	content.WriteString("\n")
 	content.WriteString(groupInfoStyle.Render("  in group: " + d.groupName))
 	content.WriteString("\n")
-	content.WriteString(dimStyle.Render("  session: " + d.sessionTitle))
+	content.WriteString(dimStyle.Render("  session: " + clipEditDialogText(d.sessionTitle, lineWidth-11)))
+	content.WriteString("\n")
+	for n, line := range strings.Split(d.switchSummary(), "\n") {
+		if n > 0 {
+			content.WriteString("\n")
+		}
+		content.WriteString(dimStyle.Render("  " + clipEditDialogText(line, lineWidth)))
+	}
 	content.WriteString("\n\n")
+	sections := dialogSections{head: []string{strings.TrimSuffix(content.String(), "\n")}, focus: d.focusIndex}
 
 	for i, f := range d.fields {
 		focused := i == d.focusIndex
+		content.Reset()
 
 		if f.kind == editFieldCheckbox {
 			// renderCheckboxLine emits a single compact "▶ [x] Label\n" row,
 			// matching the New Session dialog's options panel.
 			content.WriteString(renderCheckboxLine(f.label, f.checked, focused))
+			sections.body = append(sections.body, strings.TrimSuffix(content.String(), "\n"))
 			continue
 		}
 
+		fieldLabel := clipEditDialogText(f.label, lineWidth-3)
 		if focused {
-			content.WriteString(activeLabelStyle.Render("▶ " + f.label + ":"))
+			content.WriteString(activeLabelStyle.Render("▶ " + fieldLabel + ":"))
 		} else {
-			content.WriteString(labelStyle.Render("  " + f.label + ":"))
+			content.WriteString(labelStyle.Render("  " + fieldLabel + ":"))
 		}
-		content.WriteString("\n  ")
+		content.WriteString("\n")
 
 		switch f.kind {
 		case editFieldText:
+			content.WriteString("  ")
 			content.WriteString(f.input.View())
 		case editFieldPills:
-			if f.pillLabels != nil {
-				content.WriteString(renderLabelPills(f.pillLabels, f.pillCursor))
-			} else {
-				content.WriteString(renderToolPills(f.pillOptions, f.pillCursor))
+			labels := f.pillLabels
+			if labels == nil {
+				labels = toolPillLabels(f.pillOptions)
 			}
+			cursor := f.pillCursor
+			if compact && cursor >= 0 && cursor < len(labels) {
+				labels = labels[cursor : cursor+1]
+				cursor = 0
+			}
+			// Wrap here instead of leaving the containing lipgloss style to
+			// reflow ANSI-styled separators, which can split a pill mid-label.
+			// Pass the field indent into the renderer so continuation rows
+			// stay aligned with the first row.
+			content.WriteString(renderPills(labels, cursor, "  ", lineWidth))
 		}
-		content.WriteString("\n")
+		sections.body = append(sections.body, content.String())
 	}
 
+	content.Reset()
 	if d.validationErr != "" {
 		errStyle := lipgloss.NewStyle().Foreground(ColorRed).Bold(true)
 		content.WriteString("\n")
@@ -486,56 +778,27 @@ func (d *EditSessionDialog) View() string {
 	}
 
 	content.WriteString("\n")
-	content.WriteString(helpStyle.Render("Enter save │ Esc cancel │ Tab next │ ←/→ options │ Space toggle"))
+	if session.CanonicalSwitchHarnessForUI(d.selectedPill(session.FieldTool)) == "pi" {
+		content.WriteString(dimStyle.Render("  Pi uses its default account only."))
+		content.WriteString("\n")
+	}
+	if d.IsRemote() {
+		if d.remoteAccountsLoaded {
+			content.WriteString(dimStyle.Render("  Slots and harnesses are " + d.remoteName + "'s; the switch runs there."))
+		} else {
+			content.WriteString(dimStyle.Render("  Loading account slots from " + d.remoteName + "…"))
+		}
+		content.WriteString("\n")
+	}
+	// The hint breaks between items onto a second row rather than cutting
+	// "Esc cancel" off at the box edge.
+	hint, sep := d.footerHint(compact), " │ "
+	if !strings.Contains(hint, sep) {
+		sep = " · "
+	}
+	content.WriteString(helpStyle.Render(renderDialogFooterRows(lineWidth, 2, sep, strings.Split(hint, sep))))
+	sections.foot = []string{content.String()}
 
-	dialog := dialogStyle.Render(content.String())
+	dialog := renderFittedDialog(dialogStyle, d.height, sections)
 	return lipgloss.Place(d.width, d.height, lipgloss.Center, lipgloss.Center, dialog)
-}
-
-// renderLabelPills renders a row of plain-text pills (no tool icons) for
-// fields whose options are simple labels, e.g. the pin position. Visual
-// styling matches renderToolPills so the two pill kinds read identically.
-func renderLabelPills(labels []string, cursor int) string {
-	if len(labels) == 0 {
-		return ""
-	}
-	selected := lipgloss.NewStyle().Foreground(ColorBg).Background(ColorAccent).Bold(true).Padding(0, 2)
-	idle := lipgloss.NewStyle().Foreground(ColorTextDim).Background(ColorSurface).Padding(0, 2)
-	buttons := make([]string, len(labels))
-	for i, label := range labels {
-		if i == cursor {
-			buttons[i] = selected.Render(label)
-		} else {
-			buttons[i] = idle.Render(label)
-		}
-	}
-	return lipgloss.JoinHorizontal(lipgloss.Left, buttons...)
-}
-
-// renderToolPills mirrors newdialog's command pills (selected =
-// ColorAccent background) so the new/edit pair feels visually identical.
-func renderToolPills(presets []string, cursor int) string {
-	if len(presets) == 0 {
-		return ""
-	}
-	selected := lipgloss.NewStyle().Foreground(ColorBg).Background(ColorAccent).Bold(true).Padding(0, 2)
-	idle := lipgloss.NewStyle().Foreground(ColorTextDim).Background(ColorSurface).Padding(0, 2)
-	buttons := make([]string, len(presets))
-	for i, cmd := range presets {
-		name := cmd
-		if name == "" {
-			name = "shell"
-		} else {
-			name = displayCommandPreset(cmd)
-			if def := session.GetToolDef(cmd); def != nil && def.Icon != "" {
-				name = def.Icon + " " + name
-			}
-		}
-		if i == cursor {
-			buttons[i] = selected.Render(name)
-		} else {
-			buttons[i] = idle.Render(name)
-		}
-	}
-	return lipgloss.JoinHorizontal(lipgloss.Left, buttons...)
 }

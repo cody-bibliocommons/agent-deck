@@ -41,28 +41,27 @@ func SweepInboxesForChildSession(childSessionID string) (int, error) {
 	}
 
 	dir := InboxDir()
+	totalDropped := 0
 	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return 0, nil
-		}
-		return 0, err
-	}
-
-	totalDropped, err := sweepInboxFilesForChild(dir, entries, childSessionID)
-	if err != nil {
-		return totalDropped, err
+	switch {
+	case err == nil:
+		totalDropped, err = sweepInboxFilesForChild(dir, entries, childSessionID)
+	case errors.Is(err, fs.ErrNotExist):
+		err = nil // no inbox on this host; the rest of the footprint may still exist
 	}
 
 	// Issue #1225: sweep the rest of the child's outbox footprint so a reused id
 	// can't inherit stale state and per-parent ledgers don't leak. Best-effort —
-	// these never fail the rm.
+	// these never fail the rm, and they run even when the inbox sweep did not
+	// (a host with no inbox directory still keeps a turn journal, which the
+	// remote talkback cursor would otherwise name for the whole horizon).
 	_ = os.Remove(DeadLetterPathFor(childSessionID)) // dead-lettered records
+	RemoveTurnJournal(childSessionID)                // issue #2469 per-child turn journal
 	ForgetConsumedTurnsForChild(childSessionID)      // consumed-turn ledgers (this id as a CHILD)
 	ResetStopBlockBudget(childSessionID)             // Stop-hook block budget (if it was a parent)
 	sweepParentSideArtifacts(childSessionID)         // audit B5: this id's OWN parent-side files
 
-	return totalDropped, nil
+	return totalDropped, err
 }
 
 // sweepParentSideArtifacts removes the per-PARENT files keyed by this id, for
@@ -80,29 +79,41 @@ func sweepParentSideArtifacts(parentID string) {
 
 	consumedTurnsMu.Lock()
 	_ = os.Remove(consumedTurnsPathFor(parentID))
+	// Issue #2469 per-parent artifacts: counters, digest marker, fleet fingerprint.
+	_ = ResetInboxStats(parentID)
+	_ = os.Remove(inboxDigestPath(parentID))
+	_ = os.Remove(fleetBlockPath(parentID))
 	consumedTurnsMu.Unlock()
+	_ = os.Remove(commsEnrollmentPath(parentID))       // a removed parent is no ledger consumer
+	_ = os.Remove(resultReadsPath(parentID))           // what this id read as a reader
+	_ = os.Remove(resultReadsPath(parentID) + ".lock") // and its lock file
 }
 
 // sweepInboxFilesForChild rewrites every inbox file dropping the child's lines,
-// holding inboxWriteMu for the duration. Split out so the broader outbox-artifact
-// cleanup in SweepInboxesForChildSession runs without the inbox lock held.
+// taking each file's flock and inboxWriteMu in turn. Split out so the broader
+// outbox-artifact cleanup in SweepInboxesForChildSession runs without the
+// inbox lock held.
 func sweepInboxFilesForChild(dir string, entries []os.DirEntry, childSessionID string) (int, error) {
-	inboxWriteMu.Lock()
-	defer inboxWriteMu.Unlock()
-
 	totalDropped := 0
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
 			continue
 		}
-		path := filepath.Join(dir, e.Name())
-		dropped, err := sweepOneInboxLocked(path, childSessionID)
+		dropped, err := sweepOneInboxFileForChild(filepath.Join(dir, e.Name()), childSessionID)
 		if err != nil {
 			return totalDropped, err
 		}
 		totalDropped += dropped
 	}
 	return totalDropped, nil
+}
+
+// sweepOneInboxFileForChild rewrites one inbox file under its flock (messaging
+// audit P1-3: every inbox rewrite takes the producers' lock).
+func sweepOneInboxFileForChild(path, childSessionID string) (int, error) {
+	return withInboxFileLocked(path, func() (int, error) {
+		return sweepOneInboxLocked(path, childSessionID)
+	})
 }
 
 // sweepOneInboxLocked rewrites one inbox file without lines whose

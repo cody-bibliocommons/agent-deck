@@ -3,9 +3,12 @@ package session
 import (
 	"bytes"
 	"fmt"
+	"github.com/asheshgoplani/agent-deck/internal/filelinks"
 	"log/slog"
+	"maps"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -14,8 +17,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/BurntSushi/toml"
+
+	"github.com/asheshgoplani/agent-deck/internal/harness"
 
 	dark "github.com/thiagokokada/dark-mode-go"
 
@@ -50,7 +56,24 @@ var ErrRefusingConfigSectionDrop = fmt.Errorf("session: refusing to save config.
 // or omitzero (int/struct) so zero-value fields are not written to disk. Without
 // this, SaveUserConfig bloats the file with sections the user never configured.
 // TestSaveUserConfig_ZeroValueConfigProducesNoSections enforces this invariant.
+// HealthSettings controls local-only runtime self-sampling.
+type HealthSettings struct {
+	Enabled *bool `toml:"enabled,omitempty"`
+	// SessionEvents is the kill switch for the per-session event journal
+	// (status, send, restart, stop, worker_done lines next to the health
+	// samples). Default on; health.enabled = false disables it as well.
+	SessionEvents *bool `toml:"session_events,omitempty"`
+}
+
+func (h HealthSettings) IsEnabled() bool { return h.Enabled == nil || *h.Enabled }
+
+func (h HealthSettings) SessionEventsEnabled() bool {
+	return h.IsEnabled() && (h.SessionEvents == nil || *h.SessionEvents)
+}
+
 type UserConfig struct {
+	Health HealthSettings `toml:"health,omitempty"`
+
 	// DefaultTool is the pre-selected AI tool when creating new sessions
 	// Valid values: "claude", "gemini", "opencode", "codex", "pi", or any custom tool name
 	// If empty or invalid, defaults to "shell" (no pre-selection)
@@ -96,8 +119,31 @@ type UserConfig struct {
 	// GroupSort controls the order of sessions within a group.
 	//   "creation"   (default) — fixed creation order; honors K/J manual reorder.
 	//   "actionable"           — issue #857 status→recency→Order surfacing.
+	//   "alphabetical"         — issue #2451 title A→Z (case-insensitive)→Order.
 	// Empty or unrecognized values normalize to "creation".
 	GroupSort string `toml:"group_sort,omitempty"`
+
+	// SendTransport selects how `agent-deck session send` delivers to a
+	// Claude-compatible target. "tmux" (default) pins the historical keystroke
+	// path; "auto" opts in to Claude Code's messaging socket when one is
+	// available, falling back to tmux keystrokes otherwise. Discussion #2089.
+	SendTransport string `toml:"send_transport,omitempty"`
+
+	// Send tunes `agent-deck session send` ([send] section). See SendSettings.
+	Send SendSettings `toml:"send,omitempty"`
+
+	// Inbox tunes what reaches a parent session and when (issue #2469):
+	// which tiers wake it, how much child text a record carries, the info
+	// digest window. See InboxConfig.
+	Inbox InboxConfig `toml:"inbox,omitempty"`
+
+	// Comms is the [comms] section: the one switch of the Comms Ledger
+	// (docs/comms.md). Off by default while the ledger is canaried.
+	Comms CommsSettings `toml:"comms,omitempty"`
+
+	// Trace is the [trace] section: agent activity tracing (ASK-129,
+	// internal/trace). Off by default; AGENTDECK_TRACE overrides it.
+	Trace TraceSettings `toml:"trace,omitempty"`
 
 	// MCPs defines available MCP servers for the MCP Manager
 	// These can be attached/detached per-project via the MCP Manager (M key)
@@ -112,6 +158,9 @@ type UserConfig struct {
 
 	// Claude defines Claude Code integration settings
 	Claude ClaudeSettings `toml:"claude,omitempty"`
+
+	// Sessions holds settings for how agent-deck looks after running sessions.
+	Sessions SessionsSettings `toml:"sessions,omitempty"`
 
 	// Profiles defines optional per-profile overrides.
 	// Example:
@@ -130,7 +179,7 @@ type UserConfig struct {
 	GroupDefaults GroupDefaultsSettings `toml:"group_defaults,omitempty"`
 
 	// Conductors defines optional per-conductor overrides.
-	// Keyed by conductor name (matches Instance.Title minus "conductor-" prefix).
+	// Keyed by conductor name (Instance.ResolveConductorName).
 	// Mirrors Groups — see ConductorOverrides for the sub-table shape.
 	// Closes issue #602.
 	// Example:
@@ -148,6 +197,9 @@ type UserConfig struct {
 	// Codex defines Codex CLI integration settings
 	Codex CodexSettings `toml:"codex,omitempty"`
 
+	// Models controls how model and reasoning-effort suggestions are built (#2388)
+	Models ModelsSettings `toml:"models,omitempty"`
+
 	// Cursor defines Cursor Agent CLI integration settings (Issue #1672)
 	Cursor CursorSettings `toml:"cursor,omitempty"`
 
@@ -157,6 +209,9 @@ type UserConfig struct {
 	// Crush defines charmbracelet/crush CLI integration settings (Issue #940)
 	Crush CrushSettings `toml:"crush,omitempty"`
 
+	// Muse defines Muse Code CLI integration settings
+	Muse MuseSettings `toml:"muse,omitempty"`
+
 	// Hermes defines Hermes Agent CLI integration settings
 	Hermes HermesSettings `toml:"hermes,omitempty"`
 
@@ -165,11 +220,17 @@ type UserConfig struct {
 	// Kiro defines Kiro CLI (AWS) integration settings
 	Kiro KiroSettings `toml:"kiro-cli,omitempty"`
 
+	// OMP defines Oh My Pi (`omp`, github.com/can1357/oh-my-pi) integration settings
+	OMP OMPSettings `toml:"omp,omitempty"`
+
 	// Worktree defines git worktree preferences
 	Worktree WorktreeSettings `toml:"worktree,omitempty"`
 
 	// GlobalSearch defines global conversation search settings
 	GlobalSearch GlobalSearchSettings `toml:"global_search,omitempty"`
+
+	// Recall defines the cross-harness conversation store settings (docs/recall.md)
+	Recall RecallSettings `toml:"recall,omitempty"`
 
 	// Logs defines session log management settings
 	Logs LogSettings `toml:"logs,omitempty"`
@@ -216,6 +277,18 @@ type UserConfig struct {
 	// Remotes defines named SSH remote agent-deck instances
 	Remotes map[string]RemoteConfig `toml:"remotes,omitempty"`
 
+	// Providers defines named sandbox providers ([providers.<name>]): commands
+	// speaking the agent-deck provider protocol that create, list, inspect and
+	// destroy sandboxes, which `remote add --provider` registers as remotes.
+	Providers map[string]ProviderConfig `toml:"providers,omitempty"`
+
+	// Sandbox holds settings for the sandboxes this machine creates with a
+	// provider ([sandbox]).
+	Sandbox SandboxSettings `toml:"sandbox,omitempty"`
+
+	// Remote holds settings for every remote attach ([remote]).
+	Remote RemoteAttachSettings `toml:"remote,omitempty"`
+
 	// OpenClaw defines OpenClaw gateway integration settings
 	OpenClaw OpenClawSettings `toml:"openclaw,omitempty"`
 
@@ -254,8 +327,15 @@ type UserConfig struct {
 	// Web defines `agent-deck web` HTTP server settings.
 	Web WebSettings `toml:"web,omitempty"`
 
+	// Security holds the folder-trust switches ([security]).
+	Security SecuritySettings `toml:"security,omitempty"`
+
 	// UI defines TUI layout settings (split ratios, etc).
 	UI UISettings `toml:"ui,omitempty"`
+
+	// Launch defines settings applied to every session spawn regardless of
+	// tool (identity injection, ...). See LaunchSettings.
+	Launch LaunchSettings `toml:"launch,omitempty"`
 
 	// SelfHeal defines self-heal supervision settings (SELF-HEAL-DESIGN.md).
 	// Stage 1 (v1.9.67) is observe-only: it logs what it WOULD do, takes no
@@ -264,6 +344,112 @@ type UserConfig struct {
 
 	// Performance holds opt-in resource tuning for multi-instance setups.
 	Performance PerformanceSettings `toml:"performance,omitempty"`
+
+	// Core holds the one-core registry and daemon switches (docs/core-registry.md).
+	Core CoreSettings `toml:"core,omitempty"`
+
+	// Macapp holds the switches for the Mac app surface (docs/macapp-core.md).
+	Macapp MacappSettings `toml:"macapp,omitempty"`
+
+	// Browser holds the `agent-deck browser` opt-in (docs/macapp-browser.md).
+	Browser BrowserSettings `toml:"browser,omitempty"`
+
+	// Ask holds the `agent-deck ask` switches (docs/ask.md).
+	Ask AskSettings `toml:"ask,omitempty"`
+
+	// Harnesses overrides the core install/login table per harness
+	// ([harnesses.<name>] binary, install_command, login_command, docs_url).
+	Harnesses map[string]harness.Override `toml:"harnesses,omitempty"`
+}
+
+// TraceSettings is the [trace] section.
+type TraceSettings struct {
+	// Level is off (default), metadata (ids, tool names, timings, status)
+	// or summaries (adds a short scrubbed shape summary per tool call).
+	Level string `toml:"level,omitempty"`
+}
+
+// TraceLevelSetting returns the configured [trace] level string ("" when
+// unset or the config is unreadable). The env override is applied by the
+// caller (trace.ResolveLevel).
+func TraceLevelSetting() string {
+	cfg, _ := LoadUserConfig()
+	if cfg == nil {
+		return ""
+	}
+	return cfg.Trace.Level
+}
+
+// CommsSettings is the [comms] section.
+type CommsSettings struct {
+	// Ledger turns the Comms Ledger on: the hooks agent-deck installs spool
+	// the text they receive, the notify daemon commits one record per turn
+	// to <data>/comms/<profile>/, and `agent-deck msg` reads it. Off: no
+	// spool file is written and no ledger directory is created. The old
+	// inbox, turn journal and inbox stats keep working either way.
+	Ledger bool `toml:"ledger,omitempty"`
+	// Consumers enrolls Claude parents by id, unique title, or "*". The
+	// inbox is unchanged; the ledger adds prompt text and deduplicates exact
+	// transcript turns in both directions. Ledger wakes and Stop blocks are
+	// only for ledger-only urgent records, which have no production producer
+	// in P2b, so this phase does not move the #2482 wake targets.
+	// Needs ledger = true. See docs/comms.md "Delivery".
+	Consumers []string `toml:"consumers,omitempty"`
+}
+
+// AskSettings is the [ask] section (docs/ask.md): an agent asks the owner
+// for a secret, a choice or a short text through the Mac app or TUI dialog.
+// These are guard rails an agent can edit, not security boundaries. There is
+// deliberately no vault command key: the vault is the fixed, root-owned
+// /usr/local/bin/deck-secret.
+type AskSettings struct {
+	// Enabled turns `agent-deck ask` on. Default true; false refuses every
+	// request and every deliver.
+	Enabled *bool `toml:"enabled,omitempty"`
+
+	// SecretScopes lists the vault scopes `ask secret` may write, as
+	// "scope/" prefixes. Default ["conductor/"]; an empty list allows none.
+	SecretScopes []string `toml:"secret_scopes,omitempty"`
+
+	// AllowSandboxed lets sessions that run in a sandbox ask. Default false.
+	AllowSandboxed bool `toml:"allow_sandboxed,omitempty"`
+}
+
+// IsEnabled reports [ask] enabled (default true).
+func (a AskSettings) IsEnabled() bool { return a.Enabled == nil || *a.Enabled }
+
+// Scopes returns [ask] secret_scopes, ["conductor/"] when unset.
+func (a AskSettings) Scopes() []string {
+	if a.SecretScopes == nil {
+		return []string{"conductor/"}
+	}
+	return a.SecretScopes
+}
+
+// MacappSettings is the [macapp] section. Everything is off by default.
+type MacappSettings struct {
+	// Plugins enables the plugin-facing commands: `limits --json` and the
+	// macapp.* namespace of `events publish`.
+	Plugins bool `toml:"plugins,omitempty"`
+
+	// TranscriptEvents makes the notify daemon publish a session.transcript
+	// bus frame whenever a live session's native transcript grows, so a
+	// client never stats transcript files itself.
+	TranscriptEvents bool `toml:"transcript_events,omitempty"`
+
+	// StatusEvents makes every status owner (TUI poller, notify daemon)
+	// publish session.status and session.turn bus frames when it writes a
+	// status transition to state.db.
+	StatusEvents bool `toml:"status_events,omitempty"`
+}
+
+// CoreSettings is the [core] section.
+type CoreSettings struct {
+	// Daemon routes --json=envelope requests of registry commands through the
+	// profile's `agent-deck daemon serve` when one answers; the CLI runs them
+	// in process when none does. Default false: direct mode, the socket is
+	// never dialled (docs/daemon-protocol.md).
+	Daemon bool `toml:"daemon,omitempty"`
 }
 
 // SelfHealSettings controls the self-heal supervision policy (SELF-HEAL-DESIGN.md
@@ -353,7 +539,23 @@ type PerformanceSettings struct {
 	//
 	//	[performance]
 	//	claim_polling = true
-	ClaimPolling *bool `toml:"claim_polling,omitempty"`
+	ClaimPolling          *bool `toml:"claim_polling,omitempty"`
+	StatusIntervalSeconds int   `toml:"status_interval_seconds,omitempty"`
+}
+
+// StatusInterval bounds local TUI sweep frequency while preserving the two-second default.
+func (c *UserConfig) StatusInterval() time.Duration {
+	if c == nil || c.Performance.StatusIntervalSeconds == 0 {
+		return 2 * time.Second
+	}
+	seconds := c.Performance.StatusIntervalSeconds
+	if seconds < 1 {
+		seconds = 1
+	}
+	if seconds > 10 {
+		seconds = 10
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 // ClaimPollingEnabled reports whether claim-based polling is enabled.
@@ -367,6 +569,25 @@ func (c *UserConfig) ClaimPollingEnabled() bool {
 // UISettings controls TUI layout proportions.
 // See issue #1092.
 type UISettings struct {
+	// EmbeddedTerminal enables a compact persistent session sidebar whose Enter
+	// key focuses a full-fidelity embedded tmux client. It is opt-in so an
+	// omitted setting preserves the classic layout and Enter-to-attach behavior.
+	EmbeddedTerminal *bool `toml:"embedded_terminal,omitempty"`
+
+	// SidebarDensity controls how many lines one session occupies in the
+	// embedded-layout sidebar. It has no effect on the classic layout. Valid
+	// values:
+	//   "compact" (default) — 2 lines: identity line plus one metadata line.
+	//   "full"              — 3 lines: identity line plus two metadata lines.
+	//   "minimal"           — 1 line: identity line only, with the tool marker
+	//                         moved inline so you can still tell Codex from
+	//                         Claude at a glance.
+	//   "auto"              — the widest of the three that still fits every
+	//                         visible row on screen, recomputed as groups open
+	//                         and close.
+	// Empty or unknown values fall back to "compact".
+	SidebarDensity string `toml:"sidebar_density,omitempty"`
+
 	// PreviewPct is the percentage of horizontal width allocated to the
 	// preview pane (sessions list gets the remainder). Valid range: 10-90.
 	// Default: 65 (current behavior — sessions 35 / preview 65).
@@ -436,16 +657,14 @@ type UISettings struct {
 	// action remains reachable by its key and is fully listed under help (?).
 	Footer string `toml:"footer,omitempty"`
 
-	// NewSessionEnterAdvances controls what Enter does on the free-text
-	// Name/Branch fields of the new-session dialog. As of the UX top-3 pass this
-	// is ON BY DEFAULT (the mechanism shipped opt-in in PR #1295): Enter advances
-	// focus to the next field, so typing a name and pressing Enter no longer
-	// silently creates a session with all defaults — the #1 reported new-session
-	// trap. Ctrl+S is the explicit submit shortcut and submits in BOTH modes;
-	// Enter still submits from non-text rows (tool/checkboxes). The pointer lets
-	// us distinguish "unset" (nil → default true) from an explicit opt-OUT
-	// (`new_session_enter_advances = false` → restores the legacy Enter-submits
-	// behavior). Set `= true` (or leave unset) to keep the new default.
+	// NewSessionEnterAdvances controls what Enter does in the new-session
+	// dialog. Unset or false (the default since ASK-110, 2026-10-24): Enter
+	// creates the session from any row with the defaults already filled in,
+	// an empty name is taken from the folder, and Tab/↓ walk the optional
+	// rows. Owner report: "it is hard; we have to go to the end to do it" —
+	// Enter used to walk every row to a trailing Create button. `= true` opts
+	// back into that walk (mechanism from PR #1295, default from the UX
+	// top-3 pass to ASK-110). Ctrl+S creates in both modes.
 	NewSessionEnterAdvances *bool `toml:"new_session_enter_advances"`
 
 	// AttachOnCreate controls whether creating a session in the TUI (the `n`
@@ -456,6 +675,196 @@ type UISettings struct {
 	// `add`/`session start` are unaffected by this flag — they attach only
 	// with an explicit `--attach`.
 	AttachOnCreate bool `toml:"attach_on_create,omitempty"`
+
+	// ActiveIncludesIdle widens the active-on-top view (`t`) so an idle
+	// session whose tmux pane is still alive stays in the top section with
+	// the running/waiting/starting ones; only sessions without a live pane
+	// (stopped, error, queued) sink below the divider. Default false keeps
+	// today's working-vs-idle split. Issue #2452.
+	ActiveIncludesIdle bool `toml:"active_includes_idle,omitempty"`
+
+	// RemotePreview configures which fields the remote preview panel
+	// (right side, `remotes/<name>` host row selected) shows, and in what
+	// order. See RemotePreviewSettings.
+	RemotePreview RemotePreviewSettings `toml:"remote_preview,omitempty"`
+
+	// Header configures which fields the controller's own status-bar header
+	// shows, and in what order. See HeaderSettings.
+	Header HeaderSettings `toml:"header,omitempty"`
+}
+
+// PreviewField names are shared between [ui.remote_preview] and [ui.header]
+// so both blocks accept the same vocabulary and validate the same way.
+const (
+	PreviewFieldVersion          = "version"
+	PreviewFieldSessionsByStatus = "sessions_by_status"
+	PreviewFieldHarnesses        = "harnesses"
+	PreviewFieldLoad             = "load"
+	PreviewFieldMemory           = "memory"
+	PreviewFieldDisk             = "disk"
+	PreviewFieldLastPoll         = "last_poll"
+	// PreviewFieldAccounts is opt-in only (not part of either default field
+	// list, see DefaultRemotePreviewFields/DefaultHeaderFields): the named
+	// Claude account slots on the rendering host (the same slots
+	// `accounts --json` lists) with their live 5h/7d usage limits, read from
+	// each slot's on-disk quota cache. See AccountUsage/CollectAccountUsage.
+	PreviewFieldAccounts = "accounts"
+	// PreviewFieldSSH is opt-in only: who is connected to the host over SSH
+	// right now (per user: count, since, from), gathered by the host's own
+	// `system stats` via `who`. A remote that does not send it renders
+	// "ssh unknown", never a guess.
+	PreviewFieldSSH = "ssh"
+)
+
+// validPreviewFields is the full set of field names either block accepts.
+// A name outside this set is unknown and is reported once at startup by
+// normalizeUIPreviewFields, never silently dropped.
+var validPreviewFields = map[string]bool{
+	PreviewFieldVersion:          true,
+	PreviewFieldSessionsByStatus: true,
+	PreviewFieldHarnesses:        true,
+	PreviewFieldLoad:             true,
+	PreviewFieldMemory:           true,
+	PreviewFieldDisk:             true,
+	PreviewFieldLastPoll:         true,
+	PreviewFieldAccounts:         true,
+	PreviewFieldSSH:              true,
+}
+
+// DefaultRemotePreviewFields is the remote preview panel's field order when
+// [ui.remote_preview].fields is unset — identical to the panel shipped
+// before this config block existed, so setting nothing changes nothing.
+var DefaultRemotePreviewFields = []string{
+	PreviewFieldVersion,
+	PreviewFieldSessionsByStatus,
+	PreviewFieldHarnesses,
+	PreviewFieldLoad,
+	PreviewFieldMemory,
+	PreviewFieldDisk,
+	PreviewFieldLastPoll,
+}
+
+// DefaultHeaderFields is the controller's own status-bar header field order
+// when [ui.header].fields is unset — identical to today's header (version
+// badge, session-status counts, host load/memory/disk). harnesses and
+// last_poll are valid field names for [ui.header] too (a per-tool harness
+// count is meaningful locally; last_poll is not — the controller does not
+// poll itself — and is a silent no-op there) but are not part of the
+// default so the header's look never changes for users who set nothing.
+var DefaultHeaderFields = []string{
+	PreviewFieldVersion,
+	PreviewFieldSessionsByStatus,
+	PreviewFieldLoad,
+	PreviewFieldMemory,
+	PreviewFieldDisk,
+}
+
+// RemotePreviewSettings configures the remote preview panel's content.
+type RemotePreviewSettings struct {
+	// Fields lists which pieces of information the panel shows, in render
+	// order. Valid names: version, sessions_by_status, harnesses, load,
+	// memory, disk, last_poll, accounts, ssh. Unset/empty uses
+	// DefaultRemotePreviewFields. Unknown names are reported once at startup
+	// and dropped.
+	Fields []string `toml:"fields,omitempty"`
+}
+
+// HeaderSettings configures the controller's own status-bar header content.
+type HeaderSettings struct {
+	// Fields lists which pieces of information the header shows, in render
+	// order. Same vocabulary as RemotePreviewSettings.Fields. Unset/empty
+	// uses DefaultHeaderFields. Unknown names are reported once at startup
+	// and dropped.
+	Fields []string `toml:"fields,omitempty"`
+}
+
+// GetRemotePreviewFields returns the configured remote-preview field order,
+// falling back to DefaultRemotePreviewFields when unset.
+func (u UISettings) GetRemotePreviewFields() []string {
+	if len(u.RemotePreview.Fields) == 0 {
+		return append([]string(nil), DefaultRemotePreviewFields...)
+	}
+	return u.RemotePreview.Fields
+}
+
+// GetHeaderFields returns the configured header field order, falling back
+// to DefaultHeaderFields when unset.
+func (u UISettings) GetHeaderFields() []string {
+	if len(u.Header.Fields) == 0 {
+		return append([]string(nil), DefaultHeaderFields...)
+	}
+	return u.Header.Fields
+}
+
+// normalizeUIPreviewFields lowercases/trims and validates
+// [ui.remote_preview].fields and [ui.header].fields. Unknown entries are
+// logged once (at config load — see LoadUserConfig) via registryLog.Warn,
+// the same mechanism normalizeUIHiddenTools uses for [ui].hidden_tools, and
+// dropped rather than silently kept or silently ignored.
+func normalizeUIPreviewFields(ui *UISettings) {
+	if ui == nil {
+		return
+	}
+	ui.RemotePreview.Fields = normalizePreviewFieldList(ui.RemotePreview.Fields, "ui.remote_preview.fields")
+	ui.Header.Fields = normalizePreviewFieldList(ui.Header.Fields, "ui.header.fields")
+}
+
+func normalizePreviewFieldList(fields []string, key string) []string {
+	if len(fields) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(fields))
+	for _, raw := range fields {
+		name := strings.ToLower(strings.TrimSpace(raw))
+		if name == "" {
+			continue
+		}
+		if !validPreviewFields[name] {
+			registryLog.Warn("ignored unknown "+key+" entry",
+				"name", raw,
+				"hint", "valid fields: version, sessions_by_status, harnesses, load, memory, disk, last_poll, accounts")
+			continue
+		}
+		out = append(out, name)
+	}
+	return out
+}
+
+// GetEmbeddedTerminal reports whether the embedded terminal layout is enabled.
+// An omitted value preserves the classic layout.
+func (u UISettings) GetEmbeddedTerminal() bool {
+	return u.EmbeddedTerminal != nil && *u.EmbeddedTerminal
+}
+
+// Sidebar densities for the embedded layout. See UISettings.SidebarDensity.
+const (
+	SidebarDensityFull    = "full"
+	SidebarDensityCompact = "compact"
+	SidebarDensityMinimal = "minimal"
+	// SidebarDensityAuto spends the most height per session that still fits
+	// every visible row on screen at once, and gives it back as groups open.
+	// It is not a fourth card shape: it resolves to full, compact, or minimal.
+	SidebarDensityAuto = "auto"
+	// DefaultSidebarDensity is the two-line card: the identity line plus one
+	// metadata line.
+	DefaultSidebarDensity = SidebarDensityCompact
+)
+
+// GetSidebarDensity returns the configured sidebar density, normalized to one
+// of the known values. Empty or unknown input falls back to
+// DefaultSidebarDensity. Matching is case-insensitive.
+func (u UISettings) GetSidebarDensity() string {
+	switch strings.ToLower(strings.TrimSpace(u.SidebarDensity)) {
+	case SidebarDensityCompact:
+		return SidebarDensityCompact
+	case SidebarDensityMinimal:
+		return SidebarDensityMinimal
+	case SidebarDensityFull:
+		return SidebarDensityFull
+	case SidebarDensityAuto:
+		return SidebarDensityAuto
+	}
+	return DefaultSidebarDensity
 }
 
 // normalizeUIHiddenTools lowercases, dedupes, and drops unknown entries from
@@ -465,6 +874,7 @@ func normalizeUIHiddenTools(ui *UISettings, customTools map[string]ToolDef) {
 		return
 	}
 	known := make(map[string]bool, len(builtinTools())+len(customTools))
+	known["opencode2"] = true
 	for _, bt := range builtinTools() {
 		known[strings.ToLower(strings.TrimSpace(bt.Name))] = true
 	}
@@ -646,15 +1056,14 @@ func (u UISettings) GetRemoteSessionRefreshSecs() int {
 	return val
 }
 
-// GetNewSessionEnterAdvances reports whether Enter on the new-session dialog's
-// free-text Name/Branch fields should advance focus (true) instead of
-// submitting the form (false). Defaults to true when unset: Enter-advances is
-// the default so typing a name + Enter no longer silently submits with all
-// defaults. A literal `new_session_enter_advances = false` opts out and
-// restores the legacy Enter-submits behavior. Ctrl+S submits in both modes.
+// GetNewSessionEnterAdvances reports whether Enter in the new-session dialog
+// advances to the next row (true) instead of creating the session (false).
+// Defaults to false when unset (ASK-110): Enter creates from any row. A
+// literal `new_session_enter_advances = true` opts into the walk. Ctrl+S
+// creates in both modes.
 func (u UISettings) GetNewSessionEnterAdvances() bool {
 	if u.NewSessionEnterAdvances == nil {
-		return true // Default: ON (Enter advances; Ctrl+S submits).
+		return false // Default: Enter creates; Tab walks.
 	}
 	return *u.NewSessionEnterAdvances
 }
@@ -663,6 +1072,12 @@ func (u UISettings) GetNewSessionEnterAdvances() bool {
 // session immediately instead of only selecting it. Default false.
 func (u UISettings) GetAttachOnCreate() bool {
 	return u.AttachOnCreate
+}
+
+// GetActiveIncludesIdle reports whether the active-on-top view keeps idle
+// sessions with a live pane in its top section. Default false.
+func (u UISettings) GetActiveIncludesIdle() bool {
+	return u.ActiveIncludesIdle
 }
 
 // GetRemoteLatencyRefreshSecs returns the remote latency refresh interval
@@ -686,6 +1101,9 @@ func (u UISettings) GetRemoteLatencyRefreshSecs(fallbackSecs int) int {
 
 // WebSettings configures the `agent-deck web` HTTP server.
 type WebSettings struct {
+	// AllowedHosts adds exact HTTP Host names for reverse proxies and Serve.
+	// An entry may include a port; no port allows any port on that host.
+	AllowedHosts []string `toml:"allowed_hosts,omitempty"`
 	// MutationsEnabled controls whether POST/PATCH/DELETE endpoints accept
 	// requests. nil (omitted) defaults to true. Forced off by --read-only.
 	MutationsEnabled *bool `toml:"mutations_enabled,omitempty"`
@@ -702,6 +1120,37 @@ type WebSettings struct {
 	// hosts that are NOT on TrustedDomains. nil (omitted) defaults to true.
 	// Setting it false accepts the risk and opens every link directly.
 	ConfirmLinkOpen *bool `toml:"confirm_link_open,omitempty"`
+
+	// FileLinkRoots lists directories whose files the web terminal may open
+	// through the deck when a file:// link points into them (issue #2676).
+	// `~` and $VARS expand. Empty (the default) keeps file links off: a click
+	// only copies the path.
+	FileLinkRoots []string `toml:"file_link_roots,omitempty"`
+}
+
+// SecuritySettings is the [security] table.
+type SecuritySettings struct {
+	// AutoTrustFolders lets agent-deck mark any folder it starts a Claude,
+	// Codex or Cursor session in as trusted (so the tool skips its "trust
+	// this folder?" prompt), and source a relative env_file from it. Unset:
+	// false on a new install, true on an install that predates v1.16.34
+	// (written into its config.toml once; see InstallKind). Folders
+	// agent-deck creates itself (conductor, triage and scratch dirs under its
+	// data dir, worktrees it makes) and trusted_folders are trusted either way.
+	AutoTrustFolders *bool `toml:"auto_trust_folders,omitempty"`
+
+	// TrustedFolders lists folders (and everything under them) agent-deck may
+	// mark trusted even when auto_trust_folders is off. `~` and $VARS expand.
+	// `agent-deck launch --trust-folder` adds the session's folder here.
+	TrustedFolders []string `toml:"trusted_folders,omitempty"`
+}
+
+// GetAutoTrustFolders resolves [security].auto_trust_folders; see the field.
+func (s SecuritySettings) GetAutoTrustFolders() bool {
+	if s.AutoTrustFolders == nil {
+		return isExistingInstall()
+	}
+	return *s.AutoTrustFolders
 }
 
 // FeedbackSettings controls the in-product feedback prompts.
@@ -712,17 +1161,46 @@ type FeedbackSettings struct {
 	// Disabled suppresses all passive feedback prompts when true.
 	// Defaults to false. Set by RecordOptOut paths; cleared on re-enable.
 	Disabled bool `toml:"disabled,omitempty"`
+
+	// AgentReports lets agent sessions file public GitHub issues and
+	// comments as this machine's gh account (`agent-deck feedback bug
+	// --from-agent`, `feedback fixed --from-agent`). Defaults to false:
+	// a person turns it on with `agent-deck feedback agent-consent`,
+	// which shows what is posted, where and as whom, and asks y/N.
+	AgentReports bool `toml:"agent_reports,omitempty"`
 }
 
 // TelemetrySettings configures opt-in usage telemetry (TELEMETRY.md).
 type TelemetrySettings struct {
+	// Owner suppresses only the anonymous daily install tick. It cannot grant consent.
+	Owner bool `toml:"owner,omitempty"`
+
 	// Disabled forces telemetry off regardless of stored consent, like
 	// AGENTDECK_TELEMETRY=0. It cannot enable telemetry.
 	Disabled bool `toml:"disabled,omitempty"`
 
-	// Endpoint overrides the HTTPS receiver URL for self-hosting. Plain http
-	// is accepted only for localhost. Empty uses the compiled-in default.
+	// Endpoint overrides the receiver base URL (default PostHog Cloud EU,
+	// https://eu.i.posthog.com; uploads go to <endpoint>/batch/). Plain http
+	// is accepted only for localhost. Changing it requires fresh consent.
 	Endpoint string `toml:"endpoint,omitempty"`
+
+	// PostHogKey is the PostHog project API key (phc_...), used only by
+	// builds without a compiled-in key, after AGENTDECK_POSTHOG_KEY; with
+	// none, events stay in the local spool and nothing is uploaded.
+	PostHogKey string `toml:"posthog_key,omitempty"`
+
+	// Level is "full" (default) or "basic". Config can only lower the level.
+	Level string `toml:"level,omitempty"`
+
+	// OrgID is an opaque org id (a-z, 0-9, inner dashes, 3-40 chars, or a
+	// UUID) added as the "org" property to detailed events. A managed
+	// configuration's org_id wins over it. Default: none.
+	OrgID string `toml:"org_id,omitempty"`
+
+	// CrashDSN turns on crash and error reports to this Sentry DSN
+	// (https://<public key>@<host>/<project>). A managed configuration's
+	// crash_dsn wins over it. Default: none (crash reports off).
+	CrashDSN string `toml:"crash_dsn,omitempty"`
 }
 
 // OpenClawSettings configures the OpenClaw gateway connection.
@@ -735,6 +1213,11 @@ type OpenClawSettings struct {
 	// Falls back to OPENCLAW_PASSWORD env var if not set.
 	Password string `toml:"password,omitempty"`
 
+	// AllowInsecure lets a plain ws:// GatewayURL point at a host that is not
+	// loopback or tailnet, sending the password unencrypted (same as passing
+	// --insecure to the openclaw commands). Prefer wss:// instead.
+	AllowInsecure bool `toml:"allow_insecure,omitempty"`
+
 	// AutoSync syncs OpenClaw agents as agent-deck sessions on TUI startup
 	AutoSync bool `toml:"auto_sync,omitempty"`
 
@@ -743,6 +1226,21 @@ type OpenClawSettings struct {
 }
 
 // RemoteConfig defines a remote agent-deck instance accessible via SSH.
+// RemoteAttachSettings are the [remote] settings that apply to every remote
+// attach (agent-deck remote attach, the TUI's Enter on a remote session).
+type RemoteAttachSettings struct {
+	// PasteImages lets Ctrl+V with an image on this machine's clipboard upload
+	// it to the attached remote session and type its host path, when that
+	// session's agent (Claude, Gemini) shows its input composer. Default on;
+	// false leaves Ctrl+V to the remote untouched.
+	PasteImages *bool `toml:"paste_images,omitempty"`
+}
+
+// PasteImagesEnabled reports the [remote] paste_images setting (default true).
+func (s RemoteAttachSettings) PasteImagesEnabled() bool {
+	return s.PasteImages == nil || *s.PasteImages
+}
+
 type RemoteConfig struct {
 	// Host is the SSH destination (e.g., "user@host" or "user@host:port")
 	Host string `toml:"host,omitempty"`
@@ -758,6 +1256,160 @@ type RemoteConfig struct {
 	// old hardcoded 10s silently killed fetches from hosts with many sessions,
 	// making the whole remote look unavailable (#1859 family).
 	CommandTimeoutSeconds int `toml:"command_timeout_seconds,omitempty"`
+
+	// Transport carries interactive attaches: "ssh" (default) or "mosh".
+	// Mosh answers keystrokes locally and survives roaming, which matters on
+	// high-latency links such as a relayed tailnet path. Listing, polling,
+	// and every other command stay on SSH regardless.
+	Transport string `toml:"transport,omitempty"`
+
+	// MoshServer is the command that starts mosh-server on the remote, for
+	// hosts where it is not on the non-login SSH PATH (e.g.
+	// "/opt/homebrew/bin/mosh-server"). Empty uses mosh's default.
+	MoshServer string `toml:"mosh_server,omitempty"`
+
+	// TalkbackIntervalSecs makes the notify-daemon pull this remote's child
+	// records into every enrolled local conductor's inbox on its own, every
+	// N seconds (0 = off, the default; 30 is a good value). A conductor is
+	// enrolled once it has drained the remote (`remote drain`), which leaves a
+	// cursor behind.
+	TalkbackIntervalSecs int `toml:"talkback_interval_secs,omitempty"`
+
+	// RequireSameProfile lets this remote's records reach only a local
+	// conductor whose profile equals Profile (#2831): `remote drain` refuses
+	// any other receiving inbox, --into resolves within the effective profile
+	// only, and scheduled talkback enrolls only that profile's conductors.
+	// Off by default, because single-user setups often name profiles
+	// differently on each machine.
+	RequireSameProfile bool `toml:"require_same_profile,omitempty"`
+
+	// Provider names the [providers.<name>] entry that created this remote's
+	// sandbox. Empty for a plain SSH remote. Set by `remote add --provider`.
+	Provider string `toml:"provider,omitempty"`
+
+	// SandboxID is the provider's id for this remote's sandbox, used by
+	// `remote destroy`. Empty for a plain SSH remote.
+	SandboxID string `toml:"sandbox_id,omitempty"`
+
+	// SSHConfig is the path of the per-sandbox ssh_config agent-deck wrote
+	// (HostName, Port, User, IdentityFile, known_hosts). When set, every ssh
+	// and mosh call for this remote passes it with -F. Empty uses the user's
+	// own ssh configuration.
+	SSHConfig string `toml:"ssh_config,omitempty"`
+
+	// Owner is the person who created this remote's sandbox, sent to the
+	// provider as the agent-deck/owner label ([sandbox] owner, else $USER).
+	// Empty for a plain SSH remote and for sandboxes made before owners.
+	Owner string `toml:"owner,omitempty"`
+}
+
+// SandboxSettings is the [sandbox] section: settings for the sandboxes
+// this machine creates with a provider.
+type SandboxSettings struct {
+	// Owner names the person who owns the sandboxes created here, e.g.
+	// "alice". It is sent to the provider as the agent-deck/owner label and
+	// shown on the sandbox's remote (remote list, TUI, web). Default: the
+	// login name ($USER). At most 64 printable characters.
+	Owner string `toml:"owner,omitempty"`
+}
+
+// Where SandboxOwnerSource found the owner, named for error messages.
+const (
+	OwnerSourceConfig = "[sandbox] owner"
+	OwnerSourceUser   = "$USER"
+	OwnerSourceLogin  = "the account's login name"
+)
+
+// SandboxOwner returns the owner for a new sandbox: [sandbox] owner, else
+// $USER, else the account's login name; "" when none is known.
+func (c *UserConfig) SandboxOwner() string {
+	owner, _ := c.SandboxOwnerSource()
+	return owner
+}
+
+// SandboxOwnerSource is SandboxOwner plus where the value came from
+// (OwnerSourceConfig, OwnerSourceUser or OwnerSourceLogin; "" with no
+// owner), so a refusal names the setting the user can actually change.
+func (c *UserConfig) SandboxOwnerSource() (owner, source string) {
+	if c != nil {
+		if owner := strings.TrimSpace(c.Sandbox.Owner); owner != "" {
+			return owner, OwnerSourceConfig
+		}
+	}
+	if owner := strings.TrimSpace(os.Getenv("USER")); owner != "" {
+		return owner, OwnerSourceUser
+	}
+	if u, err := user.Current(); err == nil {
+		if owner := strings.TrimSpace(u.Username); owner != "" {
+			return owner, OwnerSourceLogin
+		}
+	}
+	return "", ""
+}
+
+// PrintableOwner returns owner without its control and other
+// non-printable characters. An owner is free text from config.toml (a
+// hand-edited remote, [sandbox] owner) or the environment, so every view
+// that prints it to a terminal, a JSON client or the web goes through this.
+func PrintableOwner(owner string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsPrint(r) {
+			return r
+		}
+		return -1
+	}, owner)
+}
+
+// ProviderConfig defines one sandbox provider ([providers.<name>]).
+type ProviderConfig struct {
+	// Command is the provider executable: an absolute path, or a bare name
+	// resolved via PATH. It is run directly (never through a shell) with one
+	// argument, the action (create, list, status or destroy).
+	Command string `toml:"command,omitempty"`
+
+	// CreateTimeoutSeconds bounds a create call (default 600: cold VMs can
+	// take several minutes).
+	CreateTimeoutSeconds int `toml:"create_timeout_seconds,omitempty"`
+
+	// TimeoutSeconds bounds list, status and destroy calls (default 60).
+	TimeoutSeconds int `toml:"timeout_seconds,omitempty"`
+
+	// AgentDeckPath is the agent-deck path on this provider's sandboxes
+	// (default "agent-deck"), copied into each registered remote.
+	AgentDeckPath string `toml:"agent_deck_path,omitempty"`
+}
+
+// GetCreateTimeout returns the create timeout, defaulting to 600s.
+func (pc ProviderConfig) GetCreateTimeout() time.Duration {
+	if pc.CreateTimeoutSeconds > 0 {
+		return time.Duration(pc.CreateTimeoutSeconds) * time.Second
+	}
+	return 600 * time.Second
+}
+
+// GetTimeout returns the list/status/destroy timeout, defaulting to 60s.
+func (pc ProviderConfig) GetTimeout() time.Duration {
+	if pc.TimeoutSeconds > 0 {
+		return time.Duration(pc.TimeoutSeconds) * time.Second
+	}
+	return 60 * time.Second
+}
+
+// Remote attach transports accepted by RemoteConfig.Transport.
+const (
+	RemoteTransportSSH  = "ssh"
+	RemoteTransportMosh = "mosh"
+)
+
+// GetTransport returns the normalized interactive transport, defaulting to
+// "ssh". An unrecognized value is returned as written so attach can refuse it
+// instead of silently falling back to a transport the user did not choose.
+func (rc RemoteConfig) GetTransport() string {
+	t := strings.ToLower(strings.TrimSpace(rc.Transport))
+	if t == "" {
+		return RemoteTransportSSH
+	}
+	return t
 }
 
 // GetAgentDeckPath returns the agent-deck binary path, defaulting to "agent-deck".
@@ -797,12 +1449,65 @@ type ProfileSettings struct {
 	// Nil pointer means "no [profiles.<name>.costs] block in TOML"; the
 	// resolver falls through to global [costs] settings.
 	Costs *ProfileCosts `toml:"costs,omitempty"`
+	// Browser overrides [browser] for this profile ([profiles.<name>.browser]).
+	Browser *BrowserSettings `toml:"browser,omitempty"`
+	// Sessions overrides [sessions] for this profile ([profiles.<name>.sessions]).
+	Sessions SessionsSettings `toml:"sessions,omitempty"`
+}
+
+// SessionsSettings is the [sessions] section (and [profiles.<name>.sessions]).
+type SessionsSettings struct {
+	// AutoRefreshIdleBuilds restarts a Claude or Codex session onto a newer
+	// installed build of its tool once it sits idle at an empty prompt,
+	// resuming its conversation (see idle_build_refresh.go).
+	// Default: true (nil = true); the profile value wins over the global one.
+	AutoRefreshIdleBuilds *bool `toml:"auto_refresh_idle_builds,omitempty"`
+
+	// WaitTimeout turns on the wait timer for every session without its own
+	// value: a session that has waited on a human this long at a numbered
+	// question with a "(Recommended)" option under the cursor takes that
+	// option. Never answers permission, trust or security prompts (see
+	// wait_timer.go). A Go duration of at least 1m ("5m"); empty, "0" or
+	// "off" is off. Default: off. Per session: `session set <id>
+	// wait-timeout`.
+	WaitTimeout string `toml:"wait_timeout,omitempty"`
+}
+
+// ConductorAutoRefreshIdleBuilds reports whether conductor name opted into
+// idle build refresh ([conductors.<name>.sessions] auto_refresh_idle_builds =
+// true). Default false: a restart cancels a conductor's in-Claude timers and
+// sends it a recovery turn.
+func (c *UserConfig) ConductorAutoRefreshIdleBuilds(name string) bool {
+	if c == nil || name == "" {
+		return false
+	}
+	v := c.Conductors[name].Sessions.AutoRefreshIdleBuilds
+	return v != nil && *v
+}
+
+// AutoRefreshIdleBuildsEnabled reports whether idle sessions of profile move
+// onto newer tool builds by themselves: [profiles.<profile>.sessions] first,
+// then [sessions], default true.
+func (c *UserConfig) AutoRefreshIdleBuildsEnabled(profile string) bool {
+	if c == nil {
+		return true
+	}
+	if p, ok := c.Profiles[profile]; ok && p.Sessions.AutoRefreshIdleBuilds != nil {
+		return *p.Sessions.AutoRefreshIdleBuilds
+	}
+	if c.Sessions.AutoRefreshIdleBuilds != nil {
+		return *c.Sessions.AutoRefreshIdleBuilds
+	}
+	return true
 }
 
 // ProfileClaudeSettings defines profile-specific Claude overrides.
 type ProfileClaudeSettings struct {
 	// ConfigDir overrides [claude].config_dir for this profile only.
 	ConfigDir string `toml:"config_dir,omitempty"`
+	// PromptSuggestions overrides [launch].prompt_suggestions for sessions
+	// of this agent-deck profile.
+	PromptSuggestions string `toml:"prompt_suggestions,omitempty"`
 }
 
 // ProfileCodexSettings defines profile-specific Codex overrides.
@@ -834,6 +1539,10 @@ type GroupSettings struct {
 	Hermes GroupHermesSettings `toml:"hermes,omitempty"`
 	// DeepSeek defines DeepSeek Harness overrides for a specific group.
 	DeepSeek GroupDeepSeekSettings `toml:"deepseek,omitempty"`
+	// ContextLevel overrides [launch].context_level for sessions in this
+	// group (issue #2260): "none", "primer", or "full". Walks ancestor
+	// groups like the other per-group settings — see GetGroupContextLevel.
+	ContextLevel string `toml:"context_level,omitempty"`
 }
 
 // GroupDefaultsSettings carries [group_defaults] — defaults stamped onto new
@@ -920,8 +1629,8 @@ type GroupDeepSeekSettings struct {
 
 // ConductorOverrides defines per-conductor configuration overrides.
 // Mirrors GroupSettings — conductors are first-class entities keyed by
-// conductor name (derived from Instance.Title via strings.TrimPrefix at the
-// call site, same pattern as env.go getConductorEnv).
+// conductor name (Instance.ResolveConductorName: the stored stable name, else
+// the possibly decorated conductor-<name> title).
 //
 // Named ConductorOverrides (not ConductorSettings) to avoid collision with
 // the pre-existing global [conductor] meta-agent orchestration block
@@ -934,6 +1643,11 @@ type ConductorOverrides struct {
 	Hermes ConductorHermesSettings `toml:"hermes,omitempty"`
 	// DeepSeek defines DeepSeek Harness overrides for a specific conductor.
 	DeepSeek ConductorDeepSeekSettings `toml:"deepseek,omitempty"`
+	// Inbox overrides [inbox] for this conductor (issue #2469).
+	Inbox *InboxConfig `toml:"inbox,omitempty"`
+	// Sessions opts this conductor into [sessions] auto_refresh_idle_builds,
+	// which skips conductors unless this says true.
+	Sessions SessionsSettings `toml:"sessions,omitempty"`
 }
 
 // ConductorDeepSeekSettings defines conductor-specific DeepSeek Harness
@@ -1112,25 +1826,114 @@ type LogSettings struct {
 	// AggregateIntervalS is the event aggregation flush interval in seconds
 	// Default: 30
 	AggregateIntervalS int `toml:"aggregate_interval_secs,omitzero"`
+
+	// Timings records how long each operation takes in <cache>/timings.jsonl
+	// for `agent-deck perf` (same as AGENTDECK_TIMINGS=1). Local only.
+	// Default: false
+	Timings bool `toml:"timings,omitempty"`
 }
 
 // UpdateSettings defines auto-update configuration
 type UpdateSettings struct {
-	// AutoUpdate automatically installs updates without prompting
+	// AutoUpdate makes the TUI offer to install an available update on
+	// startup (a Y/n prompt before the deck opens).
 	// Default: false
 	AutoUpdate bool `toml:"auto_update,omitempty"`
+
+	// AutoUpdateRemotes pushes the controller's version to every configured
+	// remote that reports an older agent-deck: after a successful
+	// `agent-deck update`, and in the background on startup (throttled by
+	// CheckIntervalHours). Never prompts; a remote that fails stays on its
+	// version and is logged. Default: true (nil = true); opt out with
+	// auto_update_remotes = false (issue #2164).
+	AutoUpdateRemotes *bool `toml:"auto_update_remotes,omitempty"`
+	// AutoInstall installs an available update unattended (no prompt) from
+	// the TUI's periodic check and from the `agent-deck update` timer
+	// (launchd on macOS, systemd on Linux). Set false to opt out.
+	// Default: true (nil = true)
+	AutoInstall *bool `toml:"auto_install,omitempty"`
+
+	// AutoRestart re-executes the running process in place once a newer
+	// binary is installed on disk, without asking. Set false to keep the
+	// "installed, press <key> to restart" notice and restart by hand.
+	// Default: true (nil = true)
+	AutoRestart *bool `toml:"auto_restart,omitempty"`
 
 	// CheckEnabled enables automatic update checks on startup
 	// Default: true (nil = true)
 	CheckEnabled *bool `toml:"check_enabled,omitempty"`
 
-	// CheckIntervalHours is how often to check for updates (in hours)
-	// Default: 24
+	// CheckIntervalHours is how often the startup remote sweep (see
+	// AutoUpdateRemotes/ShouldAutoUpdateRemotes) throttles itself, in hours.
+	// Default: 24. This is unrelated to CheckInterval below, which governs
+	// the near-event-driven GitHub poll every daemon/TUI runs.
 	CheckIntervalHours int `toml:"check_interval_hours,omitzero"`
+
+	// CheckInterval is how often every agent-deck daemon/TUI polls the
+	// GitHub releases endpoint for a new release, as a Go duration string
+	// (e.g. "90s", "2m"). The poll is a conditional GET (ETag /
+	// If-None-Match): a 304 (no new release) does not spend the caller's
+	// GitHub API rate limit, so a short interval is cheap. On error the
+	// caller backs off exponentially with jitter rather than retrying at
+	// this rate (see update.NextRecheck). Default: "90s".
+	CheckInterval string `toml:"check_interval,omitempty"`
+
+	// SweepRemotes pushes the controller's binary bytes to every configured
+	// remote after an unattended install, the way AutoUpdateRemotes always
+	// did before this setting existed. Default: false — remotes are instead
+	// nudged (a best-effort, byte-free "check now" over the same channel,
+	// falling back to `ssh <host> agent-deck update` for a remote that does
+	// not understand the nudge) and pull + verify themselves. `agent-deck
+	// remote update <host>` is unaffected either way: it always pulls onto
+	// the named remote by hand, regardless of this setting.
+	SweepRemotes *bool `toml:"sweep_remotes,omitempty"`
+
+	// ManageTimer lets agent-deck install and heal its own update timer
+	// (launchd on macOS, systemd --user on Linux) without a separate
+	// `update --install-timer`: `update --unattended`, the TUI's periodic
+	// check, the notify daemon at start and `remote update` install it
+	// where none is active and migrate a hand-made agentdeck-autoupdate
+	// pair (#2472). Default: true (nil = true); set false to manage the
+	// timer by hand.
+	ManageTimer *bool `toml:"manage_timer,omitempty"`
 
 	// NotifyInCLI shows update notification in CLI commands (not just TUI)
 	// Default: true (nil = true)
 	NotifyInCLI *bool `toml:"notify_in_cli,omitempty"`
+}
+
+// DefaultCheckInterval is how often a daemon/TUI polls GitHub for a new
+// release when [updates].check_interval is unset.
+const DefaultCheckInterval = 90 * time.Second
+
+// GetCheckInterval returns the configured poll interval, defaulting to
+// DefaultCheckInterval when unset or unparsable. Never returns a
+// non-positive duration.
+func (u UpdateSettings) GetCheckInterval() time.Duration {
+	if v := strings.TrimSpace(u.CheckInterval); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return DefaultCheckInterval
+}
+
+// GetSweepRemotes reports whether the controller pushes bytes to remotes
+// after an install, instead of nudging them to pull (default: false).
+func (u UpdateSettings) GetSweepRemotes() bool {
+	if u.SweepRemotes == nil {
+		return false
+	}
+	return *u.SweepRemotes
+}
+
+// GetManageTimer reports whether agent-deck installs and heals its own
+// update timer (default: true).
+func (u UpdateSettings) GetManageTimer() bool {
+	if u.ManageTimer == nil {
+		return true
+	}
+	return *u.ManageTimer
 }
 
 // GetCheckEnabled returns whether update checks are enabled (default: true).
@@ -1139,6 +1942,33 @@ func (u UpdateSettings) GetCheckEnabled() bool {
 		return true
 	}
 	return *u.CheckEnabled
+}
+
+// GetAutoUpdateRemotes returns whether older remotes follow the controller's
+// version on their own (default: true).
+func (u UpdateSettings) GetAutoUpdateRemotes() bool {
+	if u.AutoUpdateRemotes == nil {
+		return true
+	}
+	return *u.AutoUpdateRemotes
+}
+
+// GetAutoInstall reports whether available updates are installed unattended
+// (default: true).
+func (u UpdateSettings) GetAutoInstall() bool {
+	if u.AutoInstall == nil {
+		return true
+	}
+	return *u.AutoInstall
+}
+
+// GetAutoRestart reports whether a running process restarts itself in place
+// once a newer binary is on disk (default: true).
+func (u UpdateSettings) GetAutoRestart() bool {
+	if u.AutoRestart == nil {
+		return true
+	}
+	return *u.AutoRestart
 }
 
 // GetNotifyInCLI returns whether CLI update notifications are enabled (default: true).
@@ -1237,6 +2067,32 @@ type NotificationsConfig struct {
 	// on by default; this covers the operator, including TOP-LEVEL sessions with
 	// no parent, which the transition path cannot reach at all.
 	Desktop bool `toml:"desktop,omitempty"`
+
+	// Sort picks the order of the notification bar (and so which session each
+	// Ctrl+b 1-9 key jumps to). "waiting" (default) lists the session that
+	// started waiting most recently first. "last_accessed" lists the session
+	// you attached to most recently first, like Alt+Tab (#2949). Any other
+	// value falls back to "waiting".
+	Sort string `toml:"sort,omitempty"`
+}
+
+// Notification bar sort modes for [notifications] sort.
+const (
+	NotificationSortWaiting      = "waiting"
+	NotificationSortLastAccessed = "last_accessed"
+)
+
+// GetSort returns the normalized notification bar sort mode. Unknown or empty
+// values return NotificationSortWaiting so the default order never changes.
+func (n NotificationsConfig) GetSort() string {
+	return normalizeNotificationSort(n.Sort)
+}
+
+func normalizeNotificationSort(mode string) string {
+	if strings.EqualFold(strings.TrimSpace(mode), NotificationSortLastAccessed) {
+		return NotificationSortLastAccessed
+	}
+	return NotificationSortWaiting
 }
 
 // GetDesktopEnabled reports whether desktop notifications are enabled.
@@ -1342,6 +2198,72 @@ func (s *ShellSettings) GetExitToShell() bool {
 		return false // Default: OFF (preserve current exit/resume behavior)
 	}
 	return *s.ExitToShell
+}
+
+// LaunchSettings holds tool-agnostic spawn settings ([launch] in config.toml).
+type LaunchSettings struct {
+	// InjectIdentity controls whether every spawned session is told, through
+	// its harness's own instruction mechanism, that it runs inside agent-deck,
+	// what its session identity is (id, title, group, profile, account,
+	// parent, path) and how to use the agent-deck CLI from inside. The text
+	// is regenerated from the session record on every start/restart and
+	// written to an agent-deck-owned file (AGENTDECK_IDENTITY_FILE), never
+	// into the project directory. nil => true. Per-session opt-out:
+	// `add`/`launch --no-identity`.
+	InjectIdentity *bool `toml:"inject_identity,omitempty"`
+
+	// ContextLevel is the global default for the harness context-level
+	// (issue #2260): "none" (no injection at all — supersedes
+	// InjectIdentity), "primer" (short session-identity block, no CLI
+	// reference), or "full" (the block InjectIdentity has always produced).
+	// Empty (unset) falls back to InjectIdentity's bool for backward
+	// compatibility, then to "full". Group ([groups."<path>"].context_level)
+	// and session (`session set <id> context-level`) override this; the
+	// precedence is global < group < session. See
+	// Instance.EffectiveContextLevel.
+	ContextLevel string `toml:"context_level,omitempty"`
+
+	// NestUnderParent opts in to one-hop nesting for `launch` and `add` run
+	// from inside a sub-session without --parent: the new session is linked
+	// under the sub-session's own parent, takes its group by the same rules
+	// as any child of that parent, and a one-line note goes to stderr. false
+	// (the default) keeps the caller's
+	// sub-session out of it: the new session starts top-level in the
+	// folder-derived group, with no parent link and no note.
+	NestUnderParent bool `toml:"nest_under_parent,omitempty"`
+
+	// PromptSuggestions controls Claude Code prompt suggestions (the dim
+	// predicted next message in an empty composer) in sessions agent-deck
+	// launches: "children-off" (default) starts parented sessions (workers, a
+	// conductor's children) with CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false
+	// and leaves root sessions alone; "on" never sets the env; "off" sets it
+	// for every Claude session. See prompt_suggestions.go.
+	PromptSuggestions string `toml:"prompt_suggestions,omitempty"`
+
+	// FanoutHint adds the FanoutHint constant line to the injected identity
+	// block of Claude-family sessions at the primer and full context levels.
+	// nil => true.
+	// It rides on identity injection: --no-identity, inject_identity=false
+	// or context_level "none" leave no block to carry it.
+	FanoutHint *bool `toml:"fanout_hint,omitempty"`
+}
+
+// GetFanoutHint returns whether the fan-out hint is added to the identity
+// block, defaulting to true.
+func (l *LaunchSettings) GetFanoutHint() bool {
+	if l == nil || l.FanoutHint == nil {
+		return true
+	}
+	return *l.FanoutHint
+}
+
+// GetInjectIdentity returns whether identity injection is enabled, defaulting
+// to true.
+func (l *LaunchSettings) GetInjectIdentity() bool {
+	if l == nil || l.InjectIdentity == nil {
+		return true
+	}
+	return *l.InjectIdentity
 }
 
 // GetLaunchShell returns whether agent commands should be wrapped with a shell
@@ -1472,13 +2394,44 @@ func (c *UserConfig) GetPushTitle() bool {
 	return *c.PushTitle
 }
 
-// GetGroupSort returns the normalized within-group sort mode: "actionable" only
-// when explicitly set, otherwise "creation" (the default).
+// GetGroupSort returns the normalized within-group sort mode: "actionable" or
+// "alphabetical" only when explicitly set, otherwise "creation" (the default).
 func (c *UserConfig) GetGroupSort() string {
-	if c.GroupSort == "actionable" {
-		return "actionable"
+	switch c.GroupSort {
+	case "actionable", "alphabetical":
+		return c.GroupSort
 	}
 	return "creation"
+}
+
+// GetSendTransport returns the normalized send transport: "auto" only when
+// explicitly set to it, otherwise "tmux" (the default). The socket transport
+// is opt-in, so this is fail-closed, unlike GetGroupSort: an empty value and
+// every unrecognized value (a typo'd "AUTO", "garbage") normalize to the
+// existing keystroke transport rather than silently opting a user in
+// (maintainer review of #2100).
+func (c *UserConfig) GetSendTransport() string {
+	if c.SendTransport == "auto" {
+		return "auto"
+	}
+	return "tmux"
+}
+
+// SendSettings is the [send] section.
+type SendSettings struct {
+	// TagSends prefixes a send made from inside an agent-deck session with
+	// one "[agent-deck from:<sender-id>]" line so the receiver's reply is
+	// routed back to the sender (comms redesign PR5). Default true (nil).
+	TagSends *bool `toml:"tag_sends,omitempty"`
+}
+
+// GetTagSends reports whether `session send` tags agent-originated sends.
+// Default true; only an explicit tag_sends = false turns it off.
+func (c *UserConfig) GetTagSends() bool {
+	if c == nil || c.Send.TagSends == nil {
+		return true
+	}
+	return *c.Send.TagSends
 }
 
 // ClaudeSettings defines Claude Code configuration
@@ -1492,7 +2445,9 @@ type ClaudeSettings struct {
 	// Default: ~/.claude (or CLAUDE_CONFIG_DIR env var)
 	ConfigDir string `toml:"config_dir,omitempty"`
 
-	// DangerousMode enables --dangerously-skip-permissions flag for Claude sessions
+	// DangerousMode enables --dangerously-skip-permissions flag for Claude sessions.
+	// Unset: false on a new install, true on an install that predates
+	// v1.16.34 (written into its config.toml once; see InstallKind).
 	// Default: true (nil = use default true, explicitly set false to disable)
 	// Power users typically want this enabled for faster iteration
 	DangerousMode *bool `toml:"dangerous_mode,omitempty"`
@@ -1521,6 +2476,15 @@ type ClaudeSettings struct {
 	// Code falls back to its own default (#1172).
 	DefaultModel string `toml:"default_model,omitempty"`
 
+	// DefaultAccount is the named account slot (a [profiles.<name>.claude]
+	// block with a config_dir) new Claude sessions start on when no slot is
+	// picked: the New Session dialog preselects it and `add`/`launch` without
+	// --account use it (#2895). It is copied into Instance.Account at creation
+	// only, so changing it never moves an existing session. A group or
+	// conductor config_dir still wins, and a slot that is no longer configured
+	// falls back to inherit. Default: "" (inherit the conductor/group/env chain).
+	DefaultAccount string `toml:"default_account,omitempty"`
+
 	// UseChrome enables --chrome by default for Claude sessions.
 	UseChrome bool `toml:"use_chrome,omitempty"`
 
@@ -1537,6 +2501,14 @@ type ClaudeSettings struct {
 	// for instant, deterministic status updates instead of polling tmux content.
 	// Default: true (nil = use default true, set false to disable)
 	HooksEnabled *bool `toml:"hooks_enabled,omitempty"`
+
+	// StatuslineFeed lets `hooks install` (and the unattended heal) wrap the
+	// Claude statusLine with `agent-deck usage statusline-wrap`, so the core
+	// keeps each session's model, context and 5h/7d record. Set false to
+	// leave every statusLine untouched; `hooks uninstall` still restores one
+	// that was wrapped earlier.
+	// Default: true (nil = use default true, set false to disable)
+	StatuslineFeed *bool `toml:"statusline_feed,omitempty"`
 
 	// AutoResumeSummary auto-presses Enter on Claude's "Resume from summary"
 	// picker that appears after `claude --resume` on long-running sessions
@@ -1591,6 +2563,23 @@ func (c *UserConfig) GetGroupClaudeConfigDir(groupPath string) string {
 		}
 	}
 	return ""
+}
+
+// GetGroupContextLevel returns the group-specific context-level override
+// (issue #2260) and the ancestor group path that set it, walking ancestor
+// groups exactly like GetGroupClaudeConfigDir: a child group inherits its
+// parent's context_level when it has none of its own. Returns ("", "") when
+// no group in the chain sets one.
+func (c *UserConfig) GetGroupContextLevel(groupPath string) (value, matchedGroup string) {
+	if c == nil || groupPath == "" || c.Groups == nil {
+		return "", ""
+	}
+	for p := groupPath; p != ""; p = getParentPath(p) {
+		if groupCfg, ok := c.Groups[p]; ok && groupCfg.ContextLevel != "" {
+			return groupCfg.ContextLevel, p
+		}
+	}
+	return "", ""
 }
 
 // GetGroupClaudeEnvFile returns the group-specific Claude env file, walking
@@ -1740,9 +2729,8 @@ func (c *UserConfig) GetGroupHermesEnvFile(groupPath string) string {
 }
 
 // GetConductorClaudeConfigDir returns the conductor-specific Claude config
-// directory, if configured. Keyed by conductor name (Instance.Title minus
-// "conductor-" prefix — single source of truth is conductorNameFromInstance
-// in claude.go). Path expansion matches GetGroupClaudeConfigDir. Returns ""
+// directory, if configured. Keyed by conductor name (single source of truth
+// is Instance.ResolveConductorName in conductor_identity.go). Path expansion matches GetGroupClaudeConfigDir. Returns ""
 // when the conductor has no block or no config_dir — callers fall through
 // to the group/profile/global chain.
 func (c *UserConfig) GetConductorClaudeConfigDir(name string) string {
@@ -1862,11 +2850,12 @@ func (c *UserConfig) GetConductorHermesEnvFile(name string) string {
 	return conductorCfg.Hermes.EnvFile
 }
 
-// GetDangerousMode returns whether dangerous mode is enabled, defaulting to true
-// Power users (the primary audience) typically want this enabled for faster iteration
+// GetDangerousMode returns whether dangerous mode is enabled. Unset, it is
+// false on a new install and true (the pre-1.16.34 default) on an install
+// that predates it; see InstallKind.
 func (c *ClaudeSettings) GetDangerousMode() bool {
 	if c.DangerousMode == nil {
-		return true
+		return isExistingInstall()
 	}
 	return *c.DangerousMode
 }
@@ -1877,6 +2866,15 @@ func (c *ClaudeSettings) GetHooksEnabled() bool {
 		return true
 	}
 	return *c.HooksEnabled
+}
+
+// GetStatuslineFeed returns whether agent-deck may wrap Claude's statusLine,
+// defaulting to true.
+func (c *ClaudeSettings) GetStatuslineFeed() bool {
+	if c.StatuslineFeed == nil {
+		return true
+	}
+	return *c.StatuslineFeed
 }
 
 // GetAutoResumeSummary returns whether the "Resume from summary" picker is
@@ -1938,6 +2936,54 @@ type OpenCodeSettings struct {
 	// OpenCode version predates the top-level --port flag or you don't want
 	// a localhost event server bound per session.
 	DisableSSEStatus bool `toml:"disable_sse_status,omitempty"`
+}
+
+// ModelsSettings controls the model catalog shown by the new-session dialogs,
+// `launch -capabilities` and reasoning-effort validation.
+type ModelsSettings struct {
+	// Probe asks installed CLIs that can list their own models (today:
+	// `codex debug models` and `opencode models`) for their model and effort
+	// lists, cached per CLI binary, merged in front of the built-in catalog.
+	// Set false to use only the built-in catalog.
+	// Default: true
+	Probe *bool `toml:"probe,omitempty"`
+
+	// Per-tool overrides (#2664): [models.codex], [models.opencode], ...
+	// A custom tool uses the table of the tool it wraps.
+	Claude   ModelListSettings `toml:"claude,omitempty"`
+	Codex    ModelListSettings `toml:"codex,omitempty"`
+	Gemini   ModelListSettings `toml:"gemini,omitempty"`
+	OpenCode ModelListSettings `toml:"opencode,omitempty"`
+}
+
+// ModelListSettings pins or extends one tool's model suggestions.
+type ModelListSettings struct {
+	// List replaces the model suggestions entirely: no probed or built-in
+	// models. Reasoning efforts may still be probed.
+	List []string `toml:"list,omitempty"`
+	// Extra is shown first, ahead of the probed and built-in models.
+	Extra []string `toml:"extra,omitempty"`
+}
+
+// ForTool returns the override table for a tool kind ("claude", "codex",
+// "gemini", "opencode"); other kinds have none.
+func (m ModelsSettings) ForTool(kind string) ModelListSettings {
+	switch kind {
+	case "claude":
+		return m.Claude
+	case "codex":
+		return m.Codex
+	case "gemini":
+		return m.Gemini
+	case "opencode":
+		return m.OpenCode
+	}
+	return ModelListSettings{}
+}
+
+// ProbeEnabled reports whether installed CLIs may be probed. Defaults to true.
+func (m ModelsSettings) ProbeEnabled() bool {
+	return m.Probe == nil || *m.Probe
 }
 
 // CodexSettings defines Codex CLI configuration
@@ -2153,6 +3199,38 @@ type DeepSeekSettings struct {
 	ExtraArgs []string `toml:"extra_args,omitempty"`
 }
 
+// OMPSettings defines Oh My Pi (`omp`) integration configuration.
+//
+// Binary: `omp` from npm @oh-my-pi/pi-coding-agent (github.com/can1357/oh-my-pi,
+// MIT, a fork of badlogic/pi-mono). Verified against v17.3.8. See
+// internal/session/omp.go for the full invocation grammar this block feeds.
+type OMPSettings struct {
+	// DefaultModel is passed as --model unless a session has its own override.
+	DefaultModel   string `toml:"default_model,omitempty"`
+	DefaultProfile string `toml:"default_profile,omitempty"`
+	SmolModel      string `toml:"smol_model,omitempty"`
+	SlowModel      string `toml:"slow_model,omitempty"`
+	PlanModel      string `toml:"plan_model,omitempty"`
+
+	// Command overrides the default binary/invocation for omp sessions.
+	// Supports flags (e.g., "omp --smol haiku"). Unlike buildCrushCommand's
+	// true passthrough, buildOMPCommand always appends --continue
+	// --session-dir (mirroring buildPiCommand) regardless of this value —
+	// there is no passthrough branch for omp/pi. Default: "omp"
+	Command string `toml:"command,omitempty"`
+
+	// EnvFile is a .env file specific to omp sessions, sourced before the
+	// `omp` command runs (like [gemini].env_file). This is where an
+	// ANTHROPIC_API_KEY/OPENAI_API_KEY belongs when it should not live in
+	// the user's shell.
+	EnvFile string `toml:"env_file,omitempty"`
+
+	// ApprovalMode maps directly to omp's `--approval-mode` flag
+	// ("always-ask", "write", or "yolo"). Empty (default) omits the flag
+	// entirely, so omp uses its own configured default.
+	ApprovalMode string `toml:"approval_mode,omitempty"`
+}
+
 // CursorSettings defines Cursor Agent CLI integration configuration (Issue #1672).
 type CursorSettings struct {
 	// Command overrides the default binary/invocation for Cursor sessions.
@@ -2271,6 +3349,29 @@ type KiroSettings struct {
 	TrustAllTools bool `toml:"trust_all_tools,omitempty"`
 }
 
+// MuseSettings defines Muse Code CLI configuration.
+// Binary: `muse`. Interactive TUI.
+// Key flags: --trust-workspace, --yolo, --provider, --model.
+// Resume is a subcommand (`muse resume <uuid>`), wired in a follow-up.
+type MuseSettings struct {
+	// Command overrides the default invocation for Muse sessions.
+	// Supports flags (e.g., "muse --provider echo"). Replaces the default
+	// "muse --trust-workspace" wholesale, so include --trust-workspace
+	// yourself if the override drops it: bare `muse` blocks on the
+	// workspace-trust prompt in a fresh directory.
+	Command string `toml:"command,omitempty"`
+
+	// EnvFile is a .env file specific to Muse sessions (sourced before
+	// the `muse` command runs, like [crush].env_file). Optional.
+	// Useful for provider credentials (e.g. a Meta API key): panes do not
+	// inherit interactive-shell exports.
+	EnvFile string `toml:"env_file,omitempty"`
+
+	// YoloMode enables --yolo flag for Muse sessions (disable approval +
+	// sandboxing and trust the workspace for the run). Default: false
+	YoloMode bool `toml:"yolo_mode,omitempty"`
+}
+
 // WorktreeSettings contains git worktree preferences.
 type WorktreeSettings struct {
 	// AutoCleanup: remove worktree when session is deleted (default: true, nil = true)
@@ -2333,9 +3434,26 @@ type WorktreeSettings struct {
 	//   "always" → pre-gate behavior: run unconditionally, no prompt. Opt-in.
 	//   "never"  → never run these scripts, trusted or not.
 	// Unknown values are treated as "prompt" so a typo can never downgrade
-	// to "always". See --allow-repo-scripts / AGENT_DECK_ALLOW_REPO_SCRIPTS
-	// for a one-shot, non-persisted bypass (CI).
+	// to "always". See --run-hooks (--allow-repo-scripts) /
+	// AGENT_DECK_ALLOW_REPO_SCRIPTS for a one-shot, non-persisted run (CI).
 	RunRepoScripts string `toml:"run_repo_scripts,omitempty"`
+
+	// CheckoutGitConfig is a list of "key=value" git config entries passed as
+	// `git -c` to the commands that materialize a new worktree (#2366), e.g.
+	// ["core.hooksPath=/dev/null"] to skip post-checkout hooks, or
+	// ["checkout.workers=8"]. Applied only to that creation; nothing is
+	// written to the worktree's config. Global config only: a directory-local
+	// .agent-deck/config.toml cannot set it (its allowlist rejects the key).
+	CheckoutGitConfig []string `toml:"checkout_git_config,omitempty"`
+}
+
+// CreateOptions returns the git worktree-creation options these settings
+// select for a worktree created from sourceDir: sparse-checkout inheritance
+// and the checkout_git_config entries.
+func (w WorktreeSettings) CreateOptions(sourceDir string) git.WorktreeCreateOptions {
+	opts := git.SparseInheritOptions(w.InheritSparseCheckout(), sourceDir)
+	opts.GitConfig = w.CheckoutGitConfig
+	return opts
 }
 
 // ScriptConsentPolicy returns the parsed [worktree] run_repo_scripts value.
@@ -2444,6 +3562,123 @@ func (g GlobalSearchSettings) GetEnabled() bool {
 	return *g.Enabled
 }
 
+// RecallSettings configures Recall, the cross-harness conversation store
+// (docs/recall.md). Phase 1 ships only the durable hint layer (`--hint`,
+// `session annotate`), which lives in state.db and does not depend on this
+// switch; `enabled` reserves the section and gates the recall.db index that
+// later phases build. Default off.
+type RecallSettings struct {
+	// Enabled turns the recall.db transcript index on (default: false).
+	// Hints and annotations work regardless of this value.
+	Enabled *bool `toml:"enabled,omitempty"`
+	// MaxLoadAvg refuses a backfill or sweep while the one-minute load
+	// average is above it (default 4.0; 0 disables the check).
+	MaxLoadAvg *float64 `toml:"max_loadavg,omitempty"`
+	// TextTier is the stored body per message: "clipped" (default, 8 KiB)
+	// or "full".
+	TextTier string `toml:"text_tier,omitempty"`
+	// KeepMissingDays is how long the ledger row and tombstone of a
+	// vanished transcript survive before `recall gc` drops them (default 30).
+	KeepMissingDays *int `toml:"keep_missing_days,omitempty"`
+	// PerSourceMB caps how much of one transcript a single sweep parses;
+	// the rest continues next sweep (default 64; 0 = unlimited).
+	PerSourceMB *int `toml:"per_source_mb,omitempty"`
+	// Harnesses lists the harnesses the index reads (default: every
+	// registered reader: claude, codex, pi, gemini, opencode, hermes).
+	Harnesses []string `toml:"harnesses,omitempty"`
+	// HookSweep lets the asynchronous Claude SessionEnd hook index its own
+	// transcript inline, within the interactive budget (default true). Off,
+	// the hook only queues the file for the next sweep. The synchronous
+	// Stop hook never sweeps: it appends one queue line and returns.
+	HookSweep *bool `toml:"hook_sweep,omitempty"`
+	// RemoteCards allows conversation-derived cards (titles, hints, tags,
+	// 200-character previews, derived summaries; never bodies or paths) to
+	// cross the SSH boundary: `recall export` on this machine and `recall
+	// pull`/`recall import` into it (default false). The federated query
+	// (`recall search --remote`) never depends on it: it stores nothing.
+	RemoteCards *bool `toml:"remote_cards,omitempty"`
+	// BackfillOnEnable runs one bounded background pass, from the
+	// notify-daemon's poll loop, the first time recall is enabled with an
+	// empty index or a never-finished initial backfill (default true;
+	// issue #2329). It throttles instead of refusing under load, unlike
+	// the manual `recall backfill`, which still refuses without --force.
+	BackfillOnEnable *bool `toml:"backfill_on_enable,omitempty"`
+}
+
+// Recall defaults.
+const (
+	DefaultRecallMaxLoadAvg      = 4.0
+	DefaultRecallKeepMissingDays = 30
+	DefaultRecallPerSourceMB     = 64
+)
+
+// GetEnabled reports whether the recall index is switched on (default false).
+func (r RecallSettings) GetEnabled() bool {
+	return r.Enabled != nil && *r.Enabled
+}
+
+// GetHarnesses returns the harness names to index, lower-cased and
+// trimmed; nil means every registered reader.
+func (r RecallSettings) GetHarnesses() []string {
+	var out []string
+	for _, h := range r.Harnesses {
+		if h = strings.ToLower(strings.TrimSpace(h)); h != "" {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+// GetRemoteCards reports whether cards may cross the SSH boundary
+// (default false).
+func (r RecallSettings) GetRemoteCards() bool {
+	return r.RemoteCards != nil && *r.RemoteCards
+}
+
+// GetHookSweep reports whether the SessionEnd hook indexes its transcript
+// inline (default true).
+func (r RecallSettings) GetHookSweep() bool {
+	return r.HookSweep == nil || *r.HookSweep
+}
+
+// GetBackfillOnEnable reports whether the daemon runs the one-time
+// background initial backfill (default true).
+func (r RecallSettings) GetBackfillOnEnable() bool {
+	return r.BackfillOnEnable == nil || *r.BackfillOnEnable
+}
+
+// GetMaxLoadAvg returns the load gate threshold (default 4.0).
+func (r RecallSettings) GetMaxLoadAvg() float64 {
+	if r.MaxLoadAvg == nil {
+		return DefaultRecallMaxLoadAvg
+	}
+	return *r.MaxLoadAvg
+}
+
+// GetTextTier returns "clipped" unless "full" is configured.
+func (r RecallSettings) GetTextTier() string {
+	if strings.EqualFold(strings.TrimSpace(r.TextTier), "full") {
+		return "full"
+	}
+	return "clipped"
+}
+
+// GetKeepMissingDays returns the tombstone retention (default 30).
+func (r RecallSettings) GetKeepMissingDays() int {
+	if r.KeepMissingDays == nil || *r.KeepMissingDays < 0 {
+		return DefaultRecallKeepMissingDays
+	}
+	return *r.KeepMissingDays
+}
+
+// GetPerSourceMB returns the per-sweep per-source cap (default 64).
+func (r RecallSettings) GetPerSourceMB() int {
+	if r.PerSourceMB == nil || *r.PerSourceMB < 0 {
+		return DefaultRecallPerSourceMB
+	}
+	return *r.PerSourceMB
+}
+
 // ToolDef defines a custom AI tool
 type ToolDef struct {
 	// Command is the shell command to run
@@ -2462,6 +3697,11 @@ type ToolDef struct {
 
 	// Icon is the emoji/symbol to display
 	Icon string `toml:"icon,omitempty"`
+
+	// Color is an optional lipgloss color value (hex like "#ff9e64" or an
+	// ANSI index like "208") the TUI paints this tool's name with. Empty
+	// keeps the default dim text color.
+	Color string `toml:"color,omitempty"`
 
 	// BusyPatterns are strings that indicate the tool is busy
 	BusyPatterns []string `toml:"busy_patterns,omitempty"`
@@ -2562,10 +3802,45 @@ type MCPDef struct {
 	// Example: { Authorization = "Bearer token123" }
 	Headers map[string]string `toml:"headers,omitempty"`
 
+	// OAuth holds OAuth client parameters for HTTP/SSE MCPs whose server
+	// requires a pre-registered client (Claude Code's `claude mcp add
+	// --client-id ... --callback-port ...`). Written as the "oauth" object of
+	// the generated Claude MCP config. Issue #2552.
+	OAuth *MCPOAuthConfig `toml:"oauth,omitempty"`
+
 	// Server defines how to auto-start an HTTP MCP server process
 	// When set, agent-deck will start the server before connecting via HTTP
 	// This is optional - you can also connect to externally managed servers
 	Server *HTTPServerConfig `toml:"server,omitempty"`
+}
+
+// MCPOAuthConfig is the [mcps.NAME.oauth] table. Field names mirror the
+// "oauth" object Claude Code reads from .mcp.json / ~/.claude.json. The
+// client secret is deliberately absent: Claude Code keeps it in the system
+// keychain, never in a config file.
+type MCPOAuthConfig struct {
+	// ClientID is the pre-registered OAuth client id.
+	ClientID string `toml:"client_id,omitempty" json:"clientId,omitempty"`
+
+	// CallbackPort fixes the local redirect port when the client was
+	// registered with a specific redirect URI.
+	CallbackPort int `toml:"callback_port,omitzero" json:"callbackPort,omitempty"`
+
+	// AuthServerMetadataURL overrides OAuth authorization server discovery
+	// (must be https).
+	AuthServerMetadataURL string `toml:"auth_server_metadata_url,omitempty" json:"authServerMetadataUrl,omitempty"`
+
+	// Scopes is the space separated scope string to request.
+	Scopes string `toml:"scopes,omitempty" json:"scopes,omitempty"`
+}
+
+// claudeOAuth returns the oauth object to emit, or nil when nothing is set.
+func (o *MCPOAuthConfig) claudeOAuth() *MCPOAuthConfig {
+	if o == nil || *o == (MCPOAuthConfig{}) {
+		return nil
+	}
+	c := *o
+	return &c
 }
 
 // GetStartupTimeout returns the startup timeout in milliseconds, defaulting to 5000ms
@@ -2674,6 +3949,15 @@ type TmuxSettings struct {
 	// Default: true (nil = use default true, preserves pre-#730 behavior)
 	Mouse *bool `toml:"mouse,omitempty"`
 
+	// IndicZeroWidthMarks gives Indic spacing vowel signs (ा ि ी ो) zero width
+	// on the tmux server so glibc tmux (Linux packages) lays out Hindi,
+	// Bengali or Tamil text the way Claude Code does (#2334). It aligns
+	// Claude Code but misaligns Codex, the shell and vim for Indic text, it
+	// applies to the whole tmux server (the user's default one unless
+	// socket_name is set), and it needs tmux >= 3.6. Turning it back off
+	// removes exactly the entries agent-deck added. Default: false.
+	IndicZeroWidthMarks bool `toml:"indic_zero_width_marks,omitempty"`
+
 	// LaunchInUserScope starts new tmux servers via `systemd-run --user --scope`
 	// so the tmux server lives under the user's systemd manager instead of the
 	// current login session scope. This keeps tmux alive when an SSH session
@@ -2688,9 +3972,10 @@ type TmuxSettings struct {
 
 	// LaunchAs selects the spawn form for new tmux servers (v1.7.21+).
 	// Valid values (case-insensitive, whitespace-trimmed):
-	//   "scope"   — systemd-run --user --scope (PR #467 legacy behavior)
+	//   "scope"   — systemd-run --user --scope with KillMode=none, so
+	//               stopping one per-session scope cannot kill a shared server.
 	//   "service" — systemd-run --user --unit <NAME>.service with
-	//               Type=forking + Restart=on-failure. Adds auto-restart
+	//               Type=forking + Restart=on-failure + KillMode=none. Adds auto-restart
 	//               if the tmux daemon dies unexpectedly (OOM, SIGKILL,
 	//               kernel signal). Opt-in defense-in-depth.
 	//   "direct"  — plain `tmux new-session` (no systemd isolation).
@@ -2703,8 +3988,9 @@ type TmuxSettings struct {
 	// LaunchInUserScope) so a config typo doesn't silently opt the user
 	// onto an unintended spawn path.
 	//
-	// This is additive — v1.7.20 users get zero behavior change until
-	// they explicitly set launch_as.
+	// Both systemd forms preserve SSH/logout isolation while avoiding a
+	// control-group teardown of a shared tmux server. This changes only units
+	// spawned after #2219; existing transient units are never migrated.
 	LaunchAs *string `toml:"launch_as,omitempty"`
 
 	// WindowStyleOverride sets the tmux window-style (and window-active-style) for
@@ -2760,6 +4046,42 @@ type TmuxSettings struct {
 	// Precedence at Instance creation: CLI flag `--tmux-socket <name>`
 	// wins, else this config value, else empty.
 	SocketName string `toml:"socket_name,omitempty"`
+
+	// Binaries maps a tmux -L socket name to the tmux binary agent-deck runs
+	// for every call on that socket: commands, new-session, attach, control
+	// pipes and the version probe. Sockets not listed, and the default
+	// server, run the "tmux" on PATH. A tmux client only talks to a server
+	// of its own version, so this lets a newer tmux (e.g. 3.6 for
+	// indic_zero_width_marks) serve one socket while older servers keep
+	// running, without changing PATH. Move a session onto that socket with
+	// `agent-deck session set <id> tmux-socket <name>` while it is stopped.
+	// Example:
+	//   [tmux]
+	//   socket_name = "deck36"
+	//   [tmux.binaries]
+	//   deck36 = "/usr/local/opt/tmux-3.6/bin/tmux"
+	// Default: empty (every socket runs "tmux" from PATH).
+	Binaries map[string]string `toml:"binaries,omitempty"`
+}
+
+// misnamedTmuxBinarySockets returns, sorted, the [tmux.binaries] sockets
+// whose binary file is not named exactly "tmux". Such a binary still runs
+// agent-deck's own calls, but the socket's panes get its directory first on
+// PATH so that a bare "tmux" there (an agent, a hook) is the client that
+// matches the server; under another name that lookup finds the older tmux.
+func misnamedTmuxBinarySockets(binaries map[string]string) []string {
+	var out []string
+	for socket, bin := range binaries {
+		bin = strings.TrimSpace(bin)
+		if strings.TrimSpace(socket) == "" || bin == "" {
+			continue
+		}
+		if filepath.Base(bin) != "tmux" {
+			out = append(out, socket)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // GetInjectStatusLine returns whether to inject status line, defaulting to true.
@@ -2959,6 +4281,12 @@ type DockerSettings struct {
 
 	// AutoCleanup removes sandbox containers on session kill (default: true).
 	AutoCleanup *bool `toml:"auto_cleanup,omitempty"`
+
+	// SeedCredentialsFromKeychain copies the macOS Keychain Claude token into a
+	// sandbox that has no credential file yet (default: false). Off, the sandbox
+	// logs in on its own; on, the one-time copy forks the host's OAuth refresh
+	// chain once (#2153).
+	SeedCredentialsFromKeychain bool `toml:"seed_credentials_from_keychain,omitempty"`
 }
 
 // GetAutoCleanup returns whether to auto-remove sandbox containers, defaulting to true.
@@ -3079,6 +4407,38 @@ type StatusSettings struct {
 	//	[status]
 	//	shell_running_indicator = true
 	ShellRunningIndicator bool `toml:"shell_running_indicator"`
+
+	// BackgroundShellHold is how long after its launch a run_in_background
+	// shell keeps a finished Claude turn running (A5), as a Go duration
+	// such as "3m" or "30m". Unset: DefaultBackgroundShellHold (3m). "0"
+	// restores the earlier rule: the footer's shell counter alone keeps the
+	// session running, however old the shell. Past the hold the session
+	// reads waiting even if the shell is a build that is still running.
+	//
+	//	[status]
+	//	background_shell_hold = "30m"
+	BackgroundShellHold string `toml:"background_shell_hold,omitempty"`
+}
+
+// GetBackgroundShellHold returns BackgroundShellHold. Unset means
+// DefaultBackgroundShellHold; a value that is not a duration, or is
+// negative, returns an error and DefaultBackgroundShellHold.
+func (s StatusSettings) GetBackgroundShellHold() (time.Duration, error) {
+	raw := strings.TrimSpace(s.BackgroundShellHold)
+	if raw == "" {
+		return DefaultBackgroundShellHold, nil
+	}
+	if raw == "0" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return DefaultBackgroundShellHold, fmt.Errorf("[status] background_shell_hold %q is not a duration (e.g. \"3m\", \"0\")", raw)
+	}
+	if d < 0 {
+		return DefaultBackgroundShellHold, fmt.Errorf("[status] background_shell_hold %q is negative", raw)
+	}
+	return d, nil
 }
 
 // MaintenanceSettings controls the automatic maintenance worker
@@ -3101,7 +4461,7 @@ type DisplaySettings struct {
 	// DefaultFilter sets the initial status filter when the TUI opens.
 	// Valid values: "" (all, default), "active" (hides error/stopped),
 	// "running", "waiting", "idle", "error".
-	// If set to "active" and no non-error sessions exist, falls back to showing all.
+	// The active filter remains selected even when no sessions match.
 	DefaultFilter string `toml:"default_filter,omitempty"`
 
 	// ActiveFilterLabel sets the label shown on the filter pill when the active
@@ -3117,6 +4477,12 @@ type DisplaySettings struct {
 	// Valid statuses: "running", "waiting", "idle", "error", "starting",
 	// "stopped".
 	ActiveFilterExcludes []string `toml:"active_filter_excludes,omitempty"`
+
+	// HideDefaultToolBadge drops the session row's tool badge when the
+	// session runs default_tool (claude when default_tool is unset), so only
+	// sessions on another tool are labelled. Default: false (every row shows
+	// its tool).
+	HideDefaultToolBadge bool `toml:"hide_default_tool_badge,omitempty"`
 
 	// IncludeCwdPrefix controls whether the terminal/pane title is prefixed
 	// with "[<cwd-basename>]" (e.g. "[my-project] feature work"). Default true
@@ -3299,6 +4665,12 @@ func LoadUserConfig() (*UserConfig, error) {
 
 	userConfigCacheMu.Lock()
 	defer userConfigCacheMu.Unlock()
+	// Every (re)load re-applies the [macapp] status_events gate, so an
+	// edited config.toml turns the session.status tap on or off live.
+	defer func() {
+		applyStatusBusGate(userConfigCache)
+		applyBackgroundShellHold(userConfigCache)
+	}()
 
 	// Re-check under write lock: another goroutine may have refreshed the
 	// cache to match currentMtime between our RLock drop and Lock acquire.
@@ -3315,13 +4687,18 @@ func LoadUserConfig() (*UserConfig, error) {
 		return userConfigCache, nil
 	}
 
-	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+	info, statErr := os.Stat(configPath)
+	if os.IsNotExist(statErr) {
 		fresh := cloneDefaultUserConfig()
 		userConfigCache = &fresh
 		userConfigCacheMtime = time.Time{}
 		SetGroupSortMode(fresh.GetGroupSort())
 		userConfigCacheErr = nil
 		return userConfigCache, nil
+	}
+	if statErr == nil {
+		// LOC-8: warn (never refuse) when someone else could have written it.
+		warnUserConfigPerms(configPath, info)
 	}
 
 	var config UserConfig
@@ -3348,6 +4725,13 @@ func LoadUserConfig() (*UserConfig, error) {
 	}
 
 	normalizeUIHiddenTools(&config.UI, config.Tools)
+	normalizeUIPreviewFields(&config.UI)
+	for _, socket := range misnamedTmuxBinarySockets(config.Tmux.Binaries) {
+		registryLog.Warn("tmux.binaries entry is not named tmux",
+			"socket", socket,
+			"path", strings.TrimSpace(config.Tmux.Binaries[socket]),
+			"hint", "name the file exactly tmux, in a directory of its own: agent-deck puts that directory first on PATH in the socket's panes, so a bare tmux there reaches this server")
+	}
 
 	// Keep the in-group sort mode in lockstep with the loaded config. This is
 	// the single funnel for TUI, web, and CLI; ReloadUserConfig routes through
@@ -3393,6 +4777,12 @@ func SaveUserConfigWithIntent(config *UserConfig, allowSectionDrop bool) error {
 	configPath, err := GetUserConfigPath()
 	if err != nil {
 		return fmt.Errorf("failed to get config path: %w", err)
+	}
+
+	// The first config.toml this release writes records a new install
+	// before the file exists (install_kind.go).
+	if !pathPresent(configPath) {
+		recordInstallKindBeforeCreate()
 	}
 
 	// Ensure directory exists
@@ -3506,7 +4896,7 @@ func guardConfigSectionDrop(configPath string, newContent []byte) error {
 func countFunctionalMCPs(mcps map[string]MCPDef) int {
 	count := 0
 	for _, m := range mcps {
-		if m.Command != "" || m.URL != "" || len(m.Args) > 0 || len(m.Env) > 0 || m.Description != "" || len(m.Headers) > 0 || m.Transport != "" || m.Server != nil {
+		if m.Command != "" || m.URL != "" || len(m.Args) > 0 || len(m.Env) > 0 || m.Description != "" || len(m.Headers) > 0 || m.Transport != "" || m.Server != nil || m.OAuth != nil {
 			count++
 		}
 	}
@@ -3630,6 +5020,20 @@ func IsCodexCompatible(toolName string) bool {
 	return false
 }
 
+// IsDevinCompatible returns true if the tool is "devin" or a custom tool
+// whose underlying command is "devin". Use this for capability gates where
+// custom tools wrapping Devin should inherit Devin's composer behavior
+// (e.g. its wider input-coalescing window — see preEnterDelayForTool).
+func IsDevinCompatible(toolName string) bool {
+	if toolName == "devin" {
+		return true
+	}
+	if def := GetToolDef(toolName); def != nil {
+		return strings.EqualFold(strings.TrimSpace(def.CompatibleWith), "devin") || isDevinCommand(def.Command)
+	}
+	return false
+}
+
 // isShellBinary returns true if cmd is a known interactive shell process name.
 // Used to distinguish "shell at a prompt" from "shell running a foreground command"
 // (e.g. "node" from "yarn dev", "java" from "mvn spring-boot:run").
@@ -3683,6 +5087,10 @@ func isClaudeCommand(command string) bool {
 
 func isCodexCommand(command string) bool {
 	return isCommand(command, "codex")
+}
+
+func isDevinCommand(command string) bool {
+	return isCommand(command, "devin")
 }
 
 func isCommand(command, wantBase string) bool {
@@ -3788,6 +5196,10 @@ func GetToolCommand(toolName string) string {
 		if config.Hermes.Command != "" {
 			return config.Hermes.Command
 		}
+	case "omp":
+		if config.OMP.Command != "" {
+			return config.OMP.Command
+		}
 	case "deepseek":
 		// The tool is named for the vendor; the binary it launches is `dsh`.
 		// Returning the tool name here (the default tail of this function)
@@ -3812,12 +5224,9 @@ func GetToolCommand(toolName string) string {
 	return toolName
 }
 
-func isBuiltinToolName(toolName string) bool {
-	return currentRegistry().IsBuiltin(toolName)
-}
-
 // GetToolIcon returns the icon for a tool (custom or built-in)
 func GetToolIcon(toolName string) string {
+	toolName = CanonicalToolName(toolName)
 	// Check custom tools first
 	if def := GetToolDef(toolName); def != nil && def.Icon != "" {
 		return def.Icon
@@ -3837,6 +5246,8 @@ func GetToolIcon(toolName string) string {
 		return "🐙"
 	case "crush":
 		return "💘"
+	case "muse":
+		return "🔮"
 	case "cursor":
 		return "📝"
 	case "hermes":
@@ -3845,24 +5256,13 @@ func GetToolIcon(toolName string) string {
 		return "🐋"
 	case "pi":
 		return "π"
+	case "omp":
+		return "⌥"
 	case "shell":
 		return "🐚"
 	default:
 		return "🐚"
 	}
-}
-
-// GetToolBusyPatterns returns busy patterns for a tool (custom + built-in)
-func GetToolBusyPatterns(toolName string) []string {
-	var patterns []string
-
-	// Add custom patterns first
-	if def := GetToolDef(toolName); def != nil {
-		patterns = append(patterns, def.BusyPatterns...)
-	}
-
-	// Built-in patterns are handled by the detector
-	return patterns
 }
 
 // MergeToolPatterns returns merged RawPatterns for a tool, combining built-in
@@ -3872,6 +5272,14 @@ func GetToolBusyPatterns(toolName string) []string {
 func MergeToolPatterns(toolName string) *tmux.RawPatterns {
 	defaults := tmux.DefaultRawPatterns(toolName)
 	toolDef := GetToolDef(toolName)
+	// Keep in sync with patternOnlyOverride in toolregistry.go, which skips the shadow warning for these entries.
+	if toolDef == nil && defaults != nil {
+		if config, err := LoadUserConfig(); err == nil && config != nil {
+			if configured, ok := config.Tools[toolName]; ok {
+				toolDef = &configured
+			}
+		}
+	}
 
 	// No defaults and no config entry: nothing to do
 	if defaults == nil && toolDef == nil {
@@ -3942,6 +5350,32 @@ func GetWebTrustedDomains() []string {
 		return nil
 	}
 	return NormalizeTrustedDomains(config.Web.TrustedDomains)
+}
+
+// GetWebFileLinkRoots returns the expanded, absolute `[web].file_link_roots`
+// directories (issue #2676). nil means file links are off.
+func GetWebFileLinkRoots() []string {
+	roots, _ := GetWebFileLinkRootsChecked()
+	return roots
+}
+
+// GetWebFileLinkRootsChecked is GetWebFileLinkRoots plus the entries it
+// refused and why (an unset $VAR, `/`, the home directory, a relative path).
+func GetWebFileLinkRootsChecked() ([]string, []filelinks.Refused) {
+	config, err := LoadUserConfig()
+	if err != nil || config == nil {
+		return nil, nil
+	}
+	return filelinks.CheckRoots(config.Web.FileLinkRoots, ExpandPath)
+}
+
+// GetWebAllowedHosts returns the configured Host allowlist additions.
+func GetWebAllowedHosts() []string {
+	config, err := LoadUserConfig()
+	if err != nil || config == nil {
+		return nil
+	}
+	return config.Web.AllowedHosts
 }
 
 // GetWebConfirmLinkOpen reports whether the web terminal confirms before
@@ -4318,15 +5752,6 @@ func GetMaintenanceSettings() MaintenanceSettings {
 	return config.Maintenance
 }
 
-// GetStatusSettings returns status detection settings with defaults applied.
-func GetStatusSettings() StatusSettings {
-	config, err := LoadUserConfig()
-	if err != nil || config == nil {
-		return StatusSettings{}
-	}
-	return config.Status
-}
-
 // GetDockerSettings returns docker sandbox settings with defaults applied.
 func GetDockerSettings() DockerSettings {
 	config, err := LoadUserConfig()
@@ -4343,6 +5768,16 @@ func GetTmuxSettings() TmuxSettings {
 		return TmuxSettings{}
 	}
 	return config.Tmux
+}
+
+// SharedViewOverrides is the user's [tmux.options] map for the attach paths
+// that have no Instance at hand (the web bridge, the embedded terminal,
+// Shift+Enter): tmux.ApplySharedViewSize honours the same window-size and
+// aggressive-resize overrides there that Session.Start and AttachWithOptions
+// take from Instance.buildTmuxOptionOverrides, so a user who opted out of
+// the `latest` policy with `window-size = "smallest"` keeps it on every attach.
+func SharedViewOverrides() map[string]string {
+	return maps.Clone(GetTmuxSettings().Options)
 }
 
 // TerminalSettings controls outer-terminal chrome agent-deck writes directly
@@ -4466,6 +5901,7 @@ func CreateExampleConfig() error {
 	if _, err := os.Stat(configPath); err == nil {
 		return nil
 	}
+	recordInstallKindBeforeCreate()
 
 	exampleConfig := `# Agent Deck User Configuration
 # This file is loaded on startup. Edit to customize tools and MCPs.
@@ -4626,12 +6062,25 @@ remove_orphans = true
 # Update settings
 # Controls automatic update checking and installation
 [updates]
-# Automatically install updates without prompting (default: false)
+# Offer to install an available update when the TUI starts (default: false)
 # auto_update = true
+# Install available updates unattended: from the TUI's periodic check and
+# from the "agent-deck update --install-timer" job (default: true)
+auto_install = true
+# Restart agent-deck in place once a newer binary is installed (default: true)
+auto_restart = true
 # Enable update checks on startup (default: true)
 check_enabled = true
-# How often to check for updates in hours (default: 24)
-check_interval_hours = 24
+# How often to poll GitHub for a new release, e.g. "90s", "2m" (default: "90s").
+# Polls are conditional (ETag) so an unchanged answer (304) is nearly free.
+# check_interval = "90s"
+# Push the controller's binary onto every configured remote after an
+# install, instead of nudging remotes to pull it themselves (default: false)
+# sweep_remotes = true
+# Install and heal the update timer automatically (unattended runs, the TUI,
+# the notify daemon, remote update); false leaves it to --install-timer
+# (default: true)
+# manage_timer = false
 # Show update notification in CLI commands, not just TUI (default: true)
 notify_in_cli = true
 
@@ -4660,11 +6109,12 @@ auto_cleanup = true
 #   {branch}         -> sanitized (human-friendly, may collide)
 #   {branch-escaped} -> URL-escaped (collision-resistant, reversible)
 # path_template = "../worktrees/{repo-name}/{branch}"
-# Whether .agent-deck/worktree-setup.sh and worktree-destruction.sh may run
-# automatically: "prompt" (default, ask once per repo root + script content,
-# re-asks if the content changes), "always" (run unconditionally, pre-gate
-# behavior), or "never" (block them entirely). Non-interactive callers under
-# "prompt" fail closed instead of hanging; see --allow-repo-scripts for CI.
+# Whether .agent-deck/worktree-setup.sh and worktree-destruction.sh may run:
+# "prompt" (default: ask before a hook's first run and after it changes; the
+# approval covers its content, resolved path and interpreter), "never" (block
+# them), or "always" (run every hook without asking; risky unless you own every
+# repo you open). Without a terminal "prompt" skips the hook with a notice;
+# approve with "agent-deck worktree trust-hooks <repo>" or use --run-hooks.
 # run_repo_scripts = "prompt"
 
 # Default scope for MCP operations: "local", "global", or "user"
@@ -4795,6 +6245,17 @@ auto_cleanup = true
 # headers = { Authorization = "Bearer your-token-here", "X-API-Key" = "your-api-key" }
 # description = "HTTP MCP with auth headers"
 
+# Example: HTTP MCP that needs a pre-registered OAuth client
+# (same as: claude mcp add --transport http --client-id ...; Claude only)
+# [mcps.work-api]
+# url = "https://mcp.example.com/mcp"
+# transport = "http"
+# [mcps.work-api.oauth]
+#   client_id = "your-client-id"
+#   callback_port = 8080                 # optional fixed redirect port
+#   # auth_server_metadata_url = "https://auth.example.com/.well-known/oauth-authorization-server"
+#   # scopes = "read write"
+
 # Example: SSE MCP server
 # [mcps.remote-sse]
 # url = "https://api.example.com/mcp/sse"
@@ -4826,6 +6287,7 @@ auto_cleanup = true
 # Each tool can have:
 #   command      - The shell command to run
 #   icon         - Emoji/symbol shown in the UI
+#   color        - Optional lipgloss color for the tool name (hex like "#ff9e64" or ANSI index)
 #   compatible_with - Built-in compatibility to mirror ("claude" or "codex")
 #   busy_patterns - Strings that indicate the tool is processing
 
@@ -4893,7 +6355,42 @@ func GetAvailableMCPs() map[string]MCPDef {
 	if err != nil || config == nil {
 		return make(map[string]MCPDef)
 	}
-	return config.MCPs
+	return withRecallMCP(config)
+}
+
+// RecallMCPName is the built-in MCP entry for `agent-deck recall mcp`.
+const RecallMCPName = "recall"
+
+// RecallMCPDef is the definition `mcp list` shows and `mcp attach` writes
+// while [recall] enabled = true: this binary serving the index over stdio.
+// A user-defined [mcps.recall] wins over it. The command follows the hook
+// rule (hookExecutablePath): an installed binary is pinned by its stable
+// install path, an unpinnable dev build keeps the bare "agent-deck", so
+// the project's .mcp.json never names a build directory that goes away.
+func RecallMCPDef() MCPDef {
+	command := "agent-deck"
+	if exe, err := hookExecutablePath(); err == nil && exe != "" {
+		command = exe
+	}
+	return MCPDef{Command: command, Args: []string{"recall", "mcp"},
+		Description: "Recall: search, show and hand over every conversation on this machine (built-in; docs/recall.md)"}
+}
+
+// withRecallMCP returns the configured MCPs plus the built-in recall entry
+// when the index is enabled; the config's own map is never mutated.
+func withRecallMCP(config *UserConfig) map[string]MCPDef {
+	if !config.Recall.GetEnabled() {
+		return config.MCPs
+	}
+	if _, defined := config.MCPs[RecallMCPName]; defined {
+		return config.MCPs
+	}
+	out := make(map[string]MCPDef, len(config.MCPs)+1)
+	for k, v := range config.MCPs {
+		out[k] = v
+	}
+	out[RecallMCPName] = RecallMCPDef()
+	return out
 }
 
 // GetAvailableMCPNames returns sorted list of MCP names from config.toml
@@ -5039,6 +6536,7 @@ func GetPluginDef(name string) *PluginDef {
 
 // CostsSettings configures cost tracking, budgets, and pricing overrides.
 type CostsSettings struct {
+	Enabled       *bool  `toml:"enabled,omitempty"`
 	Currency      string `toml:"currency,omitempty"`
 	Timezone      string `toml:"timezone,omitempty"`
 	RetentionDays int    `toml:"retention_days,omitzero"`
@@ -5052,13 +6550,42 @@ type CostsSettings struct {
 	CostLineHideWhenZero *bool           `toml:"cost_line_hide_when_zero,omitempty"`
 	Budgets              BudgetSettings  `toml:"budgets,omitempty"`
 	Pricing              PricingSettings `toml:"pricing,omitempty"`
+	// RunBudget holds the per-run defaults every new autonomous run (a
+	// goal started by skills/agent-deck/scripts/goal/goal.sh) starts with.
+	RunBudget RunBudgetSettings `toml:"run_budget,omitempty"`
+}
+
+// RunBudgetSettings are per-run caps for autonomous runs. 0 means no cap
+// (max_turns 0 keeps the goal's own default of 24 cycles). A goal's
+// --max-tokens/--max-turns/--max-minutes flags override them.
+type RunBudgetSettings struct {
+	MaxTokens  int `toml:"max_tokens,omitzero"`
+	MaxTurns   int `toml:"max_turns,omitzero"`
+	MaxMinutes int `toml:"max_minutes,omitzero"`
 }
 
 // ProfileCosts holds per-profile overrides for cost-related settings.
 // Pointer fields use the same fall-through semantics as CostsSettings.
 type ProfileCosts struct {
+	Enabled              *bool   `toml:"enabled,omitempty"`
 	CostLineTemplate     *string `toml:"cost_line_template,omitempty"`
 	CostLineHideWhenZero *bool   `toml:"cost_line_hide_when_zero,omitempty"`
+}
+
+// ResolveCostTrackingEnabled applies profile, global, then default-on settings.
+func ResolveCostTrackingEnabled(cfg *UserConfig, profile string) bool {
+	if cfg == nil {
+		return true
+	}
+	if p, ok := cfg.Profiles[profile]; ok && p.Costs != nil && p.Costs.Enabled != nil {
+		return *p.Costs.Enabled
+	}
+	return cfg.Costs.Enabled == nil || *cfg.Costs.Enabled
+}
+
+func GetCostTrackingEnabled(profile string) bool {
+	cfg, _ := LoadUserConfig()
+	return ResolveCostTrackingEnabled(cfg, GetEffectiveProfile(profile))
 }
 
 // defaultCostLineTemplate is the hardcoded fallback that preserves the
@@ -5112,6 +6639,9 @@ func ResolveCostLineTemplate(cfg *UserConfig, profile string) (template string, 
 }
 
 type BudgetSettings struct {
+	// Enforce makes the limits refuse agent-initiated sends and wakes. Off by
+	// default: the limits are then shown in the cost dashboard only.
+	Enforce      bool                     `toml:"enforce,omitempty"`
 	DailyLimit   float64                  `toml:"daily_limit,omitzero"`
 	WeeklyLimit  float64                  `toml:"weekly_limit,omitzero"`
 	MonthlyLimit float64                  `toml:"monthly_limit,omitzero"`
@@ -5297,6 +6827,29 @@ type WatcherSettings struct {
 
 	// Alerts configures the health alerts bridge (opt-in). See WatcherAlertsSettings.
 	Alerts WatcherAlertsSettings `toml:"alerts,omitempty"`
+
+	// DeliveryDeadline bounds how long a routed event waits in the send
+	// queue for its conductor (stopped, busy, or a composer holding a draft)
+	// before its delivery fails, as a Go duration such as "72h". Unset or
+	// "0": it waits until the conductor takes it (#2537).
+	DeliveryDeadline string `toml:"delivery_deadline,omitempty"`
+}
+
+// GetDeliveryDeadline returns DeliveryDeadline, 0 for no deadline. A value
+// that is not a duration is reported and means no deadline.
+func (w WatcherSettings) GetDeliveryDeadline() (time.Duration, error) {
+	raw := strings.TrimSpace(w.DeliveryDeadline)
+	if raw == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, err
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("delivery_deadline %q is negative", raw)
+	}
+	return d, nil
 }
 
 // GetMaxEventsPerWatcher returns the max events per watcher (default: 500).

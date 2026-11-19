@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -34,6 +36,7 @@ func (s *Server) handleSessionsCollection(w http.ResponseWriter, r *http.Request
 		// even when the TUI's inotify-driven snapshot has fallen out of date.
 		// See snapshot_hook_refresh.go for the rationale.
 		refreshSnapshotHookStatuses(snapshot, s.hookStatusLoader)
+		applySnapshotAnnotations(snapshot, s.annotationLoader)
 		resp := sessionsListResponse{
 			Sessions: make([]*MenuSession, 0),
 			Groups:   make([]*MenuGroup, 0),
@@ -72,9 +75,35 @@ func (s *Server) handleSessionsCollection(w http.ResponseWriter, r *http.Request
 			writeAPIError(w, http.StatusServiceUnavailable, ErrCodeNotImplemented, "mutations not available")
 			return
 		}
-		if err := session.ValidateLaunchReasoningEffort(req.Tool, req.ReasoningEffort); err != nil {
+		if err := session.ValidateLaunchReasoningEffortForModel(req.Tool, req.ModelID, req.ReasoningEffort); err != nil {
 			writeAPIError(w, http.StatusBadRequest, ErrCodeBadRequest, err.Error())
 			return
+		}
+		if req.CreateDir {
+			preview, err := inspectSessionDirectory(req.ProjectPath)
+			if err != nil {
+				writeAPIError(w, http.StatusBadRequest, ErrCodeBadRequest, err.Error())
+				return
+			}
+			for _, dir := range preview.Missing {
+				if req.CreateDirPaths != nil && !slices.Contains(req.CreateDirPaths, dir) {
+					writeAPIError(w, http.StatusConflict, ErrCodeBadRequest, "directory list changed; review the folders and select Create this folder again")
+					return
+				}
+			}
+			// Create only the inspected parents. If an earlier parent disappears
+			// during creation, fail rather than recreate unlisted directories.
+			for _, dir := range preview.Missing {
+				if err := os.Mkdir(dir, 0o755); err != nil {
+					info, statErr := os.Stat(dir)
+					if !os.IsExist(err) || statErr != nil || !info.IsDir() {
+						writeAPIError(w, http.StatusBadRequest, ErrCodeBadRequest, fmt.Sprintf("failed to create directory %s: %v", dir, err))
+						return
+					}
+				}
+			}
+			// Keep the original input for the mutator's expansion. Re-expanding
+			// the resolved path would interpret literal dollars in env values.
 		}
 		sessionID, err := s.mutator.CreateSession(req.Title, req.Tool, req.ProjectPath, req.GroupPath, req.ModelID, req.ReasoningEffort)
 		if err != nil {
@@ -224,6 +253,8 @@ func (s *Server) handleSessionByAction(w http.ResponseWriter, r *http.Request) {
 			}
 			s.notifyMenuChanged()
 			writeJSON(w, http.StatusOK, SessionActionResponse{SessionID: sessionID})
+		case "move":
+			s.handleSessionMove(w, r, sessionID)
 		case "unarchive":
 			if err := s.mutator.UnarchiveSession(sessionID); err != nil {
 				if strings.Contains(err.Error(), "not found") {
@@ -352,6 +383,32 @@ func (s *Server) handleSessionPatch(w http.ResponseWriter, r *http.Request, sess
 	})
 }
 
+// handleSessionMove is POST /api/sessions/{id}/move (#2368): the web side of
+// the TUI's M and `agent-deck group move`. Mutation gates, rate limit and the
+// nil-mutator check have already run in handleSessionByAction.
+func (s *Server) handleSessionMove(w http.ResponseWriter, r *http.Request, sessionID string) {
+	var req MoveSessionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeAPIError(w, http.StatusBadRequest, ErrCodeBadRequest, "invalid request body")
+		return
+	}
+	movedTo, restartRequired, err := s.mutator.MoveSessionToGroup(sessionID, strings.TrimSpace(req.GroupPath))
+	if err != nil {
+		if errors.Is(err, ErrSessionNotFound) {
+			writeAPIError(w, http.StatusNotFound, ErrCodeNotFound, err.Error())
+			return
+		}
+		writeAPIError(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error())
+		return
+	}
+	s.notifyMenuChanged()
+	writeJSON(w, http.StatusOK, MoveSessionResponse{
+		SessionID:       sessionID,
+		GroupPath:       movedTo,
+		RestartRequired: restartRequired,
+	})
+}
+
 // updatesFromRequest maps the typed request struct to the field/value pairs
 // session.SetField accepts. Only fields whose pointer is non-nil are included
 // — this is how a client signals "leave this field alone" vs "set to empty".
@@ -408,6 +465,7 @@ func (s *Server) handleArchivedSessions(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	refreshSnapshotHookStatuses(snapshot, s.hookStatusLoader)
+	applySnapshotAnnotations(snapshot, s.annotationLoader)
 	resp := archivedSessionsResponse{
 		Sessions: make([]*MenuSession, 0),
 		Profile:  snapshot.Profile,

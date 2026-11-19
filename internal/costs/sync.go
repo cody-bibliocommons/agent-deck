@@ -1,50 +1,25 @@
 package costs
 
 import (
-	"bufio"
-	"encoding/json"
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/recall/reader"
+	"github.com/asheshgoplani/agent-deck/internal/sandboxguard"
 	"github.com/google/uuid"
 )
 
-// TranscriptEntry represents one line of a Claude transcript JSONL file.
-// Handles both "assistant" entries (direct usage) and "progress" entries (subagent usage).
-type TranscriptEntry struct {
-	Type    string `json:"type"`
-	UUID    string `json:"uuid"`
-	Message struct {
-		Model string `json:"model"`
-		Usage struct {
-			InputTokens              int64 `json:"input_tokens"`
-			OutputTokens             int64 `json:"output_tokens"`
-			CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
-			CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
-		} `json:"usage"`
-	} `json:"message"`
-	// Progress entries nest usage inside data.message.message
-	Data      *progressData `json:"data,omitempty"`
-	Timestamp string        `json:"timestamp"` // ISO 8601
-}
-
-type progressData struct {
-	Message struct {
-		Timestamp string `json:"timestamp"`
-		Message   struct {
-			Model string `json:"model"`
-			Usage struct {
-				InputTokens              int64 `json:"input_tokens"`
-				OutputTokens             int64 `json:"output_tokens"`
-				CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
-				CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
-			} `json:"usage"`
-		} `json:"message"`
-	} `json:"message"`
-}
+// Usage extraction is the recall Claude reader's (internal/recall/reader):
+// the transcript is decoded once, with the same decoder that indexes its
+// text, and the usage records land here. `costs sync` still works without
+// the index (it walks the transcript itself), and a recall backfill or
+// sweep hands the same events to ImportUsage for every conversation bound
+// to a deck session, so a 4 GB corpus is not read a second time for costs.
 
 // SyncResult holds the result of a historical sync operation.
 type SyncResult struct {
@@ -67,15 +42,13 @@ type SyncSession struct {
 func SyncFromTranscripts(store *Store, pricer *Pricer, sessions []SyncSession) SyncResult {
 	var result SyncResult
 
-	home, err := os.UserHomeDir()
+	claudeDir, err := sandboxguard.HomeJoin("Claude config dir (~/.claude)", ".claude")
 	if err != nil {
 		result.Errors = append(result.Errors, fmt.Sprintf("get home dir: %v", err))
 		return result
 	}
 
-	// Collect existing event IDs to avoid duplicates
-	existing := make(map[string]bool)
-
+	importer := NewUsageImporter(store, pricer)
 	for _, sess := range sessions {
 		if sess.Tool != "claude" || sess.ClaudeSessionID == "" {
 			continue
@@ -85,155 +58,138 @@ func SyncFromTranscripts(store *Store, pricer *Pricer, sessions []SyncSession) S
 
 		// Derive transcript path: ~/.claude/projects/<slugified-path>/<session-id>.jsonl
 		sluggedPath := slugifyProjectPath(sess.ProjectPath)
-		transcriptPath := filepath.Join(home, ".claude", "projects", sluggedPath, sess.ClaudeSessionID+".jsonl")
+		transcriptPath := filepath.Join(claudeDir, "projects", sluggedPath, sess.ClaudeSessionID+".jsonl")
 
 		if _, err := os.Stat(transcriptPath); os.IsNotExist(err) {
 			continue
 		}
 
-		events, errs := parseTranscriptFile(transcriptPath, sess.InstanceID, pricer)
-		result.Errors = append(result.Errors, errs...)
-
-		for _, ev := range events {
-			// Check if we already have this event (by a deterministic ID)
-			dedupKey := fmt.Sprintf("%s_%s", sess.InstanceID, ev.dedupKey)
-			if existing[dedupKey] {
-				result.EventsSkipped++
-				continue
-			}
-
-			// Check if already in database
-			var count int
-			if err := store.db.QueryRow("SELECT COUNT(*) FROM cost_events WHERE id = ?", dedupKey).Scan(&count); err != nil {
-				continue
-			}
-			if count > 0 {
-				result.EventsSkipped++
-				existing[dedupKey] = true
-				continue
-			}
-
-			costEvent := CostEvent{
-				ID:               dedupKey,
-				SessionID:        sess.InstanceID,
-				Timestamp:        ev.timestamp,
-				Model:            ev.model,
-				InputTokens:      ev.inputTokens,
-				OutputTokens:     ev.outputTokens,
-				CacheReadTokens:  ev.cacheReadTokens,
-				CacheWriteTokens: ev.cacheWriteTokens,
-				CostMicrodollars: pricer.ComputeCost(ev.model, ev.inputTokens, ev.outputTokens, ev.cacheReadTokens, ev.cacheWriteTokens),
-			}
-
-			if err := store.WriteCostEvent(costEvent); err != nil {
-				result.Errors = append(result.Errors, fmt.Sprintf("write event: %v", err))
-				continue
-			}
-			existing[dedupKey] = true
-			result.EventsImported++
+		events, err := reader.ScanClaudeUsage(context.Background(), transcriptPath)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("scan %s: %v", transcriptPath, err))
 		}
+		imported, skipped, errs := importer.Import(sess.InstanceID, events)
+		result.EventsImported += imported
+		result.EventsSkipped += skipped
+		result.Errors = append(result.Errors, errs...)
 	}
 
 	return result
 }
 
-type parsedUsage struct {
-	dedupKey         string
-	timestamp        time.Time
-	model            string
-	inputTokens      int64
-	outputTokens     int64
-	cacheReadTokens  int64
-	cacheWriteTokens int64
+// UsageImporter writes reader usage events as cost_events, deduplicated on
+// the record uuid so a re-run (or a recall sweep after a `costs sync`)
+// never double counts.
+type UsageImporter struct {
+	store    *Store
+	pricer   *Pricer
+	existing map[string]bool
 }
 
-func parseTranscriptFile(path, instanceID string, pricer *Pricer) ([]parsedUsage, []string) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, []string{fmt.Sprintf("open %s: %v", path, err)}
-	}
-	defer f.Close()
+// NewUsageImporter returns an importer over store.
+func NewUsageImporter(store *Store, pricer *Pricer) *UsageImporter {
+	return &UsageImporter{store: store, pricer: pricer, existing: map[string]bool{}}
+}
 
-	var results []parsedUsage
-	var errors []string
-
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024) // 10MB max line
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
+// Import writes the events of one deck session. It returns how many were
+// imported, how many already existed, and the write errors.
+func (u *UsageImporter) Import(instanceID string, events []reader.Usage) (imported, skipped int, errs []string) {
+	for _, ev := range events {
+		if ev.In == 0 && ev.Out == 0 {
 			continue
 		}
-
-		var entry TranscriptEntry
-		if err := json.Unmarshal([]byte(line), &entry); err != nil {
-			continue // skip unparseable lines
+		key := ev.UUID
+		if key == "" {
+			key = uuid.NewString()
 		}
-
-		var model string
-		var inputTok, outputTok, cacheRead, cacheWrite int64
-		var tsStr string
-
-		switch entry.Type {
-		case "assistant":
-			usage := entry.Message.Usage
-			model = entry.Message.Model
-			inputTok = usage.InputTokens
-			outputTok = usage.OutputTokens
-			cacheRead = usage.CacheReadInputTokens
-			cacheWrite = usage.CacheCreationInputTokens
-			tsStr = entry.Timestamp
-
-		case "progress":
-			if entry.Data == nil {
-				continue
+		// A Claude message is several records (one per content block) that
+		// repeat its usage: count it once, under its message id. legacyKey is
+		// the per-record id earlier versions stored.
+		dedupKey := fmt.Sprintf("%s_%s", instanceID, key)
+		legacyKey := ""
+		if ev.MessageID != "" {
+			legacyKey = dedupKey
+			dedupKey = UsageEventID(instanceID, ev.MessageID, ev.UUID)
+		}
+		if u.existing[dedupKey] {
+			u.dropLegacy(legacyKey, dedupKey)
+			skipped++
+			continue
+		}
+		var count int
+		if err := u.store.db.QueryRow("SELECT COUNT(*) FROM cost_events WHERE id = ?", dedupKey).Scan(&count); err != nil {
+			continue
+		}
+		if count > 0 {
+			u.dropLegacy(legacyKey, dedupKey)
+			skipped++
+			u.existing[dedupKey] = true
+			continue
+		}
+		if legacyKey != "" {
+			// A row stored per record by an earlier version becomes the
+			// message's one row; later records of the message drop theirs.
+			res, err := u.store.db.Exec("UPDATE cost_events SET id = ? WHERE id = ?", dedupKey, legacyKey)
+			if err == nil {
+				if n, _ := res.RowsAffected(); n > 0 {
+					skipped++
+					u.existing[dedupKey] = true
+					continue
+				}
 			}
-			usage := entry.Data.Message.Message.Usage
-			model = entry.Data.Message.Message.Model
-			inputTok = usage.InputTokens
-			outputTok = usage.OutputTokens
-			cacheRead = usage.CacheReadInputTokens
-			cacheWrite = usage.CacheCreationInputTokens
-			tsStr = entry.Data.Message.Timestamp
-			if tsStr == "" {
-				tsStr = entry.Timestamp
-			}
-
-		default:
-			continue
 		}
-
-		if inputTok == 0 && outputTok == 0 {
-			continue
-		}
-
-		ts, err := time.Parse(time.RFC3339Nano, tsStr)
-		if err != nil {
+		ts := ev.TS
+		if ts.IsZero() {
 			ts = time.Now()
 		}
-
-		dedupKey := entry.UUID
-		if dedupKey == "" {
-			dedupKey = uuid.NewString()
+		costEvent := CostEvent{
+			ID:               dedupKey,
+			SessionID:        instanceID,
+			Timestamp:        ts,
+			Model:            ev.Model,
+			InputTokens:      ev.In,
+			OutputTokens:     ev.Out,
+			CacheReadTokens:  ev.CacheR,
+			CacheWriteTokens: ev.CacheW,
+			CostMicrodollars: u.pricer.ComputeCost(ev.Model, ev.In, ev.Out, ev.CacheR, ev.CacheW),
 		}
-
-		results = append(results, parsedUsage{
-			dedupKey:         dedupKey,
-			timestamp:        ts,
-			model:            model,
-			inputTokens:      inputTok,
-			outputTokens:     outputTok,
-			cacheReadTokens:  cacheRead,
-			cacheWriteTokens: cacheWrite,
-		})
+		if err := u.store.WriteCostEvent(costEvent); err != nil {
+			errs = append(errs, fmt.Sprintf("write event: %v", err))
+			continue
+		}
+		u.existing[dedupKey] = true
+		imported++
 	}
+	return imported, skipped, errs
+}
 
-	if err := scanner.Err(); err != nil {
-		errors = append(errors, fmt.Sprintf("scan %s: %v", path, err))
+// dropLegacy deletes the per-record row an earlier version stored for a
+// record of a message that is already counted under its message id. The
+// transcript names the record, so the match is exact.
+func (u *UsageImporter) dropLegacy(legacyKey, dedupKey string) {
+	if legacyKey != "" && legacyKey != dedupKey {
+		_, _ = u.store.db.Exec("DELETE FROM cost_events WHERE id = ?", legacyKey)
 	}
+}
 
-	return results, errors
+// UsageEventID is the cost_events id of one usage record: "<instance>_<message
+// id>" when the format has message ids (Claude), so the records of one message
+// and the Stop hook's copy of it share one row; else "<instance>_<record uuid>".
+func UsageEventID(instanceID, messageID, recordUUID string) string {
+	if messageID != "" {
+		return fmt.Sprintf("%s_%s", instanceID, messageID)
+	}
+	return fmt.Sprintf("%s_%s", instanceID, recordUUID)
+}
+
+// Usage implements the recall ingest UsageSink: the sweep hands over the
+// usage of every conversation bound to a deck session.
+func (u *UsageImporter) Usage(instanceID string, events []reader.Usage) error {
+	_, _, errs := u.Import(instanceID, events)
+	if len(errs) > 0 {
+		return errors.New(strings.Join(errs, "; "))
+	}
+	return nil
 }
 
 // slugifyProjectPath converts a project path to Claude's directory slug format.

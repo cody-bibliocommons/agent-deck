@@ -83,12 +83,15 @@ func mapKeyDiff(want, got map[string]bool) string {
 	return strings.Join(lines, "\n")
 }
 
+// Serial on purpose: every help call runs under a 2 s budget
+// (runIssue2025Helper), which must not overlap the package's parallel
+// process-spawning tests on a loaded CI runner.
 func TestEveryRegisteredCommandHelpIsReadOnly(t *testing.T) {
 	// These are protocol/version entry points, not human-facing command
 	// dispatchers, and intentionally define no nested help surface.
 	noHelpSurface := map[string]bool{
 		"--version": true, "-v": true, "version": true,
-		"codex-notify": true, "hook-handler": true,
+		"codex-notify": true, "hook-handler": true, "__complete": true,
 	}
 	var commands []string
 	for command := range commandRegistry {
@@ -143,31 +146,14 @@ func TestIssue2025TrailingHelpIsReadOnly(t *testing.T) {
 		{"deepseek sessions", []string{"deepseek", "sessions", "--help"}},
 		{"remote add", []string{"remote", "add", "test", "example.invalid", "--help"}},
 		{"notify daemon", []string{"notify-daemon", "--help"}},
-		// normalizeArgs treats the token after an unknown non-boolean flag as
-		// that flag's value, so flag.Parse reports the unknown flag before it
-		// can provide built-in help. This exercises the explicit pre-parse guard.
-		{"creds refresh", []string{"creds-refresh", "--not-a-real-flag", "--help"}},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			home := t.TempDir()
-			configDir := filepath.Join(home, "creds")
-			if err := os.MkdirAll(configDir, 0o755); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(filepath.Join(configDir, ".credentials.json"), []byte("{}"), 0o600); err != nil {
-				t.Fatal(err)
-			}
 			before := snapshotTree(t, home)
-			args := append([]string(nil), tt.args...)
-			for i := range args {
-				if args[i] == "CONFIG_DIR" {
-					args[i] = configDir
-				}
-			}
 
-			out, err := runIssue2025Helper(t, home, args)
+			out, err := runIssue2025Helper(t, home, tt.args)
 			if err != nil {
 				t.Fatalf("help request failed: %v\n%s", err, out)
 			}
@@ -192,6 +178,7 @@ func TestEveryRegisteredCommandFamilyBareHelpIsReadOnly(t *testing.T) {
 		usage   string
 	}{
 		{"agent", "Usage: agent-deck agent <command>"},
+		{"ask", "Usage: agent-deck ask"},
 		{"codex-hooks", "Usage: agent-deck codex-hooks"},
 		{"conductor", "conductor <command>"},
 		{"costs", "Usage: agent-deck costs"},
@@ -205,10 +192,12 @@ func TestEveryRegisteredCommandFamilyBareHelpIsReadOnly(t *testing.T) {
 		{"mcp", "Usage: agent-deck mcp"},
 		{"oc", "Usage: agent-deck openclaw"},
 		{"openclaw", "Usage: agent-deck openclaw"},
+		{"pi-hooks", "Usage: agent-deck pi-hooks"},
 		{"plugin", "Usage: agent-deck plugin"},
 		{"remote", "Usage: agent-deck remote"},
 		{"session", "Usage: agent-deck session"},
 		{"skill", "Usage: agent-deck skill"},
+		{"tmux-hooks", "Usage: agent-deck tmux-hooks"},
 		{"watcher", "Usage: agent-deck watcher"},
 		{"worktree", "Usage: agent-deck worktree"},
 		{"wt", "Usage: agent-deck worktree"},
@@ -327,7 +316,7 @@ func TestRemoteSubcommandHelpRoutesToSelectedCommand(t *testing.T) {
 		{"sessions", "Usage: agent-deck remote sessions [name] [options]"},
 		{"attach", "Usage: agent-deck remote attach <remote-name> <session-title-or-id>"},
 		{"rename", "Usage: agent-deck remote rename <remote-name> <session-title-or-id> <new-title>"},
-		{"update", "Usage: agent-deck remote update [name]"},
+		{"update", "Usage: agent-deck remote update [name | --all]"},
 	}
 
 	for _, tt := range tests {
@@ -347,15 +336,21 @@ func TestRemoteSubcommandHelpRoutesToSelectedCommand(t *testing.T) {
 	}
 }
 
+// runIssue2025Helper runs the agent-deck binary the package builds once
+// (channelsCLIBinary) under a scratch HOME. It used to re-exec this test
+// binary into main(); under -race every such start cost about a second,
+// which made the help matrices the slowest tests in CI (over two minutes
+// for TestEveryRegisteredCommandHelpIsReadOnly alone). The env keeps what
+// the test binary forced off: telemetry and the update check.
 func runIssue2025Helper(t *testing.T, home string, args []string) ([]byte, error) {
 	t.Helper()
+	bin := channelsCLIBinary(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	cmdArgs := append([]string{"-test.run=^TestIssue2025HelperProcess$", "--"}, args...)
-	cmd := exec.CommandContext(ctx, os.Args[0], cmdArgs...)
+	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Env = append(os.Environ(),
-		"AGENT_DECK_ISSUE2025_HELPER=1",
-		"AGENT_DECK_TASK6_HELPER_PROCESS=1",
+		"AGENTDECK_TELEMETRY=0",
+		"AGENTDECK_SKIP_UPDATE_CHECK=1",
 		"HOME="+home,
 		"XDG_CONFIG_HOME="+filepath.Join(home, ".config"),
 		"XDG_CACHE_HOME="+filepath.Join(home, ".cache"),
@@ -367,19 +362,4 @@ func runIssue2025Helper(t *testing.T, home string, args []string) ([]byte, error
 		t.Fatalf("help request did not return promptly (command started work):\n%s", out)
 	}
 	return out, err
-}
-
-func TestIssue2025HelperProcess(t *testing.T) {
-	if os.Getenv("AGENT_DECK_ISSUE2025_HELPER") != "1" {
-		return
-	}
-	separator := 0
-	for i, arg := range os.Args {
-		if arg == "--" {
-			separator = i
-			break
-		}
-	}
-	os.Args = append([]string{"agent-deck"}, os.Args[separator+1:]...)
-	main()
 }

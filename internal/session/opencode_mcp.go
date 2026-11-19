@@ -20,12 +20,142 @@ type opencodeMCPServer struct {
 	Command     []string          `json:"command,omitempty"`
 	Environment map[string]string `json:"environment,omitempty"`
 	URL         string            `json:"url,omitempty"`
+	Headers     map[string]string `json:"headers,omitempty"`
 }
 
 // opencodeConfig is the top-level shape of opencode.json (local or global).
 // Only the "mcp" key is relevant here; all other keys are preserved via rawConfig.
 type opencodeConfig struct {
 	MCP map[string]opencodeMCPServer `json:"mcp,omitempty"`
+}
+
+// UnmarshalJSON reads both legacy mcp maps and native V2 mcp.servers maps.
+func (c *opencodeConfig) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		MCP map[string]json.RawMessage `json:"mcp"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if servers, ok := raw.MCP["servers"]; ok {
+		var entry map[string]interface{}
+		if err := json.Unmarshal(servers, &entry); err != nil {
+			return err
+		}
+		if !isLegacyServerNamedServers(entry) {
+			return json.Unmarshal(servers, &c.MCP)
+		}
+	}
+	payload, err := json.Marshal(raw.MCP)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(payload, &c.MCP)
+}
+
+// isLegacyServerNamedServers reports whether the object at mcp.servers is a
+// legacy server literally named "servers" rather than the native V2 servers
+// container. A legacy server entry has a string "type" field. In the V2
+// container "type" can only be the name of a server, whose value is an object
+// (or null), so a non-string "type" is a V2 server named "type". A missing
+// "type" key means the V2 container on purpose. The reader (UnmarshalJSON) and
+// the writer (setOpenCodeMCPServers) both use this so they cannot disagree.
+func isLegacyServerNamedServers(servers map[string]interface{}) bool {
+	_, legacy := servers["type"].(string)
+	return legacy
+}
+
+// setOpenCodeMCPServers merges the managed servers into the mcp map. Only
+// entries whose name is in the agent-deck catalog are replaced or removed;
+// every other entry (hand-configured servers) is left as is. For a managed
+// entry that already exists, keys agent-deck does not set (headers when none
+// are configured, timeout, enabled, ...) are kept. Native V2 options such as
+// timeouts are preserved too.
+func setOpenCodeMCPServers(config map[string]interface{}, servers map[string]opencodeMCPServer, v2 bool) {
+	mcp, _ := config["mcp"].(map[string]interface{})
+	existingServers, _ := mcp["servers"].(map[string]interface{})
+	_, native := mcp["servers"]
+	if isLegacyServerNamedServers(existingServers) {
+		native = false
+		existingServers = nil
+	}
+	if !v2 && !native {
+		config["mcp"] = mergeOpenCodeServerMap(mcp, servers)
+		return
+	}
+	if mcp == nil {
+		mcp = make(map[string]interface{})
+	}
+	if !native {
+		// Moving to native V2: carry legacy direct entries into servers
+		// rather than dropping hand-configured ones.
+		existingServers = make(map[string]interface{})
+		for name, value := range mcp {
+			if server, ok := value.(map[string]interface{}); ok && server["type"] != nil {
+				existingServers[name] = value
+				delete(mcp, name)
+			}
+		}
+	}
+	mcp["servers"] = mergeOpenCodeServerMap(existingServers, servers)
+	config["mcp"] = mcp
+}
+
+// mergeOpenCodeServerMap returns existing with the managed (catalog) names
+// replaced by the desired servers. Every existing entry whose name is in the
+// catalog is dropped unless it is in desired, so desired must be built from
+// the full set of agent-deck-managed names (a catalog-named entry left out of
+// it is removed). Entries not in the catalog are never touched. When a managed
+// entry keeps its type and target (same url for remote, same command for
+// local), keys agent-deck does not emit are kept; when its type or target
+// changes, only timeout and enabled carry over so stored headers, oauth or
+// environment are never sent to a different endpoint or command.
+func mergeOpenCodeServerMap(existing map[string]interface{}, desired map[string]opencodeMCPServer) map[string]interface{} {
+	managed := GetAvailableMCPs()
+	out := make(map[string]interface{}, len(existing)+len(desired))
+	for name, value := range existing {
+		if _, isManaged := managed[name]; !isManaged {
+			out[name] = value
+		}
+	}
+	for name, srv := range desired {
+		entry := map[string]interface{}{}
+		if prev, ok := existing[name].(map[string]interface{}); ok {
+			prevType, _ := prev["type"].(string)
+			sameType := prevType == "" || prevType == srv.Type
+			keepAll := sameType && sameOpenCodeTarget(prev, srv)
+			for k, v := range prev {
+				if keepAll || k == "timeout" || k == "enabled" {
+					entry[k] = v
+				}
+			}
+		}
+		if data, err := json.Marshal(srv); err == nil {
+			var fields map[string]interface{}
+			if json.Unmarshal(data, &fields) == nil {
+				for k, v := range fields {
+					entry[k] = v
+				}
+			}
+		}
+		out[name] = entry
+	}
+	return out
+}
+
+// sameOpenCodeTarget reports whether prev points at the same endpoint (remote)
+// or command (local) as srv, so credentials stored on prev were meant for it.
+func sameOpenCodeTarget(prev map[string]interface{}, srv opencodeMCPServer) bool {
+	if srv.Type == "remote" {
+		url, _ := prev["url"].(string)
+		return url == srv.URL
+	}
+	prevCmd, err := json.Marshal(prev["command"])
+	if err != nil {
+		return false
+	}
+	cmd, err := json.Marshal(srv.Command)
+	return err == nil && string(prevCmd) == string(cmd)
 }
 
 // opencodeMCPConfigDirOverride allows tests to override ~/.config/opencode.
@@ -36,11 +166,14 @@ func GetOpenCodeConfigDir() string {
 	if opencodeMCPConfigDirOverride != "" {
 		return opencodeMCPConfigDirOverride
 	}
+	if dir := os.Getenv("XDG_CONFIG_HOME"); dir != "" {
+		return sandboxedToolDir("OpenCode config dir", filepath.Join(dir, "opencode"))
+	}
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		return ""
 	}
-	return filepath.Join(home, ".config", "opencode")
+	return sandboxedToolDir("OpenCode config dir", filepath.Join(home, ".config", "opencode"))
 }
 
 // opencodeProjectMCPPath resolves <project>/opencode.json.
@@ -151,19 +284,6 @@ func ClearAllOpenCodeMCPInfoCache() {
 	clear(opencodeMcpCacheTimes)
 }
 
-// PruneOpenCodeMCPCache removes stale OpenCode MCP cache entries (TTL).
-func PruneOpenCodeMCPCache(maxAge time.Duration) {
-	opencodeMcpInfoCacheMu.Lock()
-	defer opencodeMcpInfoCacheMu.Unlock()
-	now := time.Now()
-	for path, t := range opencodeMcpCacheTimes {
-		if now.Sub(t) > maxAge {
-			delete(opencodeMcpInfoCache, path)
-			delete(opencodeMcpCacheTimes, path)
-		}
-	}
-}
-
 // buildOpenCodeMCPServers constructs the mcp map for an opencode.json write.
 func buildOpenCodeMCPServers(enabledNames []string) map[string]opencodeMCPServer {
 	availableMCPs := GetAvailableMCPs()
@@ -184,14 +304,15 @@ func buildOpenCodeMCPServers(enabledNames []string) map[string]opencodeMCPServer
 				}
 			}
 			servers[name] = opencodeMCPServer{
-				Type: "remote",
-				URL:  def.URL,
+				Type:    "remote",
+				URL:     def.URL,
+				Headers: def.Headers,
 			}
 			continue
 		}
 
 		// Pool socket -> stdio via nc
-		if socketCfg, used := tryPoolSocket(pool, name, "opencode"); used {
+		if socketCfg, used := tryPoolSocket(pool, name, def, "opencode"); used {
 			cmd := []string{}
 			if socketCfg.Command != "" {
 				cmd = append([]string{socketCfg.Command}, socketCfg.Args...)
@@ -224,7 +345,7 @@ func buildOpenCodeMCPServers(enabledNames []string) map[string]opencodeMCPServer
 
 // WriteOpenCodeProjectMCP writes catalog MCPs to <project>/opencode.json.
 // OpenCode's local config uses {"mcp": {"name": {"type":"local","command":[...]}}} format.
-func WriteOpenCodeProjectMCP(projectPath string, enabledNames []string) error {
+func WriteOpenCodeProjectMCP(projectPath string, enabledNames []string, nativeV2 ...bool) error {
 	if !GetManageMCPJson() {
 		mcpCatLog.Debug("opencode_mcp_json_management_disabled", "path", logging.SanitizeValue(projectPath))
 		return nil
@@ -249,21 +370,25 @@ func WriteOpenCodeProjectMCP(projectPath string, enabledNames []string) error {
 		if jsonErr := json.Unmarshal(data, &rawConfig); jsonErr != nil {
 			return fmt.Errorf("refusing to overwrite unparseable opencode project config %s: %w", mcpFile, jsonErr)
 		}
+		if rawConfig == nil { // a JSON null root decodes to a nil map
+			rawConfig = make(map[string]interface{})
+		}
 	} else if os.IsNotExist(readErr) {
 		rawConfig = make(map[string]interface{})
 	} else {
 		return fmt.Errorf("read opencode project mcp %s: %w", mcpFile, readErr)
 	}
 
-	rawConfig["mcp"] = buildOpenCodeMCPServers(enabledNames)
+	setOpenCodeMCPServers(rawConfig, buildOpenCodeMCPServers(enabledNames), len(nativeV2) > 0 && nativeV2[0])
 
 	newData, err := json.MarshalIndent(rawConfig, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal opencode project mcp: %w", err)
 	}
-	if err := atomicfile.WriteFile(mcpFile, newData, 0o600); err != nil {
-		return fmt.Errorf("save opencode project mcp: %w", err)
+	if err := atomicfile.WriteFileWithin(filepath.Dir(mcpFile), mcpFile, newData, 0o600); err != nil {
+		return fmt.Errorf("save opencode project mcp: %w", withProjectMCPOptOut(err))
 	}
+	excludeProjectMCPFromGit(projectPath, mcpFile)
 
 	ClearOpenCodeMCPCache(projectPath)
 	return nil
@@ -271,7 +396,7 @@ func WriteOpenCodeProjectMCP(projectPath string, enabledNames []string) error {
 
 // WriteOpenCodeGlobalMCP writes catalog MCPs to ~/.config/opencode/opencode.json.
 // Preserves other JSON keys already present in the file.
-func WriteOpenCodeGlobalMCP(enabledNames []string) error {
+func WriteOpenCodeGlobalMCP(enabledNames []string, nativeV2 ...bool) error {
 	if !GetManageMCPJson() {
 		mcpCatLog.Debug("opencode_mcp_json_management_disabled", "scope", "global")
 		return nil
@@ -291,13 +416,16 @@ func WriteOpenCodeGlobalMCP(enabledNames []string) error {
 		if jsonErr := json.Unmarshal(data, &rawConfig); jsonErr != nil {
 			return fmt.Errorf("refusing to overwrite unparseable opencode global config %s: %w", configFile, jsonErr)
 		}
+		if rawConfig == nil { // a JSON null root decodes to a nil map
+			rawConfig = make(map[string]interface{})
+		}
 	} else if os.IsNotExist(readErr) {
 		rawConfig = make(map[string]interface{})
 	} else {
 		return fmt.Errorf("read opencode global mcp %s: %w", configFile, readErr)
 	}
 
-	rawConfig["mcp"] = buildOpenCodeMCPServers(enabledNames)
+	setOpenCodeMCPServers(rawConfig, buildOpenCodeMCPServers(enabledNames), len(nativeV2) > 0 && nativeV2[0])
 
 	newData, err := json.MarshalIndent(rawConfig, "", "  ")
 	if err != nil {

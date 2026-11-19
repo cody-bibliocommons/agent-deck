@@ -18,6 +18,7 @@ import (
 
 	"github.com/asheshgoplani/agent-deck/internal/agentpaths"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
+	"github.com/asheshgoplani/agent-deck/internal/session"
 )
 
 // The Command Center is the embedded, live, two-way fleet god-view (see
@@ -62,6 +63,20 @@ type CommandCenterSnapshot struct {
 	// targets (maestro + live conductor-* sessions). The panel populates its
 	// target picker from this; the /ask handler re-validates against it.
 	AskTargets []string `json:"askTargets"`
+
+	// FleetSummaries are conductor-maintained markdown summaries of the fleet,
+	// read from session annotations (snapshot_annotations.go): any session's
+	// `summary` hint, or a conductor session's `note` hint (written with
+	// `agent-deck session annotate <conductor> --note-stdin`). Rendered as a
+	// panel at the top of the Command Center.
+	FleetSummaries []CommandCenterSummary `json:"fleetSummaries"`
+}
+
+// CommandCenterSummary is one conductor-written fleet summary.
+type CommandCenterSummary struct {
+	SessionID string `json:"sessionId"`
+	Title     string `json:"title"`
+	Markdown  string `json:"markdown"`
 }
 
 // CommandCenterConductor is one project/domain row: a conductor plus the live
@@ -90,6 +105,11 @@ type CommandCenterSession struct {
 	Substate string `json:"substate,omitempty"`
 	// WorkingOn is the latest prompt/activity hint, when available.
 	WorkingOn string `json:"workingOn,omitempty"`
+	// Headline, HintStatus and Ticket are the session's annotation hints
+	// (`session annotate --hint headline=... --hint status=... --ticket`).
+	Headline   string `json:"headline,omitempty"`
+	HintStatus string `json:"hintStatus,omitempty"`
+	Ticket     string `json:"ticket,omitempty"`
 }
 
 // CommandCenterCounts is the per-conductor active-session tally (the noise the
@@ -259,6 +279,7 @@ func (s *Server) loadCommandCenterSnapshot(tracker ccStatusTracker) (*CommandCen
 		return nil, err
 	}
 	refreshSnapshotHookStatuses(menu, s.hookStatusLoader)
+	applySnapshotAnnotations(menu, s.annotationLoader)
 	return buildCommandCenterSnapshot(menu, s.cfg.Profile, conductorArtifactDir(), tracker), nil
 }
 
@@ -273,6 +294,7 @@ func buildCommandCenterSnapshot(menu *MenuSnapshot, profile, artifactDir string,
 		DecisionsWaiting:  []CommandCenterDecision{},
 		RecentlyCompleted: []CommandCenterCompletion{},
 		AskTargets:        []string{"maestro"},
+		FleetSummaries:    []CommandCenterSummary{},
 	}
 	if menu == nil {
 		return snap
@@ -281,7 +303,9 @@ func buildCommandCenterSnapshot(menu *MenuSnapshot, profile, artifactDir string,
 	// Collect sessions, split conductors from children, group children by group.
 	type sess struct {
 		id, title, status, substate, group, prompt string
+		conductorName                              string // managed group; "" for non-conductors
 		isConductor                                bool
+		hints                                      map[string]string
 	}
 	var all []sess
 	conductorByGroup := map[string]sess{}
@@ -290,21 +314,46 @@ func buildCommandCenterSnapshot(menu *MenuSnapshot, profile, artifactDir string,
 			continue
 		}
 		ms := item.Session
+		// The resolved conductor name (stored, else a possibly decorated
+		// conductor-<name> title) is the conductor identity, not the title.
+		conductorName := ms.ConductorName
+		if conductorName == "" {
+			conductorName = session.ConductorNameFromTitle(ms.Title)
+		}
+		isConductor := ms.IsConductor || conductorName != ""
+		if isConductor && conductorName == "" {
+			conductorName = ms.Title
+		}
 		e := sess{
-			id:          ms.ID,
-			title:       ms.Title,
-			status:      string(ms.Status),
-			substate:    ms.Substate,
-			group:       ms.GroupPath,
-			prompt:      firstLine(ms.LatestPrompt),
-			isConductor: ms.IsConductor || strings.HasPrefix(ms.Title, "conductor-"),
+			id:            ms.ID,
+			title:         ms.Title,
+			status:        string(ms.Status),
+			substate:      ms.Substate,
+			group:         ms.GroupPath,
+			prompt:        firstLine(ms.LatestPrompt),
+			conductorName: conductorName,
+			isConductor:   isConductor,
+			hints:         ms.Hints,
 		}
 		all = append(all, e)
+		// A `summary` hint on any session, or a `note` on a conductor (a
+		// conductor-flagged session or one parked in the "conductor" group),
+		// is a fleet summary.
+		md := e.hints["summary"]
+		if md == "" && (e.isConductor || e.group == "conductor") {
+			md = e.hints["note"]
+		}
+		if strings.TrimSpace(md) != "" {
+			snap.FleetSummaries = append(snap.FleetSummaries, CommandCenterSummary{
+				SessionID: e.id,
+				Title:     e.title,
+				Markdown:  md,
+			})
+		}
 		if e.isConductor {
-			// Map a conductor to the group it manages. Conductors named
-			// "conductor-<name>" manage the "<name>" group by convention.
-			managed := strings.TrimPrefix(e.title, "conductor-")
-			conductorByGroup[managed] = e
+			// Map a conductor to the group it manages. Conductor "<name>"
+			// manages the "<name>" group by convention.
+			conductorByGroup[e.conductorName] = e
 		}
 	}
 
@@ -339,7 +388,7 @@ func buildCommandCenterSnapshot(menu *MenuSnapshot, profile, artifactDir string,
 	groupNames := map[string]bool{}
 	for _, e := range all {
 		if e.isConductor {
-			groupNames[strings.TrimPrefix(e.title, "conductor-")] = true
+			groupNames[e.conductorName] = true
 		} else if e.group != "" {
 			groupNames[e.group] = true
 		}
@@ -362,14 +411,18 @@ func buildCommandCenterSnapshot(menu *MenuSnapshot, profile, artifactDir string,
 		if c, ok := conductorByGroup[name]; ok {
 			cd.Status = c.status
 			cd.Substate = c.substate
+			// Route by the live title so a decorated or renamed conductor
+			// stays askable (the target must be in AskTargets).
+			cd.Target = c.title
 			snap.AskTargets = append(snap.AskTargets, c.title)
 		}
-		// plain-language "currently working on": disk status feed wins, else
-		// the conductor's own latest prompt.
+		// plain-language "currently working on": disk status feed wins, then
+		// the conductor's own headline annotation, else its latest prompt
+		// (which can be a raw tool notification rather than prose).
 		if feed, ok := statusFeeds[name]; ok && feed != "" {
 			cd.CurrentlyWorkingOn = feed
 		} else if c, ok := conductorByGroup[name]; ok {
-			cd.CurrentlyWorkingOn = c.prompt
+			cd.CurrentlyWorkingOn = firstNonEmptyString(c.hints["headline"], c.prompt)
 		}
 
 		for _, e := range all {
@@ -381,11 +434,14 @@ func buildCommandCenterSnapshot(menu *MenuSnapshot, profile, artifactDir string,
 				continue
 			}
 			cd.Sessions = append(cd.Sessions, CommandCenterSession{
-				ID:        e.id,
-				Title:     e.title,
-				Status:    e.status,
-				Substate:  e.substate,
-				WorkingOn: e.prompt,
+				ID:         e.id,
+				Title:      e.title,
+				Status:     e.status,
+				Substate:   e.substate,
+				WorkingOn:  e.prompt,
+				Headline:   firstNonEmptyString(e.hints["headline"], e.hints["purpose"]),
+				HintStatus: e.hints["status"],
+				Ticket:     e.hints["ticket"],
 			})
 			switch e.status {
 			case "running":
@@ -418,11 +474,13 @@ func commandCenterFingerprint(snap *CommandCenterSnapshot) string {
 		Conductors       []CommandCenterConductor `json:"conductors"`
 		Totals           CommandCenterTotals      `json:"totals"`
 		DecisionsWaiting []CommandCenterDecision  `json:"decisionsWaiting"`
+		FleetSummaries   []CommandCenterSummary   `json:"fleetSummaries"`
 	}{
 		Profile:          snap.Profile,
 		Conductors:       snap.Conductors,
 		Totals:           snap.Totals,
 		DecisionsWaiting: snap.DecisionsWaiting,
+		FleetSummaries:   snap.FleetSummaries,
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -598,7 +656,9 @@ func (s *Server) handleCommandCenterAsk(w http.ResponseWriter, r *http.Request) 
 	// via the SSE feed as the fleet moves); -p <profile> so it works headless.
 	// Bound the child with a context timeout so a stalled `session send` (e.g.
 	// a wedged tmux) can't pile up orphaned processes if many asks fire.
-	args := []string{"-p", s.cfg.Profile, "session", "send", resolved, msg, "--no-wait"}
+	// --no-tag: an operator's command-center message is not a send from
+	// whatever session the web server happened to be started in.
+	args := commandCenterSendArgs(s.cfg.Profile, resolved, msg)
 	cmdCtx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(cmdCtx, exe, args...)
@@ -636,6 +696,8 @@ func (s *Server) handleCommandCenterAsk(w http.ResponseWriter, r *http.Request) 
 // resolveAskTarget maps a requested target to the concrete allowlisted session
 // title, returning "" if it is not allowed. "maestro" resolves to the live
 // "conductor-maestro" session when present (else bare "maestro").
+// commandCenterAskArgs is the `session send` argv of one ask. --source
+// command-center names the sender in `agent-deck triggers` (issue #2702).
 func resolveAskTarget(target string, allow []string) string {
 	if target == "maestro" {
 		if targetAllowed(allow, "conductor-maestro") {
@@ -676,4 +738,35 @@ func firstLine(s string) string {
 		s = s[:max] + "…"
 	}
 	return s
+}
+
+// Command Center (the embedded live fleet god-view — see
+// conductor/agent-deck/COMMAND-CENTER-DESIGN.md). Two read endpoints and
+// one write endpoint, all behind the existing authorize/CSRF/mutation gates.
+func init() {
+	registerFeatureRoutes(func(s *Server, mux *http.ServeMux) {
+		mux.HandleFunc("/api/command-center/status", s.handleCommandCenterStatus)
+		mux.HandleFunc("/events/command-center", s.handleCommandCenterEvents)
+		mux.HandleFunc("POST /api/command-center/ask", s.handleCommandCenterAsk)
+	})
+}
+
+// firstNonEmptyString returns the first argument that is not empty.
+func firstNonEmptyString(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// commandCenterSendArgs is the `session send` argv of a Command Center ask.
+// --no-tag: an operator's message is not a send from whatever session the
+// web server happened to be started in. --ignore-budget: an operator's
+// message is never blocked by an enforced cost budget, which gates
+// agent-initiated sends only.
+func commandCenterSendArgs(profile, target, msg string) []string {
+	// --source names the ask in `agent-deck triggers` (issue #2702).
+	return []string{"-p", profile, "session", "send", target, msg, "--no-wait", "--no-tag", "--ignore-budget", "--source", "command-center"}
 }

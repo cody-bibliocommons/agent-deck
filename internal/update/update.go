@@ -5,18 +5,23 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/agentpaths"
+	"github.com/asheshgoplani/agent-deck/internal/optiming"
 )
 
 const (
@@ -36,11 +41,24 @@ const (
 	DefaultCheckInterval = 1 * time.Hour
 )
 
-// checkInterval stores the configurable interval (set via SetCheckInterval)
+// checkInterval stores the configurable interval (set via
+// SetCheckIntervalDuration)
 var checkInterval = DefaultCheckInterval
 
-// apiBaseURL is the base URL for GitHub API calls. Overridable in tests.
-var apiBaseURL = "https://api.github.com"
+// apiBaseURL is the base URL for GitHub API calls. Overridable in tests, and
+// at runtime via AGENTDECK_GITHUB_API_BASE_URL for driving a real binary
+// against a fake release server (sandboxed end-to-end proofs of the update
+// flow) without ever pointing it at the real GitHub API.
+var apiBaseURL = envOr("AGENTDECK_GITHUB_API_BASE_URL", "https://api.github.com")
+
+// envOr returns the trimmed value of the named env var, or fallback when
+// unset or blank.
+func envOr(name, fallback string) string {
+	if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+		return v
+	}
+	return fallback
+}
 
 // detectHomebrewManagedInstall is a test seam for self-update install paths.
 var detectHomebrewManagedInstall = DetectHomebrewManagedInstall
@@ -56,11 +74,36 @@ var bridgeScriptInstaller func() error
 // UpdateBridgePy falls back to the default XDG/legacy resolution.
 var conductorDirResolver func() (string, error)
 
-// SetCheckInterval sets the update check interval from config
-func SetCheckInterval(hours int) {
-	if hours > 0 {
-		checkInterval = time.Duration(hours) * time.Hour
+// SetCheckIntervalDuration sets the update check interval directly. Used to
+// wire [updates].check_interval (a duration string, default 90s) so the
+// near-event-driven poll cadence isn't limited to whole hours.
+func SetCheckIntervalDuration(d time.Duration) {
+	if d > 0 {
+		checkInterval = d
 	}
+}
+
+// cacheFreshMarginMax caps the margin cacheFreshFor takes off the interval.
+const cacheFreshMarginMax = 10 * time.Second
+
+// cacheFreshFor is how long a saved check answers CheckForUpdate without a
+// poll: the check interval less a small margin (10%, at most 10s).
+//
+// A headless poller (notify-daemon, `web --no-tui`) ticks every check
+// interval, and the cache it saved on the previous tick is stamped after
+// that tick's network round trip. Compared against the full interval, the
+// next tick finds the cache younger than the interval by that lag, serves
+// it, and only every second tick reaches GitHub: a new release was noticed
+// up to twice check_interval (default 90s, so 3 min) after publishing. The
+// margin absorbs the lag so every tick polls, as check_interval documents.
+// Polls stay conditional (If-None-Match with the cached ETag), and a cache
+// another process saved moments ago is still shared.
+func cacheFreshFor(interval time.Duration) time.Duration {
+	margin := interval / 10
+	if margin > cacheFreshMarginMax {
+		margin = cacheFreshMarginMax
+	}
+	return interval - margin
 }
 
 // SetBridgeScriptInstaller configures the bridge.py installer used after updates.
@@ -104,6 +147,12 @@ type UpdateCache struct {
 	DownloadURL    string    `json:"download_url"`
 	ReleaseURL     string    `json:"release_url"`
 	ReleasesBehind int       `json:"releases_behind,omitempty"`
+	// ETag is the GitHub response's ETag for /releases/latest, sent back as
+	// If-None-Match on the next poll. GitHub answers an unchanged resource
+	// with 304 Not Modified, which does not count against the caller's API
+	// rate limit, so polling every check_interval (default 90s) stays cheap
+	// between releases.
+	ETag string `json:"etag,omitempty"`
 }
 
 // UpdateInfo contains information about an available update
@@ -226,6 +275,14 @@ func resolveGitHubToken() string {
 // token is available. On a 403 response from an unauthenticated request it
 // returns a friendlier rate-limit error pointing the user at authentication.
 func githubAPIGet(url string) (*http.Response, bool, error) {
+	return githubAPIGetConditional(url, "")
+}
+
+// githubAPIGetConditional is githubAPIGet with an optional If-None-Match
+// sent when etag is non-empty, so an unchanged release answers 304 Not
+// Modified instead of re-sending (and re-billing the rate limit for) the
+// full body.
+func githubAPIGetConditional(url, etag string) (*http.Response, bool, error) {
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, false, err
@@ -236,6 +293,9 @@ func githubAPIGet(url string) (*http.Response, bool, error) {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
+	if etag != "" {
+		req.Header.Set("If-None-Match", etag)
+	}
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
@@ -286,7 +346,7 @@ func fetchRecentReleases(limit int) ([]Release, error) {
 func CountReleasesBehind(currentVersion string, releases []Release) int {
 	behind := 0
 	for _, r := range releases {
-		if CompareVersions(r.TagName, currentVersion) > 0 {
+		if ReleaseSupersedes(r.TagName, currentVersion) {
 			behind++
 		}
 	}
@@ -312,14 +372,8 @@ func CachedUpdateInfo(currentVersion string) (*UpdateInfo, error) {
 	if cache == nil || cache.LatestVersion == "" {
 		return nil, nil
 	}
-	info := &UpdateInfo{
-		CurrentVersion: currentVersion,
-		LatestVersion:  cache.LatestVersion,
-		DownloadURL:    cache.DownloadURL,
-		ReleaseURL:     cache.ReleaseURL,
-		ReleasesBehind: cache.ReleasesBehind,
-		Available:      CompareVersions(currentVersion, cache.LatestVersion) < 0,
-	}
+	info := &UpdateInfo{CurrentVersion: currentVersion}
+	applyCacheToInfo(info, cache, currentVersion)
 	return info, nil
 }
 
@@ -339,24 +393,40 @@ func ShouldNudge(info *UpdateInfo) bool {
 
 // fetchLatestRelease fetches the latest release from GitHub
 func fetchLatestRelease() (*Release, error) {
+	release, _, _, err := fetchLatestReleaseConditional("")
+	return release, err
+}
+
+// fetchLatestReleaseConditional fetches the latest release from GitHub,
+// sending If-None-Match: etag when etag is non-empty. notModified is true
+// on a 304 (release is unchanged; release is nil), in which case the caller
+// should keep using its cached copy. newETag is the response's ETag, to
+// remember for the next call regardless of whether it was a 200 or a 304.
+func fetchLatestReleaseConditional(etag string) (release *Release, newETag string, notModified bool, err error) {
+	done := optiming.StartResult("update.check")
+	defer func() { done(err != nil) }()
 	url := fmt.Sprintf("%s/repos/%s/releases/latest", apiBaseURL, GitHubRepo)
 
-	resp, authed, err := githubAPIGet(url)
+	resp, authed, err := githubAPIGetConditional(url, etag)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch release: %w", err)
+		return nil, "", false, fmt.Errorf("failed to fetch release: %w", err)
 	}
 	defer resp.Body.Close()
+	newETag = resp.Header.Get("ETag")
 
+	if resp.StatusCode == http.StatusNotModified {
+		return nil, newETag, true, nil
+	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, rateLimitError(resp.StatusCode, authed)
+		return nil, newETag, false, rateLimitError(resp.StatusCode, authed)
 	}
 
-	var release Release
-	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
-		return nil, fmt.Errorf("failed to parse release: %w", err)
+	var r Release
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		return nil, newETag, false, fmt.Errorf("failed to parse release: %w", err)
 	}
 
-	return &release, nil
+	return &r, newETag, false, nil
 }
 
 // getAssetURL returns the download URL for the current platform
@@ -430,13 +500,22 @@ func FetchReleaseByTag(tag string) (*Release, error) {
 
 // CompareVersions compares two semantic versions
 // Returns: -1 if v1 < v2, 0 if v1 == v2, 1 if v1 > v2
+//
+// A pre-release ("1.16.4-switch-preview.abc") sorts BELOW its release
+// ("1.16.4"), as semver orders them: a preview controller is older than the
+// release it previews, so it never judges a remote on that release as
+// behind, and it never keeps a remote from moving to it (#2164). Two
+// pre-releases of the same core compare by their suffix.
 func CompareVersions(v1, v2 string) int {
 	// Remove 'v' prefix if present
 	v1 = strings.TrimPrefix(v1, "v")
 	v2 = strings.TrimPrefix(v2, "v")
 
-	parts1 := strings.Split(v1, ".")
-	parts2 := strings.Split(v2, ".")
+	core1, pre1 := splitPreRelease(v1)
+	core2, pre2 := splitPreRelease(v2)
+
+	parts1 := strings.Split(core1, ".")
+	parts2 := strings.Split(core2, ".")
 
 	// Pad with zeros
 	for len(parts1) < 3 {
@@ -459,7 +538,128 @@ func CompareVersions(v1, v2 string) int {
 		}
 	}
 
+	switch {
+	case pre1 == pre2:
+		return 0
+	case pre1 == "":
+		return 1 // release > pre-release of the same core
+	case pre2 == "":
+		return -1
+	}
+	return comparePreRelease(pre1, pre2)
+}
+
+// splitPreRelease separates "1.2.3-rc.1+build" into its numeric core "1.2.3"
+// and pre-release tag "rc.1". Build metadata after "+" is ignored either way.
+func splitPreRelease(v string) (core, pre string) {
+	v, _, _ = strings.Cut(v, "+")
+	core, pre, _ = strings.Cut(v, "-")
+	return core, pre
+}
+
+// ReleaseSupersedes reports whether installing release over current is an
+// upgrade. It is CompareVersions(release, current) > 0, plus one case
+// precedence alone misses: a local build ("1.16.29+local.20261018.abc") is
+// replaced by the published release of the same version (#2710).
+// CompareVersions ignores build metadata, so on its own it calls the two
+// equal and the local build would never be offered its own release. Other
+// build metadata, and a release tag that itself carries "+", stay equal.
+func ReleaseSupersedes(release, current string) bool {
+	switch CompareVersions(release, current) {
+	case 1:
+		return true
+	case 0:
+		return IsLocalBuild(current) && !strings.Contains(release, "+")
+	}
+	return false
+}
+
+// IsLocalBuild reports whether v carries the "+local" build metadata that
+// tools/dist-local stamps on unpublished builds.
+func IsLocalBuild(v string) bool {
+	_, build, ok := strings.Cut(strings.TrimSpace(v), "+")
+	return ok && (build == "local" || strings.HasPrefix(build, "local."))
+}
+
+// comparePreRelease orders two pre-release tags the way semver 2.0 §11
+// does: dot-separated identifiers compared left to right, numeric ones as
+// numbers (so rc.2 < rc.10), numeric below alphanumeric, and a tag that is
+// a prefix of the other sorts first (rc.1 < rc.1.1).
+func comparePreRelease(a, b string) int {
+	as, bs := strings.Split(a, "."), strings.Split(b, ".")
+	for i := 0; i < len(as) && i < len(bs); i++ {
+		aNum, bNum := isNumericIdentifier(as[i]), isNumericIdentifier(bs[i])
+		switch {
+		case aNum && bNum:
+			if c := compareNumericIdentifiers(as[i], bs[i]); c != 0 {
+				return c
+			}
+		case aNum:
+			return -1
+		case bNum:
+			return 1
+		default:
+			if c := strings.Compare(as[i], bs[i]); c != 0 {
+				return c
+			}
+		}
+	}
+	switch {
+	case len(as) < len(bs):
+		return -1
+	case len(as) > len(bs):
+		return 1
+	}
 	return 0
+}
+
+// isNumericIdentifier reports whether id is one or more ASCII digits.
+func isNumericIdentifier(id string) bool {
+	if id == "" {
+		return false
+	}
+	for _, c := range id {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// compareNumericIdentifiers orders two digit strings by value without
+// converting them: leading zeros dropped, then longer is larger, then
+// lexical. No integer width is involved, so an identifier past int64
+// (a build counter, a timestamp) still sorts correctly.
+func compareNumericIdentifiers(a, b string) int {
+	a, b = strings.TrimLeft(a, "0"), strings.TrimLeft(b, "0")
+	switch {
+	case len(a) < len(b):
+		return -1
+	case len(a) > len(b):
+		return 1
+	}
+	return strings.Compare(a, b)
+}
+
+// applyCacheToInfo fills info from a cached (or just-confirmed-unchanged)
+// release: used both when the cache is still fresh and when a conditional
+// poll comes back 304 Not Modified. The cached ReleasesBehind is only used
+// when the cache was written by this same version: after an upgrade it still
+// counts how far the old binary was behind, so it is left at 0 (unknown).
+func applyCacheToInfo(info *UpdateInfo, cache *UpdateCache, currentVersion string) {
+	info.LatestVersion = cache.LatestVersion
+	info.DownloadURL = cache.DownloadURL
+	info.ReleaseURL = cache.ReleaseURL
+	info.ReleasesBehind = 0
+	if cacheWrittenBy(cache, currentVersion) {
+		info.ReleasesBehind = cache.ReleasesBehind
+	}
+	info.Available = ReleaseSupersedes(cache.LatestVersion, currentVersion)
+}
+
+// cacheWrittenBy reports whether cache was last written by currentVersion.
+func cacheWrittenBy(cache *UpdateCache, currentVersion string) bool {
+	return strings.TrimPrefix(cache.CurrentVersion, "v") == strings.TrimPrefix(currentVersion, "v")
 }
 
 // CheckForUpdate checks if a new version is available
@@ -475,24 +675,53 @@ func CheckForUpdate(currentVersion string, forceCheck bool) (*UpdateInfo, error)
 		return info, nil
 	}
 
-	// Try to use cache first (unless force check)
-	if !forceCheck {
-		cache, err := loadCache()
-		if err == nil && time.Since(cache.CheckedAt) < checkInterval {
-			// Cache is fresh, use it
-			info.LatestVersion = cache.LatestVersion
-			info.DownloadURL = cache.DownloadURL
-			info.ReleaseURL = cache.ReleaseURL
-			info.ReleasesBehind = cache.ReleasesBehind
-			info.Available = CompareVersions(currentVersion, cache.LatestVersion) < 0
-			return info, nil
-		}
+	cache, cacheErr := loadCache()
+	haveCache := cacheErr == nil
+
+	// Try to use cache first (unless force check). A cache written by another
+	// version (the user upgraded) is polled again so ReleasesBehind is recounted.
+	if !forceCheck && haveCache && time.Since(cache.CheckedAt) < cacheFreshFor(checkInterval) && cacheWrittenBy(cache, currentVersion) {
+		applyCacheToInfo(info, cache, currentVersion)
+		return info, nil
 	}
 
-	// Fetch from GitHub
-	release, err := fetchLatestRelease()
+	// Poll GitHub, conditionally: an unchanged release (304) does not spend
+	// the rate limit, so the near-event-driven interval (default 90s) stays
+	// cheap between releases (#update-pull-nudge).
+	etag := ""
+	if haveCache {
+		etag = cache.ETag
+	}
+	release, newETag, notModified, err := fetchLatestReleaseConditional(etag)
 	if err != nil {
 		return info, err
+	}
+	if notModified {
+		if !haveCache {
+			// A 304 with no cache to fall back on cannot happen against a
+			// real server (there is nothing to compare against without
+			// sending an ETag), but stay defensive rather than panic on a
+			// nil cache.
+			return info, fmt.Errorf("GitHub reported no change but no cached release is on disk")
+		}
+		applyCacheToInfo(info, cache, currentVersion)
+		refreshed := *cache
+		if !cacheWrittenBy(cache, currentVersion) {
+			// The release is unchanged but this binary is not the one that
+			// counted; recount (0 on failure, like the 200 path).
+			info.ReleasesBehind = 0
+			if recent, recentErr := fetchRecentReleases(recentReleasesLimit); recentErr == nil {
+				info.ReleasesBehind = CountReleasesBehind(currentVersion, recent)
+			}
+			refreshed.ReleasesBehind = info.ReleasesBehind
+		}
+		refreshed.CheckedAt = time.Now()
+		refreshed.CurrentVersion = currentVersion
+		if newETag != "" {
+			refreshed.ETag = newETag
+		}
+		_ = saveCache(&refreshed) // renew freshness; ignore save errors
+		return info, nil
 	}
 
 	// Count how many releases the user is behind. A failure here is
@@ -533,7 +762,7 @@ func CheckForUpdate(currentVersion string, forceCheck bool) (*UpdateInfo, error)
 	info.ReleaseURL = release.HTMLURL
 	info.ReleasesBehind = releasesBehind
 	info.PublishingVersion = publishingVersion
-	info.Available = CompareVersions(currentVersion, latestVersion) < 0
+	info.Available = ReleaseSupersedes(latestVersion, currentVersion)
 
 	// Don't persist a mid-publish answer. Caching it would pin the user to the
 	// older release for a full checkInterval (an hour by default) after the real
@@ -544,96 +773,27 @@ func CheckForUpdate(currentVersion string, forceCheck bool) (*UpdateInfo, error)
 	}
 
 	// Update cache
-	cache := &UpdateCache{
+	cache = &UpdateCache{
 		CheckedAt:      time.Now(),
 		LatestVersion:  latestVersion,
 		CurrentVersion: currentVersion,
 		DownloadURL:    downloadURL,
 		ReleaseURL:     release.HTMLURL,
 		ReleasesBehind: releasesBehind,
+		ETag:           newETag,
 	}
 	_ = saveCache(cache) // Ignore cache save errors
 
 	return info, nil
 }
 
-// CheckForUpdateAsync checks for updates in the background
-// Returns a channel that will receive the result
-func CheckForUpdateAsync(currentVersion string) <-chan *UpdateInfo {
-	ch := make(chan *UpdateInfo, 1)
-
-	go func() {
-		info, err := CheckForUpdate(currentVersion, false)
-		if err != nil {
-			// On error, return no update available
-			ch <- &UpdateInfo{Available: false, CurrentVersion: currentVersion}
-		} else {
-			ch <- info
-		}
-		close(ch)
-	}()
-
-	return ch
-}
-
-// PerformUpdate downloads and installs the latest version
-func PerformUpdate(downloadURL string) error {
-	if downloadURL == "" {
-		return fmt.Errorf("no download URL available for %s/%s", runtime.GOOS, runtime.GOARCH)
-	}
-
-	execPath, upgradeCmd, managed, err := detectHomebrewManagedInstall()
-	if err != nil {
-		return fmt.Errorf("failed to detect install type: %w", err)
-	}
-	if managed {
-		return fmt.Errorf("homebrew-managed install detected at %s; use `%s`", execPath, upgradeCmd)
-	}
-
-	// Download the release
-	fmt.Printf("Downloading from %s...\n", downloadURL)
-	client := &http.Client{Timeout: 120 * time.Second}
-	resp, err := client.Get(downloadURL)
-	if err != nil {
-		return fmt.Errorf("failed to download: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download failed with status %d", resp.StatusCode)
-	}
-
-	// Create temp file for download
-	tmpFile, err := os.CreateTemp("", "agent-deck-update-*.tar.gz")
-	if err != nil {
-		return fmt.Errorf("failed to create temp file: %w", err)
-	}
-	tmpPath := tmpFile.Name()
-	defer os.Remove(tmpPath)
-
-	// Copy download to temp file
-	fmt.Println("Downloading...")
-	_, err = io.Copy(tmpFile, resp.Body)
-	tmpFile.Close()
-	if err != nil {
-		return fmt.Errorf("failed to save download: %w", err)
-	}
-
-	// Extract the binary from tarball
-	fmt.Println("Extracting...")
-	binaryData, err := extractBinaryFromTarGz(tmpPath)
-	if err != nil {
-		return fmt.Errorf("failed to extract: %w", err)
-	}
-
-	return installSelfUpdateBinary(execPath, binaryData)
-}
-
 // PerformVerifiedUpdate downloads, verifies, extracts, and installs a release
 // binary for the requested platform. It fails closed: checksum download,
 // missing-entry, or hash mismatch errors occur before the installed binary is
 // touched.
-func PerformVerifiedUpdate(release *Release, goos, goarch string) error {
+func PerformVerifiedUpdate(release *Release, goos, goarch string) (err error) {
+	done := optiming.StartResult("update.install")
+	defer func() { done(err != nil) }()
 	execPath, upgradeCmd, managed, err := detectHomebrewManagedInstall()
 	if err != nil {
 		return fmt.Errorf("failed to detect install type: %w", err)
@@ -643,7 +803,7 @@ func PerformVerifiedUpdate(release *Release, goos, goarch string) error {
 	}
 
 	fmt.Printf("Downloading and verifying %s/%s release binary...\n", goos, goarch)
-	binaryData, err := DownloadVerifiedBinary(release, goos, goarch)
+	binaryData, err := DownloadVerifiedBinaryContext(context.Background(), release, goos, goarch, terminalProgress())
 	if err != nil {
 		return fmt.Errorf("download/verify failed: %w", err)
 	}
@@ -651,10 +811,38 @@ func PerformVerifiedUpdate(release *Release, goos, goarch string) error {
 	return installSelfUpdateBinary(execPath, binaryData)
 }
 
+// InstallPathNotWritableError says the running user cannot replace the
+// binary at Path: a root-owned /usr/local/bin/agent-deck, typically. It is
+// returned instead of a bare EACCES so the self-update, the controller-driven
+// remote deploy and the unattended sweep all report the same remedy (#2164).
+type InstallPathNotWritableError struct {
+	Path string
+	User string
+}
+
+func (e *InstallPathNotWritableError) Error() string {
+	return fmt.Sprintf("install path %s is not writable by %s; move the binary to ~/.local/bin and leave a symlink at %s, or run the update with sudo",
+		e.Path, e.User, e.Path)
+}
+
+// currentUserName names the user for InstallPathNotWritableError.
+func currentUserName() string {
+	if u, err := user.Current(); err == nil && u.Username != "" {
+		return u.Username
+	}
+	if name := os.Getenv("USER"); name != "" {
+		return name
+	}
+	return fmt.Sprintf("uid %d", os.Getuid())
+}
+
 func installSelfUpdateBinary(execPath string, binaryData []byte) error {
 	// Create temp file for new binary
 	newBinaryPath := execPath + ".new"
 	if err := os.WriteFile(newBinaryPath, binaryData, 0755); err != nil {
+		if errors.Is(err, fs.ErrPermission) {
+			return &InstallPathNotWritableError{Path: execPath, User: currentUserName()}
+		}
 		return fmt.Errorf("failed to write new binary: %w", err)
 	}
 
@@ -662,6 +850,9 @@ func installSelfUpdateBinary(execPath string, binaryData []byte) error {
 	oldBinaryPath := execPath + ".old"
 	if err := os.Rename(execPath, oldBinaryPath); err != nil {
 		os.Remove(newBinaryPath)
+		if errors.Is(err, fs.ErrPermission) {
+			return &InstallPathNotWritableError{Path: execPath, User: currentUserName()}
+		}
 		return fmt.Errorf("failed to backup old binary: %w", err)
 	}
 
@@ -735,11 +926,28 @@ type ChangelogEntry struct {
 	Content string
 }
 
-// FetchChangelog fetches the CHANGELOG.md from GitHub
+// ChangelogEnv overrides where the changelog is read from: an http(s) URL
+// or a local file path. Unset means the CHANGELOG.md on GitHub main.
+const ChangelogEnv = "AGENTDECK_CHANGELOG_URL"
+
+// FetchChangelog fetches the CHANGELOG.md from GitHub, or from the URL or
+// file ChangelogEnv names.
 func FetchChangelog() (string, error) {
 	url := fmt.Sprintf("https://raw.githubusercontent.com/%s/main/CHANGELOG.md", GitHubRepo)
+	if src := strings.TrimSpace(os.Getenv(ChangelogEnv)); src != "" {
+		if !strings.HasPrefix(src, "http://") && !strings.HasPrefix(src, "https://") {
+			data, err := os.ReadFile(strings.TrimPrefix(src, "file://")) // #nosec G304 -- operator-set override
+			if err != nil {
+				return "", fmt.Errorf("failed to read changelog: %w", err)
+			}
+			return string(data), nil
+		}
+		url = src
+	}
 
 	client := &http.Client{Timeout: 10 * time.Second}
+	// #nosec G704 -- url is the fixed GitHub CHANGELOG URL, or the
+	// AGENTDECK_CHANGELOG_URL the operator set (tests, the sandbox simulation).
 	resp, err := client.Get(url)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch changelog: %w", err)
@@ -856,13 +1064,9 @@ func FormatChangelogForDisplay(entries []ChangelogEntry) string {
 			if strings.HasPrefix(line, "### ") {
 				section := strings.TrimPrefix(line, "### ")
 				sb.WriteString(fmt.Sprintf("\n  [%s]\n", section))
-			} else if strings.HasPrefix(line, "- ") {
-				sb.WriteString(fmt.Sprintf("  %s\n", line))
-			} else if strings.HasPrefix(line, "  ") {
-				// Nested content
-				sb.WriteString(fmt.Sprintf("  %s\n", line))
 			} else {
-				// Preserve unrecognized non-empty lines (e.g. plain text paragraphs)
+				// Bullets, nested content and plain text paragraphs are all
+				// kept, indented one level.
 				sb.WriteString(fmt.Sprintf("  %s\n", line))
 			}
 		}
@@ -870,16 +1074,6 @@ func FormatChangelogForDisplay(entries []ChangelogEntry) string {
 
 	sb.WriteString("\n━━━━━━━━━━━━━━━━━━\n")
 	return sb.String()
-}
-
-// extractBinaryFromTarGz extracts the agent-deck binary from a .tar.gz file.
-func extractBinaryFromTarGz(tarPath string) ([]byte, error) {
-	file, err := os.Open(tarPath)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-	return extractBinaryFromTarGzReader(file)
 }
 
 // extractBinaryFromTarGzBytes extracts the agent-deck binary from an in-memory

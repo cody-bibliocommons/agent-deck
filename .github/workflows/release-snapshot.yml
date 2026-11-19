@@ -17,7 +17,18 @@
 name: Release Snapshot (PR drift check)
 
 on:
+  # Advisory, off the PR critical path (post-tag CI queue): on a PR this
+  # runs only when the release config or workflows change; the code it covers is checked
+  # after merge on push to main and nightly.
   pull_request:
+    paths:
+      - '.goreleaser.yml'
+      - '.github/workflows/release.yml'
+      - '.github/workflows/release-snapshot.yml'
+  schedule: [{ cron: '40 2 * * *' }]
+  workflow_dispatch: {}
+  push:
+    branches: [main]
     paths:
       - '.goreleaser.yml'
       - 'cmd/agent-deck/**'
@@ -27,9 +38,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   snapshot:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -42,7 +58,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Run GoReleaser (snapshot, no publish)
-        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7
         with:
           version: '~> v2'
           args: release --snapshot --skip=publish --clean
@@ -64,7 +80,7 @@ jobs:
           )
           MISSING=()
           for suffix in "${EXPECTED[@]}"; do
-            if ! ls dist/ 2>/dev/null | grep -q "_${suffix}$"; then
+            if ! compgen -G "dist/*_${suffix}" > /dev/null; then
               MISSING+=("$suffix")
             fi
           done

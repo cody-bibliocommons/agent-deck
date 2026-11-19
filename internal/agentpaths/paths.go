@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/asheshgoplani/agent-deck/internal/sandboxguard"
 )
 
 const AppDirName = "agent-deck"
@@ -122,6 +124,13 @@ func underIsolatedRoot(resolved string) bool {
 func ensureSafeForTest(resolved string) error {
 	if !testing.Testing() {
 		return nil
+	}
+	// The HOME the test binary started with is a real home too, even when it
+	// is not the passwd home (a sandbox that runs tests with HOME=/tmp/home).
+	// sandboxguard captured it before any TestMain could swap it.
+	if err := sandboxguard.Check("agent-deck path", resolved); err != nil {
+		warnUnsafeTestPathOnce(resolved)
+		return fmt.Errorf("agentpaths: %w (2026-06-04 data-loss incident, S4)", err)
 	}
 	// Honor the marker testutil.IsolateHome (internal/testutil/homeenv.go)
 	// sets once it has swapped HOME+XDG — but only for a path that actually
@@ -320,4 +329,15 @@ func CachePath(name string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(cacheDir, cleanName), nil
+}
+
+// ProfileRuntimeDir returns "<data dir>/runtime/profiles/<profile>", the
+// per-profile directory for sockets and owner locks (the profile daemon's
+// socket lives here). It creates nothing. profile must be one path segment.
+func ProfileRuntimeDir(profile string) (string, error) {
+	name, err := cleanLocal(profile)
+	if err != nil || name != filepath.Base(name) {
+		return "", fmt.Errorf("invalid profile name: %q", profile)
+	}
+	return EffectiveDataPath(filepath.Join("runtime", "profiles", name), "runtime")
 }

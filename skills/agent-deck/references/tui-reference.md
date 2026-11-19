@@ -4,71 +4,219 @@ Complete reference for agent-deck Terminal UI features.
 
 ## Keyboard Shortcuts
 
+Reconciled against the in-app help overlay (`?`), which is the source of truth
+(`internal/ui/help.go`). Keys marked **rebindable** can be remapped under
+`[hotkeys]` in `config.toml`; the rest are fixed.
+
+Letter hotkeys also fire on the key's Russian ЙЦУКЕН twin, so the overview
+keeps working with a non-Latin layout selected: `т` opens New Session like
+`n`, `А` forks like `F`, `Г` unarchives like `Shift+u`. Twins are derived from
+the resolved bindings (rebinding an action moves its twin with it), only the
+Russian layout is covered for now, and an explicit `[hotkeys]` value always
+wins over a derived twin (`quick_fork = "т"` keeps `т` for quick_fork). The
+fixed navigation keys (`j`/`k`/`h`/`l`/`G`, jump-mode hints) stay Latin only,
+and in jump mode a Cyrillic letter falls through to its twin's action. Attached
+panes are untouched: they receive the raw bytes exactly as typed.
+
+### First run
+
+A fresh install (no `config.toml`, no sessions) opens a **Welcome** instead of
+the setup wizard. It shows once; `Esc` skips it and it does not come back.
+
+- It lists Claude Code, Codex, Gemini CLI and Pi as installed or not, with the
+  install command for each missing one, and offers a plain shell when none is
+  installed.
+- For Claude and Codex it shows whether you are signed in, from the tool's own
+  status command (`claude auth status`, `codex login status`; only the exit
+  code is read). `l` on a tool that is not signed in starts a session running
+  the tool's own login (`claude auth login`, `codex login`) and attaches you to it;
+  come back with `Ctrl+Q` and the Welcome confirms the sign-in. agent-deck never
+  reads or stores a token. The check uses the account a new session would use
+  (`[claude] default_account`).
+- `↑`/`↓` pick an agent, `Enter` opens the New Session dialog with it and this
+  folder filled in, and `Enter` again starts the session: two keys from the
+  Welcome to a running session.
+- After that first session, **What you can do** opens once. `Alt+W` ("Show me
+  around", `show_around`) opens it any time; `Tab` there goes to the agents and
+  sign-in page.
+
 ### Navigation
 
 | Key | Action |
 |-----|--------|
 | `j` / `↓` | Move down |
 | `k` / `↑` | Move up |
-| `h` / `←` | Collapse group / go to parent |
-| `l` / `→` / `Tab` | Toggle expand/collapse group |
+| `Ctrl+u` / `Ctrl+d` | Half page up / down |
+| `PgUp` / `PgDn` | Half page up / down |
+| `Ctrl+f` / `Ctrl+b` | Full page up / down |
+| `Home` / `End` | Jump to first / last item |
+| `gg` | Jump to top |
+| `G` | Recall search (see [Search & Filter](#search--filter)) |
+| `h` / `←` | Collapse group, fold a parent session's child list, or go to parent |
+| `l` / `→` / `Tab` | Toggle expand/collapse group, or a parent session's child list |
 | `1-9` | Jump to Nth root group |
+| `Space` | Jump mode |
+| `Enter` | Attach to session OR toggle group |
+| `Shift+Enter` | Open session in new iTerm window (macOS) |
+| `` ` `` | Alternate-session toggle: swap with the previous session, vim `Ctrl-^` style (**rebindable** as `alt_session`) |
+| `Alt+←` / `Alt+→` | Walk back / forward through recently used sessions, MRU-ordered via `last_accessed` (**rebindable** as `mru_back` / `mru_forward`) |
+
+### Group Navigation
+
+| Key | Action |
+|-----|--------|
+| `Alt+j` / `Alt+k` | Next / previous session in group |
+| `Alt+1` - `Alt+9` | Jump to Nth session in group |
+| `Alt+g` / `Alt+G` | First / last session in group |
+| `Alt+/` | Filter search within group |
 
 ### Session Actions
 
 | Key | Action |
 |-----|--------|
 | `Enter` | Attach to session OR toggle group |
-| `n` | New session (inherits current group) |
-| `r` | Rename session or group |
-| `R` | Restart session (reloads MCPs) |
-| `+` / `K` / `Shift+↑` | Move item up (auto-promotes a sub-session to top-level when at the parent's first child) |
-| `-` / `J` / `Shift+↓` | Move item down (auto-promotes a sub-session to top-level when at the parent's last child) |
+| `n` / `N` | New session / quick create (**rebindable**) |
+| `r` | Rename session or group (**rebindable**) |
+| `R` | Restart session, reloads MCPs (**rebindable**) |
+| `T` | Restart with a new session ID (**rebindable**) |
+| `d` | Delete session or group (**rebindable**) |
+| `D` | Close session process (**rebindable**) |
+| `Ctrl+Z` | Undo delete (**rebindable**) |
+| `A` | Archive session — stops tmux, hides from default list; conversations/metadata untouched (**rebindable**) |
+| `Shift+U` | Unarchive session; does NOT auto-start tmux (**rebindable**) |
+| `^` | Toggle archived view (**rebindable**) |
+| `M` | Move session to a different group (**rebindable**) |
+| `m` | MCP Manager (Claude/Gemini/Cursor) (**rebindable**) |
+| `L` | Plugin Manager (Claude) (**rebindable**) |
+| `s` | Skills Manager (**rebindable**) |
+| `$` | Cost Dashboard |
+| `v` | Cycle preview mode: output / stats / both (**rebindable**) |
+| `O` | Toggle preview orientation (right / below — portrait monitors) |
+| `<` / `>` | Shrink / grow preview pane by 5% (or drag the divider with the mouse) |
+| `u` | Mark unread, idle -> waiting (**rebindable**) |
+| `a` | Quick approve — sends `1` to Claude (**rebindable**) |
+| `o` | Prompt session — send a one-line prompt without attaching (**rebindable**) |
+| `Q` | Queue a message for after the current turn (`queue_message`, **rebindable**) |
+| `C` | Inspect full context — everything the agent is being sent, ranked by cost (`context_inspector`, **rebindable**) |
+| `I` | Insert mode: keystrokes go straight to the selected session's pane until `Esc`; `Enter` submits. Insert mode is raw by design: it can submit unsent composer text, whatever is in the composer, including an operator's unsent draft |
+| `y` | Toggle YOLO mode (**rebindable**) |
+| `+` / `K` / `Shift+↑` | Move item up (auto-promotes a sub-session to top-level at the parent's first child) |
+| `-` / `J` / `Shift+↓` | Move item down (auto-promotes a sub-session to top-level at the parent's last child) |
 | `Shift+→` / `Shift+←` | Indent / outdent within current group (single-level nesting) |
-| `M` | Move session to different group |
-| `m` | Open MCP Manager (Claude/Gemini) |
-| `s` | Open Skills Manager |
-| `d` | Delete session or group |
-| `A` | Archive session (stops tmux, hides from default list; conversations/metadata untouched) |
-| `Shift+U` | Unarchive session (restores to list; does NOT auto-start tmux) |
-| `b` | Re-run worktree setup script (`.agent-deck/worktree-setup.sh`) |
-| `u` | Mark unread (idle -> waiting) |
-| `f` | Quick fork (Claude/OpenCode/Pi/Codex) |
-| `F` | Fork with options (Claude/OpenCode/Pi/Codex) |
+| `,` | Pin (cycles off -> top -> bottom -> off) |
+| `f` / `F` | Quick fork / fork with options (Claude/OpenCode/Pi/Codex/Oh My Pi) (**rebindable**) |
+| `x` | Send output to another session (**rebindable**) |
+| `alt+l` | Hand a reference to another session: pick this one, move to the target, `Enter` (or `alt+l`) drops, `Esc` cancels. Types a one-line pointer to the picked session (title, id, path, status, `agent-deck session output <id> -q`) into the target's composer and never presses Enter. Group rows, the same session and remote sessions are refused in place; nothing moves (**rebindable**: `[hotkeys].session_ref`) |
+| `E` | Exec shell in sandbox container (**rebindable**) |
+| `H` | Open shell in session's worktree, split pane / window (**rebindable**) |
+| `p` | Edit multi-repo paths (**rebindable**) |
+| `P` | Edit session settings — title / color / ... (**rebindable**) |
+| `e` | Edit notes; hidden when notes are disabled (**rebindable**) |
+| `b` | Re-run worktree setup script `.agent-deck/worktree-setup.sh` (**rebindable**) |
+| `W` | Finish worktree — merge + cleanup (**rebindable**) |
+| `w` | Watcher panel (**rebindable**) |
 
-For remote group headers, `Enter`/`Tab` toggles collapse and `h`/Left collapses or moves to the parent. Remote-session reorder keys move only within the current remote group; the order is saved on the viewing machine, while remote group headers remain name-sorted.
+For remote group headers, `Enter`/`Tab` toggles collapse and `h`/Left collapses or moves to the parent. A remote host header shows `v1.15.0 ↑` after its count when the remote runs an older agent-deck than this controller (the version is asked once per hour per remote on the session poll); `u` on that header opens "Update remote <name> from v<old> to v<new>?" and runs the same verified deploy as `agent-deck remote update <name>`. A remote session whose parent (for example its conductor) is in the same remote group is shown one level under it, as local sub-sessions are; with the parent absent it is shown flat. Remote-session reorder keys move only within the current remote group (a child only among its parent's children); the order is saved on the viewing machine, while remote group headers remain name-sorted.
+
+Local parent rows with sub-sessions (for example a conductor and the sessions it spawned) carry a `▾N`/`▸N` child-fold badge after the row title. `Tab`/`l`/`→` toggles just that child list; `h`/`←` folds it shut, and on an already-folded parent continues to the window fold or the group collapse. Unfolding a parent also reopens its window rows, and a search jump or focus request to a hidden child unfolds its parent. Folded parents keep their own row, mirroring a collapsed group header, and the fold state persists per machine alongside the other view preferences.
+
+### Copy & Text Selection
+
+Dragging with the mouse does **not** select text: the TUI puts the terminal in
+mouse reporting mode (`tea.WithMouseCellMotion`) so that click-to-select,
+wheel scrolling and the divider drag work, which means the terminal never sees
+your drag as a selection gesture.
+
+| Key | Action |
+|-----|--------|
+| `c` | Copy last AI response (**rebindable**) |
+| `B` | Copy session info — repo / path / branch (**rebindable**, `copy_info`) |
+| `V` | Copy visible terminal text, links included (**rebindable**) |
+| `Y` | Copy a fenced code block from output; opens a picker when there are several |
+| `Shift+drag` | Native terminal selection — bypasses mouse reporting |
+| `Option+drag` | Native terminal selection in iTerm2 |
+
+`c`, `B` and `V` are `copy_output`, `copy_info` and `copy_pane` under
+`[hotkeys]`; `Y` is fixed. Copy info moved from `C` to `B`: `C` now opens the
+context inspector (set `copy_info = "C"` and rebind `context_inspector` to get
+the old key back).
+
+All four copy paths use the same clipboard chain, falling back to OSC 52 so they
+work over SSH. If your terminal offers no selection bypass at all, you can turn
+off tmux mouse mode for attached sessions — at the cost of tmux scrolling, pane
+resize and mouse copy mode:
+
+```toml
+[tmux]
+mouse = false
+```
+
+That setting affects **attached sessions only**; the agent-deck list view keeps
+its own mouse capture regardless.
 
 ### Group Actions
 
 | Key | Action |
 |-----|--------|
-| `g` | Create group (subgroup if on group) |
-| `r` | Rename group |
+| `g` | Create group (subgroup if on group) (**rebindable**) |
+| `r` | Rename group (**rebindable**) |
+| `Tab` | Toggle expand |
 
 ### Search & Filter
 
 | Key | Action |
 |-----|--------|
-| `/` | Local search (fuzzy) |
-| `G` | Global search (all Claude conversations) |
+| `/` | Local search, fuzzy (**rebindable**) |
+| `G` | Recall search over every indexed conversation (Claude, Codex, pi, Gemini, OpenCode, Hermes); footer notice and local search when `[recall] enabled = false` |
 | `Tab` | Switch between local/global search |
 | `0` | Clear filter (show all) |
-| `!` | Filter: running only (toggle) |
-| `@` | Filter: waiting only (toggle) |
-| `#` | Filter: idle only (toggle) |
-| `&` | Filter: error only (toggle) |
+| `!` / `Shift+1` | Filter: running only (toggle) |
+| `@` / `Shift+2` | Filter: waiting only (toggle) |
+| `#` / `Shift+3` | Filter: idle only (toggle) |
+| `&` | Filter: errors only (toggle) |
+| `%` | Filter: Open only, hides stopped and error sessions by default (toggle). With custom exclusions that keep stopped visible, cycles All → Open → Open with stopped hidden → All. The selected step survives restart, including an empty Open view. |
 | `^` | Filter: view archived sessions (toggle) |
+| `t` | Cycle group view: active-on-top / populated-on-top (**rebindable**). Active-on-top puts running/waiting/starting sessions above an `idle / done` divider; set `[ui] active_includes_idle = true` to keep idle sessions with a live pane on top as well (divider becomes `stopped / done`) |
+| `*` | Cycle time filter: today / 3 days / 7 days / 30 days / all (**rebindable**) |
+
+Inside the search prompt, `/waiting`, `/running` and `/idle` filter by status.
 
 ### Global
 
 | Key | Action |
 |-----|--------|
-| `?` | Help overlay |
-| `i` | Import existing tmux sessions |
-| `Ctrl+R` | Manual refresh |
-| `Ctrl+Q` | Detach (keep tmux running) |
+| `?` | Help overlay (**rebindable**) |
+| `S` | Settings (**rebindable**) |
+| `i` | Import existing tmux sessions (**rebindable**) |
+| `Ctrl+R` | Manual refresh / reload from disk (**rebindable**) |
+| `Ctrl+Q` | Detach, keeps tmux running (**rebindable**) |
+| `Ctrl+S` | Switch session, here or attached — unbound by default (**rebindable**) |
+| `PageUp` | Scrollback pager, while attached |
+| `Alt+A` | Agents panel; appears once an agent is adopted (**rebindable**) |
 | `$` | Cost Dashboard |
-| `q` / `Ctrl+C` | Quit |
+| `Ctrl+Y` | Install the available update now (`install_update`; runs `agent-deck update` on the terminal, see [Updates](#updates)) |
+| `Ctrl+T` | Restart agent-deck in place now (`restart_deck`; the new build starts with the same args, env and selection) |
+| `Alt+D` | Dead-letter events (list, inspect, retry, confirmed selected purge) |
+| `Alt+T` | Triggers panel — every launchd job, systemd unit, watcher and bridge that wakes a session (`triggers`, **rebindable**) |
+| `Ctrl+E` | Open feedback dialog |
+| `Z` | Report a problem or idea: a short form, then the full GitHub issue text, filed only after you press `y` (`report_problem`, **rebindable**) |
+| `Alt+W` | Show me around: "What you can do" (sessions, switching, send, conductor, remotes, each with its key), then `Tab` for your agents and sign-in (`show_around`, **rebindable**) |
+| `Alt+N` | What's new: this version's highlights and any of your reports it fixed, each with "Is it fixed for you?" (`y`/`n`, optional comment, then the exact public comment and the GitHub account that posts it; posted only after you press `y`, never while gh is not logged in). Also opens by itself on the first start after an update (`whats_new`, **rebindable**) |
+| `q` / `Ctrl+C` | Quit (**rebindable**) |
+
+### Worktree Shortcuts
+
+| Key | Action |
+|-----|--------|
+| `n` -> `w` | Create session in a worktree |
+| `F` -> `w` | Fork session into a worktree |
+
+### Startup Flags
+
+| Flag | Action |
+|------|--------|
+| `--group <name>` | Launch scoped to a group |
+| `--profile <name>` | Use a specific profile |
 
 ## Local Status Indicators
 
@@ -80,26 +228,47 @@ For remote group headers, `Enter`/`Tab` toggles collapse and `h`/Left collapses 
 | `✕` | Error | Red | tmux session doesn't exist |
 | `⟳` | Starting | Yellow | Session launching |
 
+A Claude session whose foreground turn is over but which still has a Workflow, background agents, shells or a Monitor in flight is `●` running (substate `background-work`); the preview shows one line under the status, `background: <task> n/m · <elapsed>` (for example `background: comms-followon-round3 3/5 · 18m32s`). When the work reports back the session turns `◐` waiting, then `○` idle once acknowledged.
+
 Federated remote rows currently carry coarse running/waiting/idle/error status; local Honest Status substates are not included in the remote payload.
 
 ## Dialogs
 
+### Dead-letter events (`Alt+D`)
+
+The panel mirrors `agent-deck inbox dead-letter`: `j`/`k` selects a record,
+`Enter` shows bounded metadata, `r` retries delivery, and `d` starts a selected
+record purge that must be confirmed with `y`. A retry that cannot resolve a live
+target reports the reason and retains the record. Raw prompt, output, and
+completion content are never rendered.
+
 ### New Session (`n`)
 
-**Fields (order: Name → Tool → Path):**
-- Session name (required)
+**Fields (order: Name → Tool → Model → Reasoning effort → Path):**
+- Session name (optional: left empty, it is the folder name, made unique and cut to 50 characters; the empty field previews that exact name). With a worktree on, an empty name's branch is taken from that name
 - Command (claude/gemini/opencode/codex/custom) — the dialog remembers the last-used tool (persisted per profile, never written to config.toml; an explicit `default_tool` in config wins)
+- Model ID (claude/codex/gemini/opencode): empty means the tool default; `↓` or `Space` opens the list of known IDs, or type any ID (CLI: `--model`)
+- Reasoning effort (claude/codex): `←`/`→` or `Space` cycles the levels (CLI: `--effort`)
 - Project path (required, supports `~/`)
 - Parent group (auto-selected)
-- Claude options (when Claude is selected): permission mode, Chrome, teammate mode, extra args, and start query
+- Claude options (when Claude is selected): permission mode, Chrome, teammate mode, extra args, start query, and the account row (CLI: `--account`; hidden when no named accounts are configured; starts on `[claude].default_account`, labelled `(default)`, when one is set)
+- `[ Create session ]` button (last row)
 
-**Controls:** `Tab` move fields | `Enter` advance to next field (on free-text Name/Branch fields) | `Ctrl+S` create from any field | `Esc` cancel
+**Controls:** `Enter` creates from any row with what is filled in | `Tab`/`Shift+Tab` and `↓`/`↑` move between rows (inside the Claude options row by row) | `↓`/`Space` open the model list, `Space`/`→` browse paths; while a list is open `Enter` picks | `Ctrl+S` creates too | `Esc` back out of a list, then cancel
 
-Enter-advances is the default (`[ui].new_session_enter_advances = true`), so typing a name and pressing Enter no longer silently creates a session with all defaults. Set `[ui].new_session_enter_advances = false` to restore the legacy Enter-submits behavior; `Ctrl+S` submits in both modes.
+The common case is two keys: `n`, then `Enter` (this folder, the remembered tool, the selected group, the folder name as title). `N` on the home screen creates with the group's defaults without opening the dialog. If a required field is wrong (empty path, worktree without a valid branch, multi-repo with fewer than 2 paths), `Enter` moves to that field and shows why. A path that does not exist asks whether to create the folder; Cancel returns to the dialog with focus on Path, so a typo can be fixed. Set `[ui].new_session_enter_advances = true` to walk the form instead: Enter moves to the next row and only the `[ Create session ]` button or `Ctrl+S` creates.
 
 Pressing `n` on a remote group/session opens a remote-aware dialog (remote paths and group pre-filled); the session is created over SSH on the remote, never on localhost.
 
 Claude New Session defaults are remembered in `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/agent-deck/config.toml`) under `[claude]`, except start query and resume IDs, which are per-launch values.
+
+### Edit Session (`Shift+P`)
+
+Edits the fields a session iterates on at runtime: Title, Harness (tool), Pin position, the account row (shown when `[profiles.<name>.*].config_dir` slots are configured for a supported harness), and for claude sessions Skip permissions, Auto mode, Extra args, Wait timer (take the recommended option after this long: `5m`, `off`, or empty for `[sessions] wait_timeout`; applies live), Plugins.
+
+**Controls:** `Tab`/`↓` `Shift+Tab`/`↑` move rows | `←`/`→` choose (pills) | `Space` toggle (checkboxes) | `Enter` save | `Esc` cancel. The footer says what the keys do on the focused row; on a changed harness or account row it reads "Enter switch (asks first)".
+
+A harness or account change is saved on its own (not together with other edits) and always asks first: a same-harness account change shows "Switch Account?" (from → to, what happens), a different harness shows the transfer disclosure. `y`/Switch runs it, `n`/Esc returns to the row with nothing written; the outcome is reported in a notice. CLI equivalents: `agent-deck session switch-account <session> <account>` (same flow), `agent-deck session set <session> account <name>`, `agent-deck session switch <session> --to-harness <tool> [--to-account <account>]` (preview with `session switch-preview`); `agent-deck accounts` lists the slots.
 
 ### MCP Manager (`m`)
 
@@ -176,18 +345,17 @@ Claude New Session defaults are remembered in `$XDG_CONFIG_HOME/agent-deck/confi
 
 ### Global Search (`G`)
 
-- Full content search across `~/.claude/projects/`
-- Regex + fuzzy matching
+- Full-text search of the Recall index (`recall.db`): Claude transcripts plus the other harnesses Recall reads (see `docs/recall.md`)
+- Same query as `agent-deck recall search`
 - Recency ranking
 - Split view: results + preview
 - `[/]` scroll preview
 - `Enter` create/jump to session
 
-**Config:**
+**Config:** `G` is off unless Recall is on (with Recall off it falls back to the local title search; see `docs/recall.md`):
 ```toml
-[global_search]
+[recall]
 enabled = true
-recent_days = 30
 ```
 
 ## Preview Pane
@@ -195,6 +363,17 @@ recent_days = 30
 - Shows last ~500 lines of session's tmux pane
 - Auto-updates every 2 seconds
 - Launch animation: 6-15s for Claude/Gemini
+
+## Updates
+
+The TUI checks for a new release on startup and every 5 minutes, and watches its own binary on disk once per tick (one `stat`; a `version` probe only when the file changed). What happens next depends on `[updates]` in config.toml (both default to `true`, both also in the Settings panel under UPDATES):
+
+| Setting | On (default) | Off |
+|---------|--------------|-----|
+| `auto_install` | When a release is installable the TUI runs `agent-deck update --unattended --trigger tui` in the background (no prompt, the deck stays usable). One attempt per version per hour; a failure shows one footer line ("auto-update to vX failed: ...; run agent-deck update"). Skipped for Homebrew-managed installs, while a release is still publishing, and under `AGENTDECK_SKIP_UPDATE_CHECK`. | Banner: `⬆ Update available: vA → vB (... press ctrl+y to install (agent-deck update) · Esc to dismiss)` for 6+ releases behind; `Ctrl+Y` installs interactively. |
+| `auto_restart` | Once a newer build is on disk the banner reads `⬆ vX installed, restarting when idle (ctrl+t now)` and the TUI restarts itself at the first tick with no dialog open, no insert mode and no session action in flight (attached sessions are never interrupted: the restart only happens from the home screen). After the restart the footer says `restarted into vNEW (was vOLD)` and the cursor is back on the session it was on. | Banner: `⬆ vX installed, press ctrl+t to restart agent-deck`; `Ctrl+T` restarts when you choose. |
+
+Before the restart is armed (by the key or on its own) the TUI checks the file it is about to exec: it must be a regular, non-empty, executable file that answers `agent-deck version`; otherwise the restart is refused with a footer message (`restart blocked: new binary ... ; still running vOLD`) and the old build keeps running. The restart replaces the process in place (same executable path, args and environment), so tmux sessions, MCP pools and the web server are untouched. `web --no-tui` restarts itself the same way when no request is in flight; a remote agent exits cleanly instead and the controller reconnects. None of this happens on its own when the TUI is driven by a test, CI or a script: under `go test`, with `AGENTDECK_SKIP_UPDATE_CHECK` set, with `CI` truthy, with an `AGENTDECK_TEST_*` marker, or without a terminal on stdin and stdout, the banner reverts to `press ctrl+t to restart agent-deck` and only the keys act (issue #2251).
 
 ## Layout
 

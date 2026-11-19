@@ -8,7 +8,9 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/comms"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 )
 
@@ -47,18 +49,22 @@ func handleInbox(profile string, args []string) {
 	}
 	if err := runInboxWithProfile(os.Stdout, args, profile); err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		os.Exit(inboxExitCode(err))
+		exitCLI(inboxExitCode(err))
 	}
 }
 
 func printInboxUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage: agent-deck inbox <session-id>")
 	fmt.Fprintln(w, "       agent-deck inbox drain [--json] <session-id>")
-	fmt.Fprintln(w, "       agent-deck inbox export [--json]")
+	fmt.Fprintln(w, "       agent-deck inbox export [--json] [--profile <name>] [--after '<cursor-json>' [--with-writer]]")
+	fmt.Fprintln(w, "       agent-deck inbox cursor [--json] [<remote>]")
 	fmt.Fprintln(w, "       agent-deck inbox writer-status [--json]")
+	fmt.Fprintln(w, "       agent-deck inbox peek [--json] [<session-id>|self]")
+	fmt.Fprintln(w, "       agent-deck inbox stats [--json] [--all] [<session-id>|self]")
+	fmt.Fprintln(w, "       agent-deck inbox dead-letter <list|show|retry|purge>")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Drain pending completion events from the parent's durable outbox.")
-	fmt.Fprintln(w, "The `drain` form (issue #1225) collapses last-wins per child and")
+	fmt.Fprintln(w, "The `drain` form (issue #1225) preserves distinct turns per child and")
 	fmt.Fprintln(w, "dedups re-delivery via turn_fingerprint; run it first on every")
 	fmt.Fprintln(w, "heartbeat. Reading clears the inbox.")
 	fmt.Fprintln(w, "The `export` form (issue #1948) READS this host's completion and")
@@ -67,11 +73,20 @@ func printInboxUsage(w io.Writer) {
 	fmt.Fprintln(w, "The `writer-status` form reports whether a notify-daemon is")
 	fmt.Fprintln(w, "actually recording transitions here — without it, an empty export")
 	fmt.Fprintln(w, "cannot be told apart from a host where nothing has been watching.")
+	fmt.Fprintln(w, "The `dead-letter` family safely inspects, retries, or purges terminal")
+	fmt.Fprintln(w, "delivery failures; run `agent-deck inbox dead-letter help` for details.")
 }
 
 func printInboxExportUsage(w io.Writer) {
-	fmt.Fprintln(w, "Usage: agent-deck inbox export [--json]")
+	fmt.Fprintln(w, "Usage: agent-deck inbox export [--json] [--profile <name>] [--after '<cursor-json>' [--with-writer]]")
 	fmt.Fprintln(w, "Print this host's completion/transition records without consuming them.")
+	fmt.Fprintln(w, "Only records of one profile are exported: --profile, else the invoking profile")
+	fmt.Fprintln(w, "(-p). A --profile that differs from -p is an error.")
+	fmt.Fprintln(w, "--after (requires --json) returns only what the cursor does not hold yet:")
+	fmt.Fprintln(w, "turn-journal lines past each child's seq, changed completion-ledger entries")
+	fmt.Fprintln(w, "and _unowned records past its read position, as")
+	fmt.Fprintln(w, "{\"records\":[...],\"cursor_next\":{...}}; --with-writer adds \"writer\".")
+	fmt.Fprintln(w, "The cursor is the cursor_next of the previous call; \"-\" reads it from stdin.")
 }
 
 func printInboxWriterStatusUsage(w io.Writer) {
@@ -164,7 +179,7 @@ func inboxExitCode(err error) int {
 //
 //	agent-deck inbox <session-id>          legacy raw drain (read + truncate)
 //	agent-deck inbox drain [--json] <id>   issue #1225 consumer drain — collapses
-//	                                       last-wins per child and dedups
+//	                                       preserves distinct turns and dedups retries
 //	                                       re-delivery via turn_fingerprint. This
 //	                                       is the conductor's heartbeat step.
 func runInbox(stdout io.Writer, args []string) error {
@@ -179,14 +194,26 @@ func runInboxWithProfile(stdout io.Writer, args []string, explicitProfile string
 			retErr = fmt.Errorf("write inbox output: %w", tracked.err)
 		}
 	}()
+	if len(args) > 0 && args[0] == "dead-letter" {
+		return runInboxDeadLetter(stdout, args[1:])
+	}
 	if len(args) > 0 && args[0] == "drain" {
 		return runInboxDrain(stdout, args[1:], explicitProfile)
 	}
 	if len(args) > 0 && args[0] == "export" {
-		return runInboxExport(stdout, args[1:])
+		return runInboxExport(stdout, args[1:], explicitProfile)
 	}
 	if len(args) > 0 && args[0] == "writer-status" {
 		return runInboxWriterStatus(stdout, args[1:])
+	}
+	if len(args) > 0 && args[0] == "cursor" {
+		return runInboxCursor(stdout, args[1:])
+	}
+	if len(args) > 0 && args[0] == "stats" {
+		return runInboxStats(stdout, args[1:], explicitProfile)
+	}
+	if len(args) > 0 && args[0] == "peek" {
+		return runInboxPeek(stdout, args[1:], explicitProfile)
 	}
 
 	fs := flag.NewFlagSet("inbox", flag.ContinueOnError)
@@ -208,13 +235,86 @@ func runInboxWithProfile(stdout io.Writer, args []string, explicitProfile string
 	return nil
 }
 
+// runInboxDeadLetterRetry and runInboxDeadLetterPurge are the #2062 management
+// subcommands; runInboxDeadLetter in inbox_deadletter_cmd.go dispatches to them.
+func runInboxDeadLetterRetry(stdout io.Writer, args []string) error {
+	fs := flag.NewFlagSet("inbox dead-letter retry", flag.ContinueOnError)
+	asJSON := fs.Bool("json", false, "output JSON")
+	fs.SetOutput(stdout)
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: agent-deck inbox dead-letter retry [--json] <record-id>")
+	}
+	id := fs.Arg(0)
+	target, err := session.RetryDeadLetter(id)
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return json.NewEncoder(stdout).Encode([]session.DeadLetterActionOutcome{
+			{ID: id, Action: "retry", Outcome: "delivered", Reason: "delivered to inbox " + target},
+		})
+	}
+	fmt.Fprintf(stdout, "Delivered dead-letter record %s to inbox %s.\n", id, target)
+	return nil
+}
+
+func runInboxDeadLetterPurge(stdout io.Writer, args []string) error {
+	fs := flag.NewFlagSet("inbox dead-letter purge", flag.ContinueOnError)
+	olderThan := fs.Duration("older-than", 0, "purge records older than this duration")
+	yes := fs.Bool("yes", false, "confirm an unbounded purge")
+	asJSON := fs.Bool("json", false, "output JSON")
+	fs.SetOutput(stdout)
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("inbox dead-letter purge accepts no arguments")
+	}
+	if *olderThan < 0 {
+		return fmt.Errorf("--older-than must be a positive duration")
+	}
+	var results []session.DeadLetterActionOutcome
+	var err error
+	if *olderThan > 0 {
+		results, err = session.PurgeDeadLettersOlderThan(time.Now().Add(-*olderThan))
+	} else if *yes {
+		results, err = session.PurgeAllDeadLetters()
+	} else {
+		return fmt.Errorf("refusing unbounded purge: pass --yes or a positive --older-than duration")
+	}
+	if err != nil {
+		return fmt.Errorf("purge dead letters: %w", err)
+	}
+	if *asJSON {
+		if results == nil {
+			results = []session.DeadLetterActionOutcome{}
+		}
+		return json.NewEncoder(stdout).Encode(results)
+	}
+	removed, skipped := 0, 0
+	for _, r := range results {
+		switch r.Outcome {
+		case "removed":
+			removed++
+		case "skipped":
+			skipped++
+		}
+	}
+	fmt.Fprintf(stdout, "Purged %d dead-letter record(s); skipped %d _unowned record(s) (%s).\n", removed, skipped, session.UnownedPurgeSkipReason)
+	return nil
+}
+
 // runInboxDrain is the issue #1225 consumer path: exactly-once-per-turn,
-// last-wins-per-child. Used by the conductor heartbeat and any machine consumer.
+// exactly-once-per-turn. Used by the conductor heartbeat and any machine consumer.
 func runInboxDrain(stdout io.Writer, args []string, explicitProfile string) error {
 	fs := flag.NewFlagSet("inbox drain", flag.ContinueOnError)
 	asJSON := fs.Bool("json", false, "emit the drained events as a JSON array")
+	strict := fs.Bool("strict", false, "exit 4 when any dead-lettered or _unowned record exists")
 	fs.Usage = func() {
-		fmt.Fprintln(stdout, "Usage: agent-deck inbox drain [--json] [<session-id>|self]")
+		fmt.Fprintln(stdout, "Usage: agent-deck inbox drain [--json] [--strict] [<session-id>|self]")
 		fmt.Fprintln(stdout, "With no id (or 'self'), drains the caller's own session.")
 		fmt.Fprintln(stdout, "Full session IDs resolve across all profiles; titles and shortened IDs")
 		fmt.Fprintln(stdout, "resolve only within the effective profile.")
@@ -232,8 +332,11 @@ func runInboxDrain(stdout io.Writer, args []string, explicitProfile string) erro
 	if err != nil {
 		return err
 	}
+	if caller := callerSessionID(); caller != "" {
+		session.SpoolCommsCall(caller, comms.CallInboxDrain, sessionID)
+	}
 
-	events, err := session.DrainInboxForParent(sessionID)
+	events, withdrawn, err := session.DrainInboxForParentReport(sessionID)
 	if err != nil {
 		return fmt.Errorf("drain inbox: %w", err)
 	}
@@ -249,18 +352,74 @@ func runInboxDrain(stdout io.Writer, args []string, explicitProfile string) erro
 	} else {
 		printInboxEvents(stdout, events)
 	}
+	reportWithdrawnRecords(os.Stderr, withdrawn, *asJSON)
+	// Issue #2834: only the notify-daemon writes these records. With none
+	// running, an empty drain is not "nothing finished", so say so. Text mode
+	// prints it with the drain; --json keeps stdout the bare array.
+	if note := noNotifyDaemonNote(session.ReadWriterStatus()); note != "" {
+		if *asJSON {
+			fmt.Fprintln(os.Stderr, "WARNING: "+note)
+		} else {
+			fmt.Fprintln(stdout, "WARNING: "+note)
+		}
+	}
 
-	deadLetters, err := session.CountDeadLetterRecords()
+	// Messaging audit P1-4 (#2101): a dead letter is parked, not pending
+	// delivery, and nothing can ack it yet, so it must not turn every
+	// heartbeat drain into a failure. Print the per-store counts; exit 4 only
+	// when the caller asked for it with --strict.
+	counts, err := session.CountDeadLetterStores()
 	if err != nil {
 		return fmt.Errorf("count dead letters: %w", err)
 	}
-	if deadLetters > 0 {
+	if total := counts.Total(); total > 0 {
 		if !*asJSON {
-			fmt.Fprintf(stdout, "WARNING: %d dead-lettered event(s) require attention.\n", deadLetters)
+			fmt.Fprintf(stdout, "WARNING: %d dead-lettered event(s) require attention (dead-letter: %d, _unowned: %d); see 'agent-deck inbox dead-letter list'.\n",
+				total, counts.DeadLetter, counts.Unowned)
 		}
-		return &deadLettersPendingError{count: deadLetters}
+		if *strict {
+			return &deadLettersPendingError{count: total}
+		}
 	}
 	return nil
+}
+
+// noNotifyDaemonNote is the one sentence the parent-facing surfaces (inbox
+// drain, the fleet line) print when no notify-daemon is writing completion
+// records on this host (#2834), or "" when one is.
+func noNotifyDaemonNote(ws session.WriterStatus) string {
+	if ws.Running {
+		return ""
+	}
+	return "no notify-daemon running; completions are not being recorded, so an empty drain or 0 done does not mean nothing finished. Start one with `agent-deck notify-daemon` (`agent-deck conductor setup` installs it as a service)."
+}
+
+// reportWithdrawnRecords logs the records a drain retired unshown because
+// the parent already read the result they announce. It goes to stderr so
+// stdout stays the delivered records (a JSON array with --json, unchanged
+// for every consumer): one line "withdrawn N ..." in text mode, one JSON
+// object {"withdrawn": N, "withdrawn_records": [...]} with --json. Nothing
+// is printed when nothing was withdrawn.
+func reportWithdrawnRecords(w io.Writer, withdrawn []session.TransitionNotificationEvent, asJSON bool) {
+	if len(withdrawn) == 0 {
+		return
+	}
+	type withdrawnRecord struct {
+		Child    string `json:"child_session_id"`
+		Title    string `json:"child_title,omitempty"`
+		TurnUUID string `json:"turn_uuid"`
+	}
+	records := make([]withdrawnRecord, 0, len(withdrawn))
+	names := make([]string, 0, len(withdrawn))
+	for _, ev := range withdrawn {
+		records = append(records, withdrawnRecord{Child: ev.ChildSessionID, Title: ev.ChildTitle, TurnUUID: ev.TurnUUID})
+		names = append(names, ev.ChildSessionID+"@"+ev.TurnUUID)
+	}
+	if asJSON {
+		_ = json.NewEncoder(w).Encode(map[string]any{"withdrawn": len(records), "withdrawn_records": records})
+		return
+	}
+	fmt.Fprintf(w, "withdrawn %d record(s) already read with session output: %s\n", len(records), strings.Join(names, ", "))
 }
 
 func resolveInboxDrainSession(identifier string) (string, error) {
@@ -413,11 +572,40 @@ func resolveSelfSessionID() (string, error) {
 			return s, nil
 		}
 	}
-	if s := strings.TrimSpace(GetCurrentSessionID()); s != "" {
-		return s, nil
+	if inst := selfInstanceByTmuxName(currentAgentDeckTmuxName()); inst != nil {
+		return inst.ID, nil
 	}
 	return "", fmt.Errorf("no session id given and could not resolve the current session " +
 		"(set AGENTDECK_INSTANCE_ID, run inside an agent-deck tmux session, or pass an explicit id)")
+}
+
+// selfInstanceByTmuxName finds the session that owns the tmux session name,
+// looking in the effective profile first and then the others. The name ends in
+// a random suffix, not the session ID, so it is matched whole.
+func selfInstanceByTmuxName(name string) *session.Instance {
+	if name == "" {
+		return nil
+	}
+	effective := session.GetEffectiveProfile("")
+	profiles := []string{effective}
+	if all, err := session.ListProfiles(); err == nil {
+		for _, p := range all {
+			if p != effective {
+				profiles = append(profiles, p)
+			}
+		}
+	}
+	for _, profile := range profiles {
+		storage, instances, _, err := loadSessionData(profile)
+		if err != nil {
+			continue
+		}
+		_ = storage.Close()
+		if inst := instanceOwningTmuxName(name, instances); inst != nil {
+			return inst
+		}
+	}
+	return nil
 }
 
 // runInboxExport is the issue #1948 remote-side READ: it prints this host's
@@ -428,9 +616,20 @@ func resolveSelfSessionID() (string, error) {
 // Non-destructive is the contract, not a side effect: two conductors draining
 // this host must both get the records, and this host's own conductor must still
 // find its inbox exactly as it left it.
-func runInboxExport(stdout io.Writer, args []string) error {
+// inboxExportStdin is where `inbox export --after -` reads its cursor; a test
+// seam.
+var inboxExportStdin = func() io.Reader { return os.Stdin }
+
+// maxInboxExportCursorBytes bounds the cursor read from stdin (one entry per
+// remote child active within the talkback horizon, about 80 bytes each).
+const maxInboxExportCursorBytes = 64 << 20
+
+func runInboxExport(stdout io.Writer, args []string, explicitProfile string) error {
 	fs := flag.NewFlagSet("inbox export", flag.ContinueOnError)
 	asJSON := fs.Bool("json", false, "emit the records as a JSON array")
+	scope := fs.String("profile", "", "export only this profile's records (default: the invoking profile)")
+	after := fs.String("after", "", "incremental export: only records past this cursor JSON, or - to read it from stdin (wrapped with cursor_next)")
+	withWriter := fs.Bool("with-writer", false, "with --after: include the writer status in the reply")
 	fs.Usage = func() { printInboxExportUsage(stdout) }
 	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		return err
@@ -439,8 +638,47 @@ func runInboxExport(stdout io.Writer, args []string) error {
 		fs.Usage()
 		return fmt.Errorf("inbox export takes no positional arguments")
 	}
+	profile, err := inboxExportProfile(*scope, explicitProfile)
+	if err != nil {
+		return err
+	}
+	afterSet := false
+	fs.Visit(func(f *flag.Flag) { afterSet = afterSet || f.Name == "after" })
+	if afterSet {
+		if !*asJSON {
+			return fmt.Errorf("inbox export --after requires --json")
+		}
+		raw := *after
+		if raw == "-" {
+			// The cursor grows with the remote's fleet; stdin has no argv cap.
+			b, err := io.ReadAll(io.LimitReader(inboxExportStdin(), maxInboxExportCursorBytes+1))
+			if err != nil {
+				return fmt.Errorf("inbox export --after -: read cursor from stdin: %w", err)
+			}
+			if len(b) > maxInboxExportCursorBytes {
+				return fmt.Errorf("inbox export --after -: cursor larger than %d bytes", maxInboxExportCursorBytes)
+			}
+			raw = string(b)
+		}
+		cursor, err := session.ParseRemoteCursor(raw)
+		if err != nil {
+			return err
+		}
+		exp, err := session.ExportRecordsAfter(profile, cursor)
+		if err != nil {
+			return fmt.Errorf("export inbox records: %w", err)
+		}
+		if *withWriter {
+			ws := session.ReadWriterStatus()
+			exp.Writer = &ws
+		}
+		return json.NewEncoder(stdout).Encode(exp)
+	}
+	if *withWriter {
+		return fmt.Errorf("inbox export --with-writer requires --after")
+	}
 
-	records, err := session.ExportPendingRecords()
+	records, err := session.ExportPendingRecords(profile)
 	if err != nil {
 		return fmt.Errorf("export inbox records: %w", err)
 	}
@@ -459,6 +697,29 @@ func runInboxExport(stdout io.Writer, args []string) error {
 	printInboxEventLines(stdout, records)
 	fmt.Fprintf(stdout, "\nExported %d record(s). Nothing was consumed.\n", len(records))
 	return nil
+}
+
+// inboxExportProfile is the one profile an export is scoped to (#2539): the
+// --profile flag, else the invoking profile. The host-wide inbox, journal and
+// ledger directories hold every profile's records, so there is no unscoped
+// export, and a --profile that disagrees with -p is refused rather than
+// silently preferring one of them.
+func inboxExportProfile(flagProfile, explicitProfile string) (string, error) {
+	flagProfile, explicitProfile = strings.TrimSpace(flagProfile), strings.TrimSpace(explicitProfile)
+	if flagProfile != "" {
+		if explicitProfile != "" && explicitProfile != flagProfile {
+			return "", fmt.Errorf("inbox export: --profile %q disagrees with -p %q", flagProfile, explicitProfile)
+		}
+		return flagProfile, nil
+	}
+	profile, err := session.ResolveProfileForStorage(explicitProfile)
+	if err != nil {
+		return "", fmt.Errorf("inbox export: resolve profile: %w", err)
+	}
+	if strings.TrimSpace(profile) == "" {
+		return "", fmt.Errorf("inbox export: no profile to scope the export to")
+	}
+	return profile, nil
 }
 
 // runInboxWriterStatus answers the question an empty export cannot: is anything
@@ -524,6 +785,20 @@ func printInboxEventLines(stdout io.Writer, events []session.TransitionNotificat
 		if ev.SourceRemote != "" {
 			fmt.Fprintf(stdout, " remote=%s", ev.SourceRemote)
 		}
+		if ev.Tier != "" {
+			fmt.Fprintf(stdout, " tier=%s trigger=%s", ev.Tier, ev.Trigger)
+		}
+		// Comms redesign PR5: a reply to the drainer's own tagged send.
+		if ev.TargetKind == session.InboxTargetKindReply {
+			fmt.Fprintf(stdout, " reply from=%s", ev.ChildSessionID)
+		}
 		fmt.Fprintln(stdout)
+		// Issue #2469: the record carries the child's text so the reader
+		// (a conductor's heartbeat drain) does not re-read the child.
+		if text := strings.TrimSpace(ev.Text); text != "" {
+			for _, line := range strings.Split(text, "\n") {
+				fmt.Fprintf(stdout, "    %s\n", line)
+			}
+		}
 	}
 }

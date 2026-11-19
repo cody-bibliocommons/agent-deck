@@ -61,7 +61,8 @@ func doCheckAndWarnTmuxVersion(probe VersionProbe, w io.Writer, goos, suppress s
 }
 
 func defaultTmuxVersionProbe() (string, error) {
-	out, err := exec.Command("tmux", "-V").CombinedOutput()
+	// #nosec G204 -- "tmux" or an absolute PATH entry, fixed argv
+	out, err := commandCombinedOutput(exec.Command(defaultBinary(), "-V"))
 	if err != nil {
 		return "", err
 	}

@@ -1,6 +1,31 @@
 package tmux
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+func TestWrappedClaudeDraftMenuWordsAreNotPickerEvidence(t *testing.T) {
+	rule := strings.Repeat("─", 60)
+	pane := rule + "\n❯ Do you want to proceed? This is user text that wraps across the pane width\n" +
+		"  and says Allow once without opening any menu.\n" + rule + "\n  Haiku 4.5\n"
+	d := NewPromptDetector("claude")
+	if !d.HasPrompt(pane) {
+		t.Fatal("wrapped composer was not recognized")
+	}
+	if got := d.ClassifySubstate(pane); got == SubstateInteractiveMenu {
+		t.Fatal("user text inside a wrapped composer was classified as an interactive menu")
+	}
+}
+
+func TestClaudeQuestionProseWithoutChoicesIsNotMenu(t *testing.T) {
+	rule := strings.Repeat("─", 60)
+	pane := "● Do you want to review the summary? I can help.\n" + rule +
+		"\n❯ \n" + rule + "\n  Haiku 4.5\n"
+	if got := NewPromptDetector("claude").ClassifySubstate(pane); got == SubstateInteractiveMenu {
+		t.Fatal("recent conversation prose without selectable choices was classified as a menu")
+	}
+}
 
 // Honest Status v2: ClassifySubstate distinguishes distinct session conditions
 // that all otherwise look like "running"/"waiting" to a coarse observer. The
@@ -94,6 +119,41 @@ func TestClassifySubstate_IdleAtEmptyPrompt(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := d.ClassifySubstate(tc.content); got != SubstateIdleAtEmptyPrompt {
 				t.Errorf("got %q, want %q for %s", got, SubstateIdleAtEmptyPrompt, tc.name)
+			}
+		})
+	}
+}
+
+// TestClassifySubstate_InteractiveMenu pins #2185: an open AskUserQuestion
+// picker or permission dialog satisfies the same pane-text checks as a bare
+// empty prompt (both make hasClaudePrompt true), but must not be reported as
+// idle-at-empty-prompt — a supervisor reading that label would assume nothing
+// is happening when work is in fact blocked on an unanswered question.
+func TestClassifySubstate_InteractiveMenu(t *testing.T) {
+	d := NewPromptDetector("claude")
+	cases := []struct {
+		name    string
+		content string
+	}{
+		{
+			name: "open AskUserQuestion menu (issue reproduction)",
+			content: "Which approach should I take?\n" +
+				"❯ 1. Option A\n" +
+				"  2. Option B\n" +
+				"\n" +
+				"Enter to select · Tab/Arrow keys to navigate · Esc to cancel",
+		},
+		{
+			name: "permission dialog yes/no",
+			content: "│ Do you want to proceed?\n" +
+				"❯ Yes\n" +
+				"  No, and tell Claude what to do differently",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := d.ClassifySubstate(tc.content); got != SubstateInteractiveMenu {
+				t.Errorf("got %q, want %q for %s", got, SubstateInteractiveMenu, tc.name)
 			}
 		})
 	}

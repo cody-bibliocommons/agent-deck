@@ -1490,7 +1490,9 @@ func TestBuildCodexCommand_CustomWrapperPreservesToolIdentity(t *testing.T) {
 	// Plant a rollout file under HOME/.codex so the resume branch is exercised.
 	writeFakeCodexRollout(t, filepath.Join(tmpDir, ".codex"), inst.CodexSessionID)
 	cmd = inst.buildCodexCommand(inst.Command)
-	if !strings.Contains(cmd, "codex-wrapper resume 019d1af6-c425-7791-8fd1-38c0fc43062c") {
+	// Launch flags (yolo/model/identity injection) sit between the wrapper
+	// and the resume subcommand, so check the two ends rather than adjacency.
+	if !strings.Contains(cmd, "AGENTDECK_PROFILE=_test codex-wrapper") || !strings.HasSuffix(cmd, " resume 019d1af6-c425-7791-8fd1-38c0fc43062c") {
 		t.Fatalf("buildCodexCommand should resume through the custom wrapper, got %q", cmd)
 	}
 }
@@ -1635,6 +1637,9 @@ func TestBuildCodexCommand_ConfiguredCommandResume(t *testing.T) {
 	inst.CodexSessionID = id
 	writeFakeCodexRollout(t, filepath.Join(tmpDir, ".codex"), id)
 
+	// Identity injection sits between the command and `resume`; this test
+	// pins the configured-command/CODEX_HOME adjacency, so switch it off.
+	inst.IdentityInjectionDisabled = true
 	cmd := inst.buildCodexCommand("codex")
 	if !strings.Contains(cmd, "codex-v2 resume "+id) {
 		t.Fatalf("configured Codex command should be used for resume, got %q", cmd)
@@ -1694,6 +1699,9 @@ func TestBuildCodexCommand_InlineCodexHomeForRolloutCheck(t *testing.T) {
 	inst.CodexSessionID = id
 	writeFakeCodexRollout(t, codexHome, id)
 
+	// Identity injection sits between the command and `resume`; this test
+	// pins the configured-command/CODEX_HOME adjacency, so switch it off.
+	inst.IdentityInjectionDisabled = true
 	cmd := inst.buildCodexCommand("codex")
 	if !strings.Contains(cmd, "CODEX_HOME="+codexHome+" codex resume "+id) {
 		t.Fatalf("inline CODEX_HOME command should resume from configured home, got %q", cmd)
@@ -1728,6 +1736,9 @@ func TestBuildCodexCommand_QuotedInlineCodexHomeWithSpaces(t *testing.T) {
 	inst.CodexSessionID = id
 	writeFakeCodexRollout(t, codexHome, id)
 
+	// Identity injection sits between the command and `resume`; this test
+	// pins the configured-command/CODEX_HOME adjacency, so switch it off.
+	inst.IdentityInjectionDisabled = true
 	cmd := inst.buildCodexCommand("codex")
 	if !strings.Contains(cmd, `CODEX_HOME="`+codexHome+`" codex resume `+id) {
 		t.Fatalf("quoted inline CODEX_HOME command should resume from configured home, got %q", cmd)
@@ -3458,14 +3469,14 @@ func TestInstance_HookFastPath_CodexRunningStale(t *testing.T) {
 	}
 }
 
-func TestInstance_HookFastPath_CodexWaitingFreshness(t *testing.T) {
+func TestInstance_HookFastPath_CodexWaitingExpiresPromptly(t *testing.T) {
 	inst := NewInstanceWithTool("hook-codex-waiting", "/tmp/test", "codex")
 	inst.hookStatus = "waiting"
-	inst.hookLastUpdate = time.Now().Add(-30 * time.Second)
+	inst.hookLastUpdate = time.Now().Add(-6 * time.Second)
 
 	_, fresh := inst.GetHookStatus()
-	if !fresh {
-		t.Error("codex waiting hook should be fresh for waiting window")
+	if fresh {
+		t.Error("codex waiting hook should expire promptly so tmux can detect a new turn")
 	}
 }
 
@@ -3843,7 +3854,7 @@ exit 1
 		TmuxSocketName: "test-socket",
 		tmuxSession:    &tmux.Session{Name: "multi-window", SocketName: "test-socket"},
 	}
-	pids, err := inst.collectTmuxPaneProcessTreePIDs()
+	pids, err := inst.collectTmuxPaneProcessTreePIDs(nil)
 	if err != nil {
 		t.Fatalf("collect session panes: %v", err)
 	}
@@ -3870,7 +3881,7 @@ func TestCollectProcessTreePIDsViaPgrepReportsFailure(t *testing.T) {
 	}
 	t.Setenv("PATH", dir)
 
-	pids, err := collectProcessTreePIDsViaPgrep(100)
+	pids, err := collectProcessTreePIDsViaPgrep(context.Background(), 100)
 	if err == nil {
 		t.Fatal("pgrep execution failure must make process-tree discovery incomplete")
 	}
@@ -4045,10 +4056,10 @@ func TestQueryCodexSessionFromDockerProcFDCompleteness(t *testing.T) {
 
 func TestCodexProcessCandidateDiscoveryFailureIsUndetermined(t *testing.T) {
 	inst := &Instance{}
-	if _, err := inst.collectCodexProcessCandidates(); err == nil {
+	if _, err := inst.collectCodexProcessCandidates(nil); err == nil {
 		t.Fatal("missing tmux session must make candidate discovery undetermined")
 	}
-	if _, _, err := inst.queryCodexSessionFromProcessFiles(); err == nil {
+	if _, _, err := inst.queryCodexSessionFromProcessFiles(nil); err == nil {
 		t.Fatal("incomplete candidate discovery must reach the process-file caller")
 	}
 }
@@ -4212,10 +4223,21 @@ func TestInstance_UpdateHookStatus_UsesAnchorWhenHookSessionIDMissing_Claude(t *
 }
 
 func TestInstance_UpdateHookStatus_UsesAnchorWhenHookSessionIDMissing_Codex(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	codexHome := filepath.Join(home, ".codex")
+	t.Setenv("CODEX_HOME", codexHome)
 
 	inst := NewInstanceWithTool("hook-anchor-codex", "/tmp/test", "codex")
+	// The Codex notify writer stores each payload id as the anchor, so an
+	// ephemeral title thread can land there too: a turn end binds the anchor
+	// only once its thread owns a rollout.
 	WriteHookSessionAnchor(inst.ID, "anchor-codex-1")
+	inst.UpdateHookStatus(&HookStatus{Status: "waiting", Event: "turn/completed", UpdatedAt: time.Now()})
+	if inst.CodexSessionID != "" {
+		t.Fatalf("rollout-less anchor bound on a turn end: %q", inst.CodexSessionID)
+	}
+	seedCodex155Rollout(t, codexHome, "anchor-codex-1", "turn-1")
 
 	hookStatus := &HookStatus{
 		Status:    "waiting",

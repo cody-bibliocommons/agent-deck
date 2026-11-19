@@ -32,6 +32,11 @@ type SetupWizard struct {
 
 	// Theme setting
 	selectedTheme int // 0=dark, 1=light
+
+	// reportKey is the main-screen key of "Report a problem" (hotkey
+	// report_problem), named on the Ready step so new users learn it exists.
+	// Empty (the user unbound it) drops the line.
+	reportKey string
 }
 
 // Wizard steps
@@ -54,13 +59,28 @@ func NewSetupWizard() *SetupWizard {
 		visible:             false,
 		complete:            false,
 		currentStep:         0,
-		toolOptions:         []string{"claude", "gemini", "opencode", "codex", "pi", "shell", "copilot", "crush", "cursor", "hermes", "deepseek", "kiro-cli"},
+		toolOptions:         []string{"claude", "gemini", "opencode", "opencode2", "codex", "pi", "shell", "copilot", "crush", "muse", "cursor", "hermes", "deepseek", "omp", "kiro-cli"},
 		selectedTool:        0, // Default to Claude
 		dangerousMode:       false,
 		useDefaultConfigDir: true,
 		configDirInput:      configInput,
 		selectedTheme:       0, // Default to dark
+		reportKey:           defaultHotkeyBindings[hotkeyReportProblem],
 	}
+}
+
+// SetReportKey sets the key the Ready step names for "Report a problem".
+func (w *SetupWizard) SetReportKey(key string) {
+	w.reportKey = strings.TrimSpace(key)
+}
+
+// ReportTip is the onboarding line about reporting a problem, or "" when the
+// action is unbound.
+func (w *SetupWizard) ReportTip() string {
+	if w.reportKey == "" {
+		return ""
+	}
+	return "Found a bug or have an idea? Press " + w.reportKey + " on the main screen to report it as a GitHub issue."
 }
 
 // Show makes the wizard visible
@@ -342,8 +362,12 @@ func (w *SetupWizard) View() string {
 		Padding(2, 4).
 		Width(dialogWidth)
 
+	// Key hints break between items, never mid-hint ("Esc:" / "back").
+	helpWidth := dialogWidth - dialogStyle.GetHorizontalPadding()
+
 	// Build content based on current step
 	var content strings.Builder
+	var sections dialogSections
 
 	// Step indicator
 	stepNames := []string{"Welcome", "Tool", "Claude", "Ready"}
@@ -375,6 +399,12 @@ func (w *SetupWizard) View() string {
 		content.WriteString("\n")
 		content.WriteString(lipgloss.NewStyle().Foreground(ColorCyan).Render("  - Claude Code settings"))
 		content.WriteString("\n\n")
+		// Esc here skips the rest of the wizard, so the report tip is on
+		// this step as well as on Ready.
+		if tip := w.ReportTip(); tip != "" {
+			content.WriteString(labelStyle.Render(tip))
+			content.WriteString("\n\n")
+		}
 		content.WriteString(subtitleStyle.Render("Press Enter to continue or Esc to use defaults."))
 		content.WriteString("\n\n")
 		content.WriteString(helpStyle.Render("Enter: continue"))
@@ -384,17 +414,25 @@ func (w *SetupWizard) View() string {
 		content.WriteString("\n\n")
 		content.WriteString(subtitleStyle.Render("This tool will be pre-selected when creating new sessions:"))
 		content.WriteString("\n\n")
+		// One body section per tool so a short terminal scrolls the list
+		// around the selection instead of cutting off the step indicator.
+		sections.head = []string{strings.TrimSuffix(content.String(), "\n")}
+		sections.focus = w.selectedTool
+		content.Reset()
 
 		toolDescriptions := map[string]string{
-			"claude":   "Claude Code - Anthropic's AI coding assistant",
-			"gemini":   "Gemini CLI - Google's AI assistant",
-			"opencode": "OpenCode - Open source AI coding tool",
-			"codex":    "Codex CLI - OpenAI's coding assistant",
-			"pi":       "Pi CLI - lightweight coding assistant",
-			"crush":    "Crush - Charm's terminal-first AI coding assistant",
-			"shell":    "Shell - No AI tool (plain terminal)",
-			"cursor":   "Cursor Agent - Cursor CLI (agent / cursor agent)",
-			"kiro-cli": "Kiro CLI - AWS agentic CLI (kiro-cli chat)",
+			"claude":    "Claude Code - Anthropic's AI coding assistant",
+			"gemini":    "Gemini CLI - Google's AI assistant",
+			"opencode":  "OpenCode - Open source AI coding tool",
+			"opencode2": "OpenCode 2 - OpenCode v2 launcher",
+			"codex":     "Codex CLI - OpenAI's coding assistant",
+			"pi":        "Pi CLI - lightweight coding assistant",
+			"omp":       "Oh My Pi - batteries-included coding agent (omp)",
+			"crush":     "Crush - Charm's terminal-first AI coding assistant",
+			"muse":      "Muse Code - Meta's terminal AI coding assistant",
+			"shell":     "Shell - No AI tool (plain terminal)",
+			"cursor":    "Cursor Agent - Cursor CLI (agent / cursor agent)",
+			"kiro-cli":  "Kiro CLI - AWS agentic CLI (kiro-cli chat)",
 		}
 
 		for i, tool := range w.toolOptions {
@@ -407,17 +445,18 @@ func (w *SetupWizard) View() string {
 			} else {
 				line = unselectedStyle.Render(icon + " " + tool)
 			}
-			content.WriteString("  " + line)
-			content.WriteString(lipgloss.NewStyle().Foreground(ColorTextDim).Render("  " + desc))
-			content.WriteString("\n")
+			sections.body = append(sections.body, "  "+line+
+				lipgloss.NewStyle().Foreground(ColorTextDim).Render("  "+desc))
 		}
 
-		content.WriteString("\n")
-		content.WriteString(helpStyle.Render("Up/Down: select | Enter: continue | Esc: back"))
+		sections.foot = []string{"", helpStyle.Render(renderDialogFooterRows(helpWidth, 2, " | ", []string{"Up/Down: select", "Enter: continue", "Esc: back"}))}
 
 	case stepClaudeSettings:
 		content.WriteString(titleStyle.Render("Claude Code Settings"))
-		content.WriteString("\n\n")
+		// One body section per setting (blank rows between them) so a short
+		// terminal scrolls the settings around the cursor.
+		sections.head = []string{content.String(), ""}
+		content.Reset()
 
 		// Dangerous mode checkbox
 		checkbox := checkboxOff
@@ -433,7 +472,8 @@ func (w *SetupWizard) View() string {
 		content.WriteString(cursor + checkbox + " " + style.Render("Enable dangerous mode"))
 		content.WriteString("\n")
 		content.WriteString(lipgloss.NewStyle().Foreground(ColorTextDim).Render("    Skip permission prompts (--dangerously-skip-permissions)"))
-		content.WriteString("\n\n")
+		sections.body = append(sections.body, content.String(), "")
+		content.Reset()
 
 		// Auto mode checkbox
 		checkbox = checkboxOff
@@ -449,7 +489,8 @@ func (w *SetupWizard) View() string {
 		content.WriteString(cursor + checkbox + " " + style.Render("Enable auto mode"))
 		content.WriteString("\n")
 		content.WriteString(lipgloss.NewStyle().Foreground(ColorTextDim).Render("    Classifier-based auto-approval (--permission-mode auto)"))
-		content.WriteString("\n\n")
+		sections.body = append(sections.body, content.String(), "")
+		content.Reset()
 
 		// Config directory radio buttons
 		cursor = "  "
@@ -480,9 +521,10 @@ func (w *SetupWizard) View() string {
 		} else {
 			content.WriteString(lipgloss.NewStyle().Foreground(ColorTextDim).Render("(press Space to select)"))
 		}
-		content.WriteString("\n\n")
-
-		content.WriteString(helpStyle.Render("Up/Down: navigate | Space: toggle | Enter: continue | Esc: back"))
+		sections.body = append(sections.body, content.String())
+		sections.focus = 2 * w.claudeSettingsCursor
+		content.Reset()
+		sections.foot = []string{"", helpStyle.Render(renderDialogFooterRows(helpWidth, 2, " | ", []string{"Up/Down: navigate", "Space: toggle", "Enter: continue", "Esc: back"}))}
 
 	case stepReady:
 		content.WriteString(titleStyle.Render("Ready to Go!"))
@@ -517,13 +559,28 @@ func (w *SetupWizard) View() string {
 		}
 
 		content.WriteString("\n")
+		if tip := w.ReportTip(); tip != "" {
+			content.WriteString(labelStyle.Render(tip))
+			content.WriteString("\n\n")
+		}
 		content.WriteString(subtitleStyle.Render("Press Enter to save and start using Agent Deck!"))
 		content.WriteString("\n\n")
-		content.WriteString(helpStyle.Render("Enter: save & finish | Esc: back"))
+		content.WriteString(helpStyle.Render(renderDialogFooterRows(helpWidth, 2, " | ", []string{"Enter: save & finish", "Esc: back"})))
 	}
 
-	// Wrap in dialog box
-	dialog := dialogStyle.Render(content.String())
+	// Wrap in dialog box, never taller than the screen. A step without
+	// sections pins its last text row (the key hint) and what follows it
+	// as the foot, so a short terminal never cuts the hint off.
+	if sections.head == nil {
+		rows := strings.Split(content.String(), "\n")
+		last := len(rows) - 1
+		for last > 0 && strings.TrimSpace(rows[last]) == "" {
+			last--
+		}
+		sections.head = []string{strings.Join(rows[:last], "\n")}
+		sections.foot = rows[last:]
+	}
+	dialog := renderFittedDialog(dialogStyle, w.height, sections)
 
 	// Center the dialog using lipgloss.Place
 	return lipgloss.Place(

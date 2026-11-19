@@ -3,14 +3,18 @@ package ui
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strings"
 	"unicode"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/asheshgoplani/agent-deck/internal/git"
 	"github.com/asheshgoplani/agent-deck/internal/session"
@@ -137,6 +141,10 @@ const (
 	focusBranch                      // branch input (conditional — only when worktree enabled).
 	focusOptions                     // tool-specific options panel (conditional).
 	focusRemoteMCPs                  // MCPs defined on the target remote (conditional, remote targets only).
+	focusWhere                       // where the session runs: this machine, a remote, a new sandbox (conditional, local openings only).
+	focusCreate                      // explicit "[ Create session ]" button; the one row where Enter submits in walk mode.
+	focusHooks                       // the Claude hooks line (conditional: Claude picked, hooks undecided).
+	focusMore                        // the "More options" toggle (worktree, Docker sandbox, multi-repo).
 )
 
 // New session dialog: outer box and textinput widths stay in sync so long
@@ -167,6 +175,7 @@ type NewDialog struct {
 	geminiOptions         *YoloOptionsPanel   // Gemini YOLO panel (concrete for value extraction).
 	codexOptions          *YoloOptionsPanel   // Codex YOLO panel (concrete for value extraction).
 	hermesOptions         *YoloOptionsPanel   // Hermes YOLO panel (concrete for value extraction).
+	ompOptions            *OMPOptionsPanel    // Full OMP harness controls.
 	toolOptions           OptionsPanel        // Currently active tool options panel (nil if none).
 	focusTargets          []focusTarget       // Ordered list of active focusable elements.
 	focusIndex            int                 // Index into focusTargets.
@@ -197,6 +206,10 @@ type NewDialog struct {
 	branchAutoSet   bool   // true if branch was auto-derived from session name.
 	branchPrefix    string // configured prefix for auto-generated branch names.
 	branchPicker    *BranchPickerDialog
+	// titleTaken reports whether a session title is already used, by an
+	// existing session or one still being created. Home sets it; the derived
+	// name (preview and create) skips taken titles (#2913).
+	titleTaken func(string) bool
 	// Docker sandbox support.
 	sandboxEnabled    bool
 	inheritedExpanded bool             // whether the inherited settings section is expanded.
@@ -220,9 +233,9 @@ type NewDialog struct {
 	conductorCursor   int                 // 0 = "None", 1..N index into conductorSessions
 
 	// enterAdvances mirrors config.toml [ui] new_session_enter_advances (PR
-	// #1295). False (default) preserves today's behavior: Enter on the free-text
-	// Name/Branch fields submits the form. True makes Enter advance focus
-	// instead, with Ctrl+S as the explicit submit. Ctrl+S submits in both modes.
+	// #1295). False (default since ASK-110): Enter creates from any row. True
+	// makes Enter walk to the next row, with the Create button or Ctrl+S as the
+	// submit. Ctrl+S submits in both modes.
 	enterAdvances bool
 
 	// remoteMCPs lists the MCP names defined on the target remote (its
@@ -230,9 +243,30 @@ type NewDialog struct {
 	// local opening never populates it, so the row is absent for local
 	// sessions. remoteMCPChecked marks the picks; remoteMCPCursor is the
 	// highlighted name.
-	remoteMCPs       []string
-	remoteMCPChecked map[string]bool
-	remoteMCPCursor  int
+	remoteName          string
+	remoteTarget        bool
+	remoteCatalog       *session.RemoteCreationCatalog
+	localPresetCommands []string
+	remoteMCPs          []string
+	remoteMCPChecked    map[string]bool
+	remoteMCPCursor     int
+	// whereChoices feeds the "Where" row of a local opening (this machine,
+	// configured remotes, new sandbox per provider); whereCursor is the
+	// pick. Cleared on every opening; see newdialog_where.go.
+	whereChoices []whereChoice
+	whereCursor  int
+
+	// Onboarding (ASK-211, newdialog_onboarding.go). toolInstalled maps each
+	// local tool to whether it is installed (nil: unknown, all allowed).
+	// hooksUndecided/hooksTicked drive the Claude hooks line; moreOptions
+	// opens the folded worktree/Docker/multi-repo rows.
+	toolInstalled  map[string]bool
+	hooksUndecided bool
+	hooksTicked    bool
+	moreOptions    bool
+	// firstSession folds the model rows and the tool's options under
+	// "More options" too, for the profile's first session (onboarding).
+	firstSession bool
 }
 
 // viewportDialogContent keeps the dialog's identity and primary action pinned
@@ -320,6 +354,15 @@ func viewportDialogContent(content string, width, height, focusLogicalLine int) 
 		showDown = end < bodyEnd
 	}
 
+	// A label rendered on its own line (e.g. the Account: pill row) can land
+	// exactly on the cutoff, showing the label with none of its values and
+	// no hint that it's mid-field rather than genuinely empty. Drop that
+	// trailing bare label so the cut falls between whole fields.
+	if end > start && end < bodyEnd && isBareFieldLabel(lines[end-1]) {
+		end--
+		showDown = end < bodyEnd
+	}
+
 	dim := lipgloss.NewStyle().Foreground(ColorComment)
 	visible := append([]string(nil), lines[:headerEnd]...)
 	if showUp {
@@ -331,6 +374,24 @@ func viewportDialogContent(content string, width, height, focusLogicalLine int) 
 	}
 	visible = append(visible, footer...)
 	return strings.Join(visible, "\n")
+}
+
+// isBareFieldLabel reports whether a rendered dialog row is nothing but a
+// field label — plain words ending in ":" with no value after it, e.g.
+// "Account:" or "▶ Account:".
+func isBareFieldLabel(line string) bool {
+	label := strings.TrimSpace(stripAnsi(line))
+	label = strings.TrimSpace(strings.TrimPrefix(label, "▶ "))
+	words, ok := strings.CutSuffix(label, ":")
+	if !ok || words == "" {
+		return false
+	}
+	for _, r := range words {
+		if r != ' ' && !(r >= 'a' && r <= 'z') && !(r >= 'A' && r <= 'Z') {
+			return false
+		}
+	}
+	return true
 }
 
 // dialogSnapshot captures form state so the recent picker can restore on cancel.
@@ -373,7 +434,7 @@ func displayCommandPreset(cmd string) string {
 // flag off FilterVisibleToolNames is a no-op, so the list is byte-identical to
 // before.
 func buildPresetCommands() []string {
-	presets := []string{"", "claude", "gemini", "opencode", "codex", "pi", "copilot", "crush", "cursor", "hermes", "deepseek", "kiro-cli"}
+	presets := []string{"", "claude", "gemini", "opencode", "opencode2", "codex", "pi", "copilot", "crush", "muse", "cursor", "hermes", "deepseek", "omp", "kiro-cli"}
 	if customTools := session.GetCustomToolNames(); len(customTools) > 0 {
 		presets = append(presets, customTools...)
 	}
@@ -382,6 +443,9 @@ func buildPresetCommands() []string {
 
 // RefreshPresetCommands rebuilds the tool picker after config changes.
 func (d *NewDialog) RefreshPresetCommands() {
+	if d.remoteTarget {
+		return
+	}
 	prev := d.GetSelectedCommand()
 	d.presetCommands = buildPresetCommands()
 	d.commandCursor = 0
@@ -395,15 +459,14 @@ func (d *NewDialog) RefreshPresetCommands() {
 }
 
 // newSessionEnterAdvancesFromConfig reads config.toml [ui]
-// new_session_enter_advances. Enter-advances is the default (mechanism from PR
-// #1295): when the config is missing or the key is unset, this returns true so
-// Enter advances between fields and Ctrl+S submits. A literal `= false` opts
-// out. Defaulting to true on load error keeps the safer behavior even when the
-// config can't be read.
+// new_session_enter_advances. Enter-creates is the default (ASK-110): when the
+// config is missing, unreadable or the key is unset, this returns false so
+// Enter creates from any row. A literal `= true` opts into the walk where
+// Enter advances and only the Create button or Ctrl+S submits.
 func newSessionEnterAdvancesFromConfig() bool {
 	cfg, err := session.LoadUserConfig()
 	if err != nil || cfg == nil {
-		return true
+		return false
 	}
 	return cfg.UI.GetNewSessionEnterAdvances()
 }
@@ -484,6 +547,7 @@ func NewNewDialog() *NewDialog {
 		geminiOptions:   NewYoloOptionsPanel("Gemini", "YOLO mode - auto-approve all"),
 		codexOptions:    NewYoloOptionsPanel("Codex", "YOLO mode - bypass approvals and sandbox"),
 		hermesOptions:   NewYoloOptionsPanel("Hermes", "YOLO mode - auto-approve all tool calls"),
+		ompOptions:      NewOMPOptionsPanel(),
 		focusIndex:      0,
 		visible:         false,
 		presetCommands:  buildPresetCommands(),
@@ -502,6 +566,13 @@ func NewNewDialog() *NewDialog {
 // ShowInGroup shows the dialog with a pre-selected parent group and optional default path.
 // conductors is the list of active conductor sessions available as parent options.
 func (d *NewDialog) ShowInGroup(groupPath, groupName, defaultPath string, conductors []*session.Instance, suggestedParentID string) {
+	d.restoreLocalPresets()
+	d.remoteTarget = false
+	d.moreOptions = false
+	d.firstSession = false
+	d.remoteName = ""
+	d.remoteCatalog = nil
+	d.clearWhere()
 	if groupPath == "" {
 		groupPath = "default"
 		groupName = "default"
@@ -539,7 +610,7 @@ func (d *NewDialog) ShowInGroup(groupPath, groupName, defaultPath string, conduc
 	d.modelInput.Blur()
 	d.claudeOptions.Blur()
 	d.claudeOptions.ResetStartQuery() // #741: per-session query must not leak across openings
-	d.claudeOptions.SetAccount("")    // #924: the account pick is per-session too
+	d.claudeOptions.SetAccount("")    // #924: the account pick is per-session too; #2895 reapplies the default below
 	d.geminiOptions.Blur()
 	d.codexOptions.Blur()
 	if d.branchPicker != nil {
@@ -566,12 +637,13 @@ func (d *NewDialog) ShowInGroup(groupPath, groupName, defaultPath string, conduc
 	// sets them, so the row disappears until SetRemoteMCPs runs again.
 	d.SetRemoteMCPs(nil)
 	// Set path input to group's default path if provided, otherwise use current working directory.
+	// Shown with ~ for the home folder (onboarding); GetValues expands it.
 	if defaultPath != "" {
-		d.pathInput.SetValue(defaultPath)
+		d.pathInput.SetValue(tildePath(defaultPath))
 	} else {
 		cwd, err := os.Getwd()
 		if err == nil {
-			d.pathInput.SetValue(cwd)
+			d.pathInput.SetValue(tildePath(cwd))
 		}
 	}
 	// #1702: the dialog is a reused singleton, so pathInput still carries the
@@ -586,11 +658,18 @@ func (d *NewDialog) ShowInGroup(groupPath, groupName, defaultPath string, conduc
 	d.geminiOptions.SetDefaults(false)
 	d.codexOptions.SetDefaults(false)
 	d.hermesOptions.SetDefaults(false)
+	d.ompOptions.SetDefaults(nil)
 	if userConfig, err := session.LoadUserConfig(); err == nil && userConfig != nil {
 		d.geminiOptions.SetDefaults(userConfig.Gemini.YoloMode)
 		d.codexOptions.SetDefaults(userConfig.Codex.YoloMode)
 		d.hermesOptions.SetDefaults(userConfig.Hermes.YoloMode)
+		d.ompOptions.SetDefaults(session.NewOMPOptions(userConfig))
 		d.claudeOptions.SetDefaults(userConfig)
+		// #2895: start on [claude].default_account instead of inherit. Each
+		// opening recomputes it from config, so a one-off pick still never
+		// reaches the next opening; a group or suggested conductor parent
+		// with its own config_dir keeps the dialog on inherit.
+		d.claudeOptions.SetAccount(session.DefaultAccountForNewSession(userConfig, groupPath, d.selectedConductor()))
 		d.sandboxEnabled = userConfig.Docker.DefaultEnabled
 		d.worktreeEnabled = userConfig.Worktree.DefaultEnabled
 		if d.worktreeEnabled {
@@ -601,20 +680,36 @@ func (d *NewDialog) ShowInGroup(groupPath, groupName, defaultPath string, conduc
 		// #1172: preselect the configured default model so users who set
 		// [claude].default_model aren't forced to switch off Sonnet on every
 		// new session. Overrides the empty value set above; left empty when
-		// no (valid, in-catalog) default is configured.
+		// no default is configured.
 		if dm := preselectDefaultModel(userConfig, d.GetSelectedCommand()); dm != "" {
 			d.modelInput.SetValue(dm)
 		}
 	}
 	d.branchInput.Placeholder = d.branchPrefix + "branch-name"
+	// A worktree on by default with an empty name takes its branch from the
+	// derived name, as a toggled one does (#2913).
+	if d.worktreeEnabled && d.branchAutoSet {
+		d.autoBranchFromName()
+	}
 	d.rebuildFocusTargets()
+}
+
+// restoreLocalPresets puts the local tool row back after a remote opening
+// replaced it, so a local opening never starts on a remote's tool list.
+func (d *NewDialog) restoreLocalPresets() {
+	if d.localPresetCommands != nil {
+		d.presetCommands = d.localPresetCommands
+		d.localPresetCommands = nil
+		d.commandCursor = 0
+	}
+	d.remoteTarget = false
 }
 
 // SetDefaultTool sets the pre-selected command based on tool name
 // Call this before Show/ShowInGroup to apply user's preferred default
 func (d *NewDialog) SetDefaultTool(tool string) {
-	if tool == "" {
-		d.commandCursor = 0 // Default to shell
+	if tool == "" || tool == "shell" {
+		d.commandCursor = d.shellIndex() // Default to shell
 		return
 	}
 
@@ -628,8 +723,19 @@ func (d *NewDialog) SetDefaultTool(tool string) {
 	}
 
 	// Tool not found in presets, default to shell
-	d.commandCursor = 0
+	d.commandCursor = d.shellIndex()
 	d.updateToolOptions()
+}
+
+// shellIndex is the plain shell's slot in the tool row (0 when absent); the
+// row is reordered by RefreshInstalledTools, so it is not always first.
+func (d *NewDialog) shellIndex() int {
+	for i, cmd := range d.presetCommands {
+		if cmd == "" {
+			return i
+		}
+	}
+	return 0
 }
 
 // GetSelectedGroup returns the parent group path
@@ -637,8 +743,21 @@ func (d *NewDialog) GetSelectedGroup() string {
 	return d.parentGroupPath
 }
 
+// SetParentGroupOverride sets the dialog's displayed and forwarded parent
+// group directly, bypassing ShowInGroup's coercion of an empty group path to
+// the local "my-sessions" default. Used for a remote's true top level, which
+// has no group at all: an empty path means no -g flag reaches the remote's
+// own add command (see ssh.go).
+func (d *NewDialog) SetParentGroupOverride(path, name string) {
+	d.parentGroupPath = path
+	d.parentGroupName = name
+}
+
 func (d *NewDialog) effectiveDialogWidth() int {
 	w := newDialogPreferredOuterWidth
+	if d.remoteCatalog != nil && d.remoteCatalog.Legacy {
+		w = max(w, len(legacyRemoteCreationNotice)+10)
+	}
 	if d.width > 0 && d.width < w+newDialogTerminalGutter {
 		w = d.width - newDialogTerminalGutter
 		if w < newDialogMinOuterWidth {
@@ -656,8 +775,12 @@ func (d *NewDialog) syncInputWidths() {
 	if iw > newDialogInputMaxWidth {
 		iw = newDialogInputMaxWidth
 	}
-	d.nameInput.Width = iw
-	d.pathInput.Width = iw
+	// Name and Path carry their label on the same line (ASK-211); one cell
+	// less so the field bar (prompt, text, cursor cell; renderFieldBar)
+	// ends inside the box instead of wrapping.
+	inline := max(newDialogInputMinWidth/2, iw-(newDialogInlineIndent-2)-1)
+	d.nameInput.Width = inline
+	d.pathInput.Width = inline
 	d.commandInput.Width = iw
 	d.modelInput.Width = iw
 	d.branchInput.Width = iw
@@ -671,6 +794,20 @@ func (d *NewDialog) SetSize(width, height int) {
 	if d.branchPicker != nil {
 		d.branchPicker.SetSize(width, height)
 	}
+}
+
+// SetPath replaces the pre-filled project path of an open dialog, keeping the
+// cursor at the end and the soft-select a pre-fill gets.
+func (d *NewDialog) SetPath(path string) {
+	if path == "" {
+		return
+	}
+	if !d.remoteTarget {
+		path = tildePath(path) // shown with ~ (ASK-211); GetValues expands it
+	}
+	d.pathInput.SetValue(path)
+	d.pathInput.CursorEnd()
+	d.pathSoftSelected = true
 }
 
 // SetPathSuggestions sets the available path suggestions for autocomplete
@@ -749,26 +886,28 @@ func (d *NewDialog) IsModelTypeCustomHighlighted() bool {
 }
 
 func (d *NewDialog) shouldHandleEnterLocally() bool {
-	switch d.currentTarget() {
-	// Path/Model open their own dropdown on Enter.
-	case focusPath, focusModel:
+	// An open dropdown always owns Enter (select / close).
+	if d.suggestionsActive || d.modelSuggestionActive {
 		return true
-	// Name/Branch are free-text fields. When the opt-in
-	// [ui].new_session_enter_advances toggle is on, Enter advances to the next
-	// field rather than submitting the whole form: pressing Enter right after
-	// typing the session name used to silently submit (path defaults to cwd),
-	// skipping path/tool/model selection entirely. Handling Enter locally lets
-	// the dialog advance focus instead. Submit stays reachable from non-text
-	// rows (checkboxes/conductor) and via Ctrl+S (additive, always available).
-	// Default (toggle off) preserves today's behavior: Enter here submits, so we
-	// must NOT claim it locally.
-	case focusName, focusBranch:
-		return d.enterAdvances
-	case focusMultiRepo:
-		return d.multiRepoEnabled
-	default:
-		return d.suggestionsActive || d.modelSuggestionActive
 	}
+	switch d.currentTarget() {
+	// The Create button is the one row where Enter means "create now".
+	case focusCreate:
+		return false
+	case focusMultiRepo:
+		// Enter edits / commits the highlighted path of the list.
+		if d.multiRepoEnabled {
+			return true
+		}
+	}
+	// ASK-110 ("it is hard; we have to go to the end to do it"): by default
+	// Enter creates from every row, Path included, with the defaults already
+	// filled in; Tab/↓ walk the optional rows and Space/→ browse paths. The
+	// model list no longer opens on Enter, so the #2239 loop (Enter toggling
+	// the list forever) cannot come back. With [ui].new_session_enter_advances
+	// = true Enter walks to the next row (Path: advance or browse) and only the
+	// Create button or Ctrl+S submits.
+	return d.enterAdvances
 }
 
 // WantsSubmit reports whether the given key is an explicit "create now"
@@ -827,6 +966,7 @@ func (d *NewDialog) ApplyHighlightedModelSuggestion() {
 		if suggestionIdx < len(d.modelSuggestions) {
 			d.modelInput.SetValue(d.modelSuggestions[suggestionIdx])
 			d.modelInput.SetCursor(len(d.modelInput.Value()))
+			d.dropUnsupportedReasoningEffort()
 		}
 		d.modelNavigated = true
 	}
@@ -837,6 +977,16 @@ func (d *NewDialog) ApplyHighlightedModelSuggestion() {
 func (d *NewDialog) DismissModelSuggestions() {
 	d.modelSuggestionHidden = true
 	d.modelSuggestionActive = false
+}
+
+// openModelSuggestions steps into the model list (↓ or Space on the model
+// row): the list takes the arrow keys and Enter until it is left with Esc,
+// Tab, or a pick.
+func (d *NewDialog) openModelSuggestions() {
+	d.filterModelSuggestions()
+	d.modelSuggestionActive = true
+	d.modelSuggestionHidden = false
+	d.modelInput.Blur()
 }
 
 // SetRecentSessions sets the list of recently deleted session configs.
@@ -996,19 +1146,16 @@ func (d *NewDialog) previewRecentSession(rs *statedb.RecentSessionRow) {
 	d.rebuildFocusTargets()
 }
 
-// filterPathSuggestions filters allPathSuggestions by the current path input value
+// filterPathSuggestions filters allPathSuggestions by the current path input
+// value. Matching is fuzzy ("adk" → /home/me/agent-deck), ranked by match
+// score; path-shaped queries ("/ho", "~/dev") additionally pull live
+// filesystem subdirectory completions.
 func (d *NewDialog) filterPathSuggestions() {
-	query := strings.ToLower(strings.TrimSpace(d.pathInput.Value()))
+	query := strings.TrimSpace(d.pathInput.Value())
 	if query == "" {
 		d.pathSuggestions = d.allPathSuggestions
 	} else {
-		filtered := make([]string, 0)
-		for _, p := range d.allPathSuggestions {
-			if strings.Contains(strings.ToLower(p), query) {
-				filtered = append(filtered, p)
-			}
-		}
-		d.pathSuggestions = filtered
+		d.pathSuggestions = filterPathSuggestions(d.allPathSuggestions, query)
 	}
 	// Cursor space: 0 = "Type custom", 1..N = pathSuggestions[0..N-1]
 	if d.pathSuggestionCursor > len(d.pathSuggestions) {
@@ -1016,88 +1163,15 @@ func (d *NewDialog) filterPathSuggestions() {
 	}
 }
 
-func knownModelIDsForTool(tool string) []string {
-	switch {
-	case session.IsClaudeCompatible(tool):
-		return []string{
-			"claude-opus-5",
-			"claude-sonnet-5",
-			"claude-fable-5-1",
-			"claude-fable-5",
-			"claude-sonnet-4-6",
-			"claude-opus-4-8",
-			"claude-opus-4-7",
-			"claude-haiku-4-5",
-			"claude-haiku-4-5-20251001",
-		}
-	case tool == "gemini":
-		return []string{
-			"gemini-3.1-pro-preview",
-			"gemini-3.1-pro-preview-customtools",
-			"gemini-3-flash-preview",
-			"gemini-3.1-flash-lite",
-			"gemini-3.1-flash-lite-preview",
-			"gemini-2.5-pro",
-			"gemini-2.5-flash",
-			"gemini-2.5-flash-lite",
-		}
-	case tool == "opencode":
-		return []string{
-			"openai/gpt-5.5",
-			"openai/gpt-5.5-pro",
-			"openai/gpt-5.4",
-			"openai/gpt-5.4-pro",
-			"openai/gpt-5.4-mini",
-			"openai/gpt-5.3-codex",
-			"openai/gpt-5",
-			"openai/o3",
-			"anthropic/claude-opus-5",
-			"anthropic/claude-sonnet-5",
-			"anthropic/claude-fable-5-1",
-			"anthropic/claude-fable-5",
-			"anthropic/claude-sonnet-4-6",
-			"anthropic/claude-opus-4-8",
-			"anthropic/claude-opus-4-7",
-			"anthropic/claude-haiku-4-5",
-		}
-	case session.IsCodexCompatible(tool):
-		return []string{
-			"gpt-5.6-sol",
-			"gpt-5.6-terra",
-			"gpt-5.6-luna",
-			"gpt-5.5",
-			"gpt-5.5-pro",
-			"gpt-5.4",
-			"gpt-5.4-pro",
-			"gpt-5.4-mini",
-			"gpt-5.4-nano",
-			"gpt-5.3-codex",
-			"gpt-5.2",
-			"gpt-5.2-pro",
-			"gpt-5.1",
-			"gpt-5-pro",
-			"gpt-5",
-			"gpt-5-mini",
-			"gpt-5-nano",
-			"gpt-4.1",
-			"gpt-4.1-mini",
-			"gpt-4o",
-			"gpt-4o-mini",
-			"o3-pro",
-			"o3",
-		}
-	default:
-		return nil
-	}
-}
+func knownModelIDsForTool(tool string) []string { return session.KnownModelIDsForTool(tool) }
 
 // preselectDefaultModel returns the model ID to prefill in the new-session
-// model field for the given tool. It honors the per-tool configured
-// default_model but only when that value is present in the tool's known-model
-// catalog — an empty default, an unset config, or a stale/typo'd value (e.g.
-// an alias like "opus" or a removed pin) all degrade gracefully to "" so the
-// dialog leaves the model unset and the tool falls back to its own default
-// rather than launching a bogus --model flag (#1172). Today only Claude routes
+// model field for the given tool: the per-tool configured default_model,
+// trimmed. The model catalog is a suggestion source, not an allowlist
+// (#2388): a configured ID the catalog does not know (a model newer than this
+// build, or one the probed CLI hides) passes through with a logged warning
+// instead of being dropped, so the tool reports a typo itself rather than the
+// session silently launching on the tool default. Today only Claude routes
 // its launch model through this dialog field; the other tools apply their
 // default_model at command-build time.
 func preselectDefaultModel(config *session.UserConfig, tool string) string {
@@ -1114,16 +1188,25 @@ func preselectDefaultModel(config *session.UserConfig, tool string) string {
 	if configured = strings.TrimSpace(configured); configured == "" {
 		return ""
 	}
-	for _, id := range knownModelIDsForTool(tool) {
-		if id == configured {
-			return configured
-		}
+	if !slices.Contains(knownModelIDsForTool(tool), configured) {
+		uiLog.Warn("default_model_not_in_catalog", slog.String("tool", tool), slog.String("model", configured))
 	}
-	return ""
+	return configured
 }
 
 func (d *NewDialog) filterModelSuggestions() {
 	all := knownModelIDsForTool(d.GetSelectedCommand())
+	if d.remoteTarget {
+		all = nil
+		if d.remoteCatalog != nil {
+			for _, tool := range d.remoteCatalog.Tools {
+				if tool.Name == d.GetSelectedCommand() {
+					all = tool.Models
+					break
+				}
+			}
+		}
+	}
 	query := strings.ToLower(strings.TrimSpace(d.modelInput.Value()))
 	if query == "" {
 		d.modelSuggestions = all
@@ -1149,8 +1232,30 @@ func (d *NewDialog) Show() {
 // Hide hides the dialog
 func (d *NewDialog) Hide() {
 	d.visible = false
+	if d.localPresetCommands != nil {
+		d.presetCommands = d.localPresetCommands
+		d.localPresetCommands = nil
+		d.commandCursor = 0
+	}
+	d.remoteTarget = false
+	d.remoteName = ""
+	d.remoteCatalog = nil
 	if d.branchPicker != nil {
 		d.branchPicker.Hide()
+	}
+}
+
+// ReturnToPath shows the dialog again after a local create was turned back
+// before it started (Cancel on "Directory Not Found"), keeping what was
+// entered and putting focus on the Path row so a mistyped path can be fixed
+// (#2913). name is the Name value to restore: a derived name is not kept, so
+// it follows the corrected path.
+func (d *NewDialog) ReturnToPath(name string) {
+	d.nameInput.SetValue(name)
+	d.visible = true
+	if idx := d.indexOf(focusPath); idx >= 0 {
+		d.focusIndex = idx
+		d.updateFocus()
 	}
 }
 
@@ -1170,7 +1275,12 @@ func (d *NewDialog) sanitizePath(raw string) string {
 }
 
 func (d *NewDialog) resolveCommand() string {
-	if d.commandCursor < len(d.presetCommands) {
+	if d.remoteTarget && d.customCommandSelected() {
+		if value := strings.TrimSpace(d.commandInput.Value()); value != "" {
+			return value
+		}
+	}
+	if d.commandCursor >= 0 && d.commandCursor < len(d.presetCommands) {
 		if command := d.presetCommands[d.commandCursor]; command != "" {
 			return command
 		}
@@ -1227,6 +1337,11 @@ func (d *NewDialog) IsWorktreeExplicit() bool {
 // name field is non-empty and the branch hasn't been manually edited.
 func (d *NewDialog) autoBranchFromName() {
 	name := strings.TrimSpace(d.nameInput.Value())
+	if name == "" && !d.createsOffMachine() {
+		// An empty local name becomes the derived name on submit, so the
+		// branch follows that name (#2913).
+		name = d.DerivedName()
+	}
 	if name == "" {
 		return
 	}
@@ -1296,6 +1411,9 @@ func (d *NewDialog) ToggleSandbox() {
 // When enabling, initializes multiRepoPaths with the current pathInput value.
 // When disabling, collapses back to the first path.
 func (d *NewDialog) ToggleMultiRepo() {
+	if d.remoteCatalog != nil && d.remoteCatalog.Legacy {
+		return
+	}
 	d.multiRepoEnabled = !d.multiRepoEnabled
 	if d.multiRepoEnabled {
 		currentPath := strings.TrimSpace(d.pathInput.Value())
@@ -1354,15 +1472,49 @@ func (d *NewDialog) GetSelectedCommand() string {
 }
 
 func (d *NewDialog) selectedToolSupportsModel() bool {
-	return session.SupportsLaunchModel(d.GetSelectedCommand())
+	return session.SupportsLaunchModel(d.toolKind(d.GetSelectedCommand()))
 }
 
 func (d *NewDialog) selectedToolSupportsReasoningEffort() bool {
-	return session.SupportsLaunchReasoningEffort(d.GetSelectedCommand())
+	return session.SupportsLaunchReasoningEffort(d.toolKind(d.GetSelectedCommand()))
 }
 
+// reasoningEffortChoices lists "" (tool default) then the efforts the selected
+// tool accepts, narrowed to the typed model when the CLI was probed (#2388).
+// A remote target uses the lists from that host's -capabilities.
 func (d *NewDialog) reasoningEffortChoices() []string {
-	return append([]string{""}, session.LaunchReasoningEffortsForTool(d.GetSelectedCommand())...)
+	model := strings.TrimSpace(d.modelInput.Value())
+	if d.remoteTarget {
+		if tool := d.remoteCatalogTool(d.GetSelectedCommand()); tool != nil && len(tool.ReasoningEfforts) > 0 {
+			efforts := tool.ReasoningEfforts
+			if perModel := tool.ModelEfforts[model]; len(perModel) > 0 {
+				efforts = perModel
+			}
+			return append([]string{""}, efforts...)
+		}
+	}
+	return append([]string{""}, session.LaunchReasoningEffortsForModel(d.toolKind(d.GetSelectedCommand()), model)...)
+}
+
+// dropUnsupportedReasoningEffort clears a selected effort the current tool and
+// model no longer accept, so a model change never submits an effort the
+// launch would reject (#2388). A still-valid selection is kept.
+func (d *NewDialog) dropUnsupportedReasoningEffort() {
+	if !slices.Contains(d.reasoningEffortChoices(), d.reasoningEffort) {
+		d.reasoningEffort = ""
+	}
+}
+
+func (d *NewDialog) remoteCatalogTool(name string) *session.RemoteCreationTool {
+	if d.remoteCatalog == nil {
+		return nil
+	}
+	for i := range d.remoteCatalog.Tools {
+		if d.remoteCatalog.Tools[i].Name == name {
+			return &d.remoteCatalog.Tools[i]
+		}
+	}
+	return nil
 }
 
 func (d *NewDialog) cycleReasoningEffort(delta int) {
@@ -1383,30 +1535,27 @@ func (d *NewDialog) cycleReasoningEffort(delta int) {
 }
 
 func (d *NewDialog) updateModelPlaceholder() {
-	switch cmd := d.GetSelectedCommand(); {
-	case session.IsClaudeCompatible(cmd):
-		d.modelInput.Placeholder = "claude-sonnet-4-6"
-	case cmd == "gemini":
-		d.modelInput.Placeholder = "gemini-3.1-pro-preview"
-	case cmd == "opencode":
-		d.modelInput.Placeholder = "openai/gpt-5.5"
-	case session.IsCodexCompatible(cmd):
-		d.modelInput.Placeholder = "gpt-5.6-sol"
-	default:
-		d.modelInput.Placeholder = "tool default"
-	}
+	// One neutral placeholder for every tool. A per-tool example ID here read
+	// as an already-chosen model ("it picked claude-sonnet-4-6 by itself");
+	// the examples live on the hint line below the field instead.
+	d.modelInput.Placeholder = "tool default (↓ to browse)"
 }
 
 func (d *NewDialog) modelInputHint() string {
+	if d.remoteTarget {
+		return "Model IDs are resolved on the remote host"
+	}
 	switch cmd := d.GetSelectedCommand(); {
 	case session.IsClaudeCompatible(cmd):
-		return "Examples: claude-opus-5, claude-sonnet-5, claude-haiku-4-5"
+		return "Examples: claude-opus-5-5, claude-sonnet-5, claude-haiku-4-5"
 	case cmd == "gemini":
 		return "Examples: gemini-3.1-pro-preview, gemini-3-flash-preview, gemini-2.5-pro"
 	case cmd == "opencode":
-		return "Examples: openai/gpt-5.5, openai/gpt-5.4, anthropic/claude-opus-5"
+		return "Examples: openai/gpt-5.5, openai/gpt-5.4, anthropic/claude-opus-5-5"
+	case cmd == "omp":
+		return "Primary model; use OMP Options below for multi-model and role routing"
 	case session.IsCodexCompatible(cmd):
-		return "Examples: gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, gpt-5.5"
+		return "Examples: gpt-6-sol, gpt-6-luna, gpt-5.6-sol, gpt-5.5"
 	default:
 		return ""
 	}
@@ -1437,6 +1586,14 @@ func (d *NewDialog) GetClaudeOptions() *session.ClaudeOptions {
 	opts := d.claudeOptions.GetOptions()
 	opts.Effort = d.GetLaunchReasoningEffort()
 	return opts
+}
+
+// GetOMPOptions returns every first-class OMP launch control from the dialog.
+func (d *NewDialog) GetOMPOptions() *session.OMPOptions {
+	if d.GetSelectedCommand() != "omp" {
+		return nil
+	}
+	return d.ompOptions.GetOptions(d.GetLaunchModelID())
 }
 
 // GetClaudeExtraArgs returns the user-supplied claude CLI tokens from the
@@ -1485,6 +1642,18 @@ func (d *NewDialog) GetClaudeAccount() string {
 // types is forwarded verbatim. The account row is emptied because it listed
 // this machine's slots; the server's slots arrive via SetRemoteAccounts.
 func (d *NewDialog) ResetRemoteDefaults() {
+	d.remoteTarget = true
+	d.commandInput.SetValue("")
+	d.remoteCatalog = nil
+	d.validationErr = "Loading remote creation options..."
+	d.localPresetCommands = append([]string(nil), d.presetCommands...)
+	d.presetCommands = nil
+	d.commandCursor = 0
+	d.inheritedSettings = nil
+	d.inheritedExpanded = false
+	d.conductorSessions = nil
+	d.conductorCursor = 0
+	d.modelSuggestions = nil
 	d.worktreeEnabled = false
 	d.worktreeToggled = false
 	d.branchInput.SetValue("")
@@ -1499,6 +1668,7 @@ func (d *NewDialog) ResetRemoteDefaults() {
 	d.claudeOptions.SetFromOptions(&session.ClaudeOptions{SessionMode: "new"})
 	d.claudeOptions.SetExtraArgs(nil)
 	d.claudeOptions.SetAccounts(nil)
+	d.claudeOptions.SetDefaultAccount("") // #2895: the local default never travels
 	d.geminiOptions.SetDefaults(false)
 	d.codexOptions.SetDefaults(false)
 	d.hermesOptions.SetDefaults(false)
@@ -1550,14 +1720,14 @@ func (d *NewDialog) GetRemoteMCPs() []string {
 // the remote `add` registers the session and then fails on the MCP write,
 // leaving an unstarted session behind on the server.
 func (d *NewDialog) hasRemoteMCPRow() bool {
-	return len(d.remoteMCPs) > 0 && session.ToolSupportsMCPManager(d.resolveCommand())
+	return len(d.remoteMCPs) > 0 && session.ToolSupportsMCPManager(d.toolKind(d.resolveCommand()))
 }
 
 // dropRemoteMCPPicksIfUnsupported clears the picks when the selected tool
 // cannot attach MCPs, so a pick made under claude never travels after the
 // user switches to shell or another tool without MCP support.
 func (d *NewDialog) dropRemoteMCPPicksIfUnsupported() {
-	if len(d.remoteMCPs) > 0 && !session.ToolSupportsMCPManager(d.resolveCommand()) {
+	if len(d.remoteMCPs) > 0 && !session.ToolSupportsMCPManager(d.toolKind(d.resolveCommand())) {
 		d.remoteMCPChecked = nil
 		d.remoteMCPCursor = 0
 	}
@@ -1596,68 +1766,65 @@ func (d *NewDialog) GetRemoteCreateOptions() (session.RemoteAddOptions, string) 
 		Path:    path,
 		Group:   d.GetSelectedGroup(),
 		Sandbox: d.IsSandboxEnabled(),
-		Model:   d.GetLaunchModelID(),
-		MCPs:    d.GetRemoteMCPs(),
+	}
+	if d.remoteTarget && (d.remoteCatalog == nil || len(d.presetCommands) == 0) {
+		return opts, "Remote creation capabilities are not loaded; wait for the remote catalog or reopen the dialog"
 	}
 	if d.multiRepoEnabled {
-		return opts, "Multi-repo sessions cannot be created on a remote; add the extra paths on the server after creation"
+		var paths []string
+		for _, value := range d.multiRepoPaths {
+			if value = strings.Trim(strings.TrimSpace(value), "'\""); value != "" {
+				paths = append(paths, value)
+			}
+		}
+		if len(paths) < 2 {
+			return opts, "Multi-repo mode requires at least 2 paths"
+		}
+		opts.Path, opts.AdditionalPaths = paths[0], paths[1:]
 	}
 	if d.worktreeEnabled {
 		opts.WorktreeBranch = strings.TrimSpace(d.branchInput.Value())
 	}
 
+	if d.remoteCatalog != nil && d.remoteCatalog.Legacy {
+		if err := d.remoteCatalog.ValidateOptions(opts); err != nil {
+			return opts, err.Error()
+		}
+		return opts, ""
+	}
+	opts.Model = d.GetLaunchModelID()
+	opts.MCPs = d.GetRemoteMCPs()
+	opts.ParentID = d.GetParentSessionID()
+	opts.ReasoningEffort = d.GetLaunchReasoningEffort()
+
 	switch {
 	case d.isClaudeSelected():
 		opts.Account = d.GetClaudeAccount()
-		if q := d.GetClaudeStartQuery(); q != "" {
-			return opts, "Startup query is not sent to a remote; send it with 'agent-deck remote <name> send' once the session runs"
-		}
+		opts.StartQuery = d.GetClaudeStartQuery()
 		claudeOpts := d.GetClaudeOptions()
-		extra := remoteClaudeExtraArgs(claudeOpts)
+		opts.ClaudeOptions = claudeOpts
 		if claudeOpts.SessionMode == "resume" && claudeOpts.ResumeSessionID != "" {
 			opts.ResumeSessionID = strings.TrimSpace(claudeOpts.ResumeSessionID)
 		}
-		extra = append(extra, d.GetClaudeExtraArgs()...)
-		if len(extra) > 0 && command != "claude" {
-			return opts, "Claude options and extra args can only be forwarded to a remote for the claude tool"
-		}
-		opts.ExtraArgs = extra
-	case session.IsCodexCompatible(command):
-		// Same predicate the effort selector uses, so a Codex-compatible
-		// custom tool that could pick an effort is refused rather than
-		// silently created without it.
-		if d.GetLaunchReasoningEffort() != "" {
-			return opts, "Reasoning effort for " + command + " is not sent to a remote; set it in the server's config"
-		}
+		opts.ExtraArgs = d.GetClaudeExtraArgs()
+	case d.toolKind(command) == "codex":
 		opts.Yolo = d.GetCodexYoloMode()
 	case command == "gemini":
 		opts.Yolo = d.IsGeminiYoloMode()
 	case command == "hermes":
-		if d.GetHermesYoloMode() {
-			return opts, "Hermes YOLO mode is not sent to a remote; set it in the server's config"
+		opts.Yolo = d.GetHermesYoloMode()
+	}
+	if d.toolKind(command) == "codex" || command == "gemini" || command == "hermes" {
+		value := opts.Yolo
+		opts.YoloOverride = &value
+	}
+	if d.remoteCatalog != nil {
+		if err := d.remoteCatalog.ValidateOptions(opts); err != nil {
+			return opts, err.Error()
 		}
 	}
-	return opts, ""
-}
 
-// remoteClaudeExtraArgs turns the dialog's Claude toggles into the same CLI
-// tokens a local session launches with, minus --model (a first-class `add`
-// flag). A resume with an id travels as --resume-session instead; a bare
-// resume asks claude for its picker on the server.
-func remoteClaudeExtraArgs(opts *session.ClaudeOptions) []string {
-	if opts == nil {
-		return nil
-	}
-	flags := *opts
-	flags.Model = ""
-	var args []string
-	if flags.SessionMode == "resume" {
-		if strings.TrimSpace(flags.ResumeSessionID) == "" {
-			args = append(args, "--resume")
-		}
-		flags.SessionMode = "new"
-	}
-	return append(args, flags.ToArgs()...)
+	return opts, ""
 }
 
 // isClaudeSelected returns true if the selected command is Claude or a claude-compatible custom tool
@@ -1665,28 +1832,52 @@ func (d *NewDialog) isClaudeSelected() bool {
 	if d.commandCursor < 0 || d.commandCursor >= len(d.presetCommands) {
 		return false
 	}
-	return session.IsClaudeCompatible(d.presetCommands[d.commandCursor])
+	return d.toolKind(d.presetCommands[d.commandCursor]) == "claude"
 }
 
 // Validate checks if the dialog values are valid and returns an error message if not
 func (d *NewDialog) Validate() string {
+	msg, _ := d.validate()
+	return msg
+}
+
+// ShowValidationError shows why the form cannot be created and moves focus to
+// the field at fault (ASK-110: Enter creates from any row, so the reason must
+// land where the user can fix it).
+func (d *NewDialog) ShowValidationError() string {
+	msg, target := d.validate()
+	if msg == "" {
+		return ""
+	}
+	d.SetError(msg)
+	if idx := d.indexOf(target); idx >= 0 {
+		d.focusIndex = idx
+		d.updateFocus()
+	}
+	return msg
+}
+
+// validate returns the first validation error and the row it belongs to.
+func (d *NewDialog) validate() (string, focusTarget) {
 	name := strings.TrimSpace(d.nameInput.Value())
 	// Fix: sanitize input to remove surrounding quotes that cause path issues
 	path := strings.Trim(strings.TrimSpace(d.pathInput.Value()), "'\"")
 
-	// Check for empty name
-	if name == "" {
-		return "Session name cannot be empty"
+	// An empty local name is taken from the folder on submit (ASK-110); a
+	// remote create (a remote row, or a remote/sandbox picked in the Where
+	// row) still needs one, its own add command names nothing.
+	if name == "" && d.createsOffMachine() {
+		return "Session name cannot be empty", focusName
 	}
 
 	// Check name length
 	if len(name) > MaxNameLength {
-		return fmt.Sprintf("Session name too long (max %d characters)", MaxNameLength)
+		return fmt.Sprintf("Session name too long (max %d characters)", MaxNameLength), focusName
 	}
 
 	// Check for empty path
 	if path == "" && !d.multiRepoEnabled {
-		return "Project path cannot be empty"
+		return "Project path cannot be empty", focusPath
 	}
 
 	// Validate multi-repo paths
@@ -1698,22 +1889,25 @@ func (d *NewDialog) Validate() string {
 			if p == "" {
 				continue
 			}
-			expanded := session.ExpandPath(strings.Trim(p, "'\""))
+			expanded := strings.Trim(p, "'\"")
+			if !d.remoteTarget {
+				expanded = session.ExpandPath(expanded)
+			}
 			// #1706: submit resolves every declared path to an absolute one, so
 			// the duplicate key must be resolved too — otherwise "repo" and
 			// "./repo" pass this check and then collapse into the same path.
 			// Dedupe key only; the entered values are left untouched.
-			if abs, err := filepath.Abs(expanded); err == nil {
+			if abs, err := filepath.Abs(expanded); !d.remoteTarget && err == nil {
 				expanded = abs
 			}
 			if seen[expanded] {
-				return "Duplicate paths in multi-repo mode"
+				return "Duplicate paths in multi-repo mode", focusMultiRepo
 			}
 			seen[expanded] = true
 			nonEmpty++
 		}
 		if nonEmpty < 2 {
-			return "Multi-repo mode requires at least 2 paths"
+			return "Multi-repo mode requires at least 2 paths", focusMultiRepo
 		}
 	}
 
@@ -1721,14 +1915,73 @@ func (d *NewDialog) Validate() string {
 	if d.worktreeEnabled {
 		branch := strings.TrimSpace(d.branchInput.Value())
 		if branch == "" {
-			return "Branch name required for worktree"
+			return "Branch name required for worktree", focusBranch
 		}
 		if err := git.ValidateBranchName(branch); err != nil {
-			return err.Error()
+			return err.Error(), focusBranch
 		}
 	}
 
-	return "" // Valid
+	return "", focusName // Valid
+}
+
+// DerivedName is the session name an empty local Name field gets on submit,
+// and the name the empty field previews: the base name of the folder (the
+// first path in multi-repo mode) after ~, $VARS and a relative path are
+// resolved the way the create resolves them, cut to MaxNameLength and made
+// unique against titleTaken (#2913). It is "" when the folder has no usable
+// base name (the create then generates one).
+func (d *NewDialog) DerivedName() string {
+	_, path, _ := d.GetValues()
+	if paths, ok := d.GetMultiRepoPaths(); ok {
+		path = ""
+		if len(paths) > 0 {
+			path = paths[0]
+		}
+	}
+	if path == "" {
+		return ""
+	}
+	if abs, err := absLocalProjectPath(path); err == nil {
+		path = abs
+	}
+	base := filepath.Base(path)
+	if base == "" || base == "." || base == "/" {
+		return ""
+	}
+	return uniqueTitleWithin(base, MaxNameLength, d.titleTaken)
+}
+
+// uniqueTitleWithin returns base, or base with the first free "-N" suffix,
+// cut so the result is at most max bytes (the limit the Name field checks).
+func uniqueTitleWithin(base string, max int, taken func(string) bool) string {
+	base = cutToBytes(base, max)
+	if taken == nil || !taken(base) {
+		return base
+	}
+	for i := 2; i < 1000; i++ {
+		suffix := fmt.Sprintf("-%d", i)
+		candidate := cutToBytes(base, max-len(suffix)) + suffix
+		if !taken(candidate) {
+			return candidate
+		}
+	}
+	return base
+}
+
+// cutToBytes shortens s to at most n bytes without splitting a rune.
+func cutToBytes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	cut := 0
+	for i := range s {
+		if i > n {
+			break
+		}
+		cut = i // rune start; s[:i] has i <= n bytes
+	}
+	return s[:cut]
 }
 
 // SetError sets an inline validation error displayed inside the dialog
@@ -1768,34 +2021,65 @@ func (d *NewDialog) rebuildFocusTargets() {
 	// (type name, tool already right, submit) is never interrupted by an advanced
 	// option. In multi-repo mode the single Path field is hidden — its path list
 	// lives under focusMultiRepo below the fold instead.
+	// Onboarding (ASK-211): Name, Agent and Path come first, one line each,
+	// so Path is on screen at 80x24; the model rows follow.
 	targets := []focusTarget{focusName, focusCommand}
-	if d.selectedToolSupportsModel() {
-		targets = append(targets, focusModel)
-	}
-	if d.selectedToolSupportsReasoningEffort() {
-		targets = append(targets, focusReasoningEffort)
-	}
 	if !d.multiRepoEnabled {
 		targets = append(targets, focusPath)
 	}
-	targets = append(targets, focusWorktree, focusSandbox)
+	// The hooks line sits right under Path (prototype): it is what the first
+	// Enter agrees to, so it stays on screen at 80x24.
+	if d.showHooksLine() {
+		targets = append(targets, focusHooks)
+	}
+	modelTargets := func() {
+		if d.selectedToolSupportsModel() {
+			targets = append(targets, focusModel)
+		}
+		if d.selectedToolSupportsReasoningEffort() {
+			targets = append(targets, focusReasoningEffort)
+		}
+	}
+	if !d.firstSession {
+		modelTargets()
+	}
+	if d.hasWhereRow() {
+		targets = append(targets, focusWhere)
+	}
+	// Onboarding (ASK-211): worktree, Docker sandbox and multi-repo sit
+	// behind "More options", closed by default; a setting already on keeps
+	// its rows open (advancedShown). For a first session the model rows
+	// fold there too (modelRowsFolded).
+	targets = append(targets, focusMore)
+	if d.firstSession && !d.modelRowsFolded() {
+		modelTargets()
+	}
+	if d.advancedShown() {
+		targets = append(targets, focusWorktree, focusSandbox)
+		if d.sandboxEnabled && len(d.inheritedSettings) > 0 {
+			targets = append(targets, focusInherited)
+		}
+		if d.worktreeEnabled {
+			targets = append(targets, focusBranch)
+		}
+		// Multi-repo requires a catalog-aware remote parser.
+		if d.remoteCatalog == nil || !d.remoteCatalog.Legacy {
+			targets = append(targets, focusMultiRepo)
+		}
+	}
 	if len(d.conductorSessions) > 0 {
 		targets = append(targets, focusConductor)
-	}
-	if d.sandboxEnabled && len(d.inheritedSettings) > 0 {
-		targets = append(targets, focusInherited)
 	}
 	if d.hasRemoteMCPRow() {
 		targets = append(targets, focusRemoteMCPs)
 	}
-	if d.worktreeEnabled {
-		targets = append(targets, focusBranch)
-	}
-	// Multi-repo toggle below the fold (its path list renders here when enabled).
-	targets = append(targets, focusMultiRepo)
-	if d.toolOptions != nil {
+	if d.toolOptions != nil && d.toolOptionsShown() {
 		targets = append(targets, focusOptions)
 	}
+	// The Create button is always last: Enter walks the form top to bottom and
+	// lands here, so nothing is created until the user asks for it (Ctrl+S
+	// remains the create-from-anywhere shortcut).
+	targets = append(targets, focusCreate)
 	d.focusTargets = targets
 	// Clamp focusIndex to valid range.
 	if d.focusIndex >= len(d.focusTargets) {
@@ -1808,23 +2092,14 @@ func (d *NewDialog) rebuildFocusTargets() {
 
 // updateToolOptions sets d.toolOptions to the panel matching the current tool selection.
 func (d *NewDialog) updateToolOptions() {
-	cmd := d.GetSelectedCommand()
+	cmd := d.toolKind(d.GetSelectedCommand())
 	d.updateModelPlaceholder()
 	d.modelSuggestionCursor = 0
 	d.modelSuggestionActive = false
 	d.modelSuggestionHidden = false
 	d.modelNavigated = false
 	d.filterModelSuggestions()
-	validEffort := d.reasoningEffort == ""
-	for _, effort := range session.LaunchReasoningEffortsForTool(cmd) {
-		if effort == d.reasoningEffort {
-			validEffort = true
-			break
-		}
-	}
-	if !validEffort {
-		d.reasoningEffort = ""
-	}
+	d.dropUnsupportedReasoningEffort()
 	switch {
 	case session.IsClaudeCompatible(cmd):
 		d.toolOptions = d.claudeOptions
@@ -1834,6 +2109,8 @@ func (d *NewDialog) updateToolOptions() {
 		d.toolOptions = d.codexOptions
 	case cmd == "hermes":
 		d.toolOptions = d.hermesOptions
+	case cmd == "omp":
+		d.toolOptions = d.ompOptions
 	default:
 		d.toolOptions = nil
 	}
@@ -1851,6 +2128,7 @@ func (d *NewDialog) updateFocus() {
 	d.geminiOptions.Blur()
 	d.codexOptions.Blur()
 	d.hermesOptions.Blur()
+	d.ompOptions.Blur()
 
 	// Reset dropdown and soft-select state when focus changes.
 	d.pathSoftSelected = false
@@ -1870,13 +2148,13 @@ func (d *NewDialog) updateFocus() {
 			d.pathInput.Focus()
 		}
 	case focusCommand:
-		if d.commandCursor == 0 { // shell.
+		if d.customCommandSelected() { // shell.
 			d.commandInput.Focus()
 		}
 	case focusModel:
 		d.modelInput.Focus()
-	case focusReasoningEffort, focusWorktree, focusSandbox, focusConductor, focusInherited, focusRemoteMCPs:
-		// Checkbox/toggle rows and conductor dropdown — no text input to focus.
+	case focusReasoningEffort, focusWorktree, focusSandbox, focusConductor, focusInherited, focusRemoteMCPs, focusWhere, focusCreate, focusHooks, focusMore:
+		// Checkbox/toggle rows, conductor dropdown and Create button — no text input to focus.
 	case focusBranch:
 		d.branchInput.Focus()
 	case focusOptions:
@@ -1898,6 +2176,11 @@ func (d *NewDialog) moveFocus(delta int) {
 		d.focusIndex %= len(d.focusTargets)
 	}
 	d.updateFocus()
+	// Moving backwards into the tool options panel enters it at its last row,
+	// mirroring the forward walk that leaves from that row.
+	if delta < 0 && d.currentTarget() == focusOptions && d.toolOptions != nil {
+		d.toolOptions.FocusLast()
+	}
 }
 
 func isNewDialogTabKey(msg tea.KeyMsg) bool {
@@ -1921,7 +2204,7 @@ func (d *NewDialog) isTextInputFocused() bool {
 	case focusName, focusPath, focusModel, focusBranch:
 		return true
 	case focusCommand:
-		return d.commandCursor == 0 // custom command input
+		return d.customCommandSelected() // custom command input
 	case focusMultiRepo:
 		return d.multiRepoEditing
 	default:
@@ -2021,9 +2304,7 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 		if !d.modelSuggestionActive && d.currentTarget() == focusModel &&
 			!d.modelSuggestionHidden && d.selectedToolSupportsModel() {
 			if s := msg.String(); s == "down" || s == "up" {
-				d.filterModelSuggestions()
-				d.modelSuggestionActive = true
-				d.modelInput.Blur()
+				d.openModelSuggestions()
 				d.modelNavigated = true
 				// fall through to the modelSuggestionActive arrow handler below
 			}
@@ -2153,9 +2434,12 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 		if isNewDialogTabKey(msg) {
 			// On path field (or multi-repo path editing): trigger autocomplete or cycle through matches.
 			isPathEditing := cur == focusPath || d.multiRepoEditing
-			if isPathEditing {
+			if isPathEditing && !d.remoteTarget {
 				path := d.pathInput.Value()
-				info, err := os.Stat(path)
+				// The form shows the start folder as ~/... (ASK-211): stat the
+				// expanded path, or a complete folder reads as partial and Tab
+				// re-completes it instead of moving on.
+				info, err := os.Stat(session.ExpandPath(path))
 				isDir := err == nil && info.IsDir()
 				isPartial := !isDir || strings.HasSuffix(path, string(os.PathSeparator))
 
@@ -2194,12 +2478,23 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 				}
 				d.DismissModelSuggestions()
 			}
+			// Walk the tool options rows one at a time; Tab used to jump from
+			// the panel's first row straight back to Name, leaving Skip
+			// permissions / Extra args / Start query / Account reachable only
+			// via ↓.
+			if cur == focusOptions && d.toolOptions != nil && !d.toolOptions.AtBottom() {
+				return d, d.toolOptions.Update(msg)
+			}
 			// Issue #896 (problem 1): don't advance focus from a non-empty path
 			// that doesn't point to an existing directory. Tab should stick to
 			// the input until the user has a usable path; otherwise it silently
 			// jumps to the agent selector and the typed path is left dangling.
-			if isPathEditing {
+			if isPathEditing && !d.remoteTarget {
 				v := strings.Trim(strings.TrimSpace(d.pathInput.Value()), "'\"")
+				if d.remoteTarget && v != "" {
+					d.moveFocus(1)
+					return d, nil
+				}
 				if v != "" {
 					expanded := session.ExpandPath(v)
 					if info, err := os.Stat(expanded); err != nil || !info.IsDir() {
@@ -2219,6 +2514,9 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 		if isNewDialogShiftTabKey(msg) {
 			d.DismissSuggestions()
 			d.DismissModelSuggestions()
+			if cur == focusOptions && d.toolOptions != nil && !d.toolOptions.AtTop() {
+				return d, d.toolOptions.Update(msg)
+			}
 			d.moveFocus(-1)
 			return d, nil
 		}
@@ -2238,6 +2536,7 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 				total := len(d.conductorSessions) + 1
 				if d.conductorCursor < total-1 {
 					d.conductorCursor++
+					d.reapplyDefaultAccount()
 					return d, nil
 				}
 			}
@@ -2247,11 +2546,12 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 					return d, nil
 				}
 			}
+			if cur == focusOptions && d.toolOptions != nil && !d.toolOptions.AtBottom() {
+				return d, d.toolOptions.Update(tea.KeyMsg{Type: tea.KeyDown})
+			}
 			if d.focusIndex < maxIdx {
 				d.focusIndex++
 				d.updateFocus()
-			} else if cur == focusOptions && d.toolOptions != nil {
-				return d, d.toolOptions.Update(msg)
 			}
 			return d, nil
 
@@ -2271,6 +2571,7 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 			if cur == focusConductor {
 				if d.conductorCursor > 0 {
 					d.conductorCursor--
+					d.reapplyDefaultAccount()
 					return d, nil
 				}
 			}
@@ -2281,13 +2582,11 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 				}
 			}
 			if cur == focusOptions && d.toolOptions != nil && !d.toolOptions.AtTop() {
-				return d, d.toolOptions.Update(msg)
+				return d, d.toolOptions.Update(tea.KeyMsg{Type: tea.KeyUp})
 			}
-			d.focusIndex--
-			if d.focusIndex < 0 {
-				d.focusIndex = maxIdx
-			}
-			d.updateFocus()
+			// Same walk as ↑/Shift+Tab, so moving back into the options
+			// panel lands on its last row.
+			d.moveFocus(-1)
 			return d, nil
 
 		case "ctrl+w":
@@ -2314,6 +2613,10 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 
 		case "ctrl+f":
 			if cur == focusBranch {
+				if d.remoteTarget {
+					d.SetError("Remote branch names are validated on creation; type the branch name")
+					return d, nil
+				}
 				if d.branchPicker == nil {
 					d.branchPicker = NewBranchPickerDialog()
 				}
@@ -2332,6 +2635,7 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 				total := len(d.conductorSessions) + 1 // +1 for "None"
 				if d.conductorCursor < total-1 {
 					d.conductorCursor++
+					d.reapplyDefaultAccount()
 					return d, nil
 				}
 			}
@@ -2341,11 +2645,12 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 					return d, nil
 				}
 			}
+			if cur == focusOptions && d.toolOptions != nil && !d.toolOptions.AtBottom() {
+				return d, d.toolOptions.Update(msg)
+			}
 			if d.focusIndex < maxIdx {
 				d.focusIndex++
 				d.updateFocus()
-			} else if cur == focusOptions && d.toolOptions != nil {
-				return d, d.toolOptions.Update(msg)
 			}
 			return d, nil
 
@@ -2353,6 +2658,7 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 			if cur == focusConductor {
 				if d.conductorCursor > 0 {
 					d.conductorCursor--
+					d.reapplyDefaultAccount()
 					return d, nil
 				}
 			}
@@ -2389,38 +2695,31 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 			return d, nil
 
 		case "enter":
-			// Name/Branch are free-text fields: when the opt-in
-			// [ui].new_session_enter_advances toggle is on, Enter advances to the
-			// next field instead of submitting the form, so typing a name + Enter
-			// no longer silently creates a session with all defaults. With the
-			// toggle off (default) home.go never forwards Enter here for these
-			// fields (shouldHandleEnterLocally returns false), so this branch is
-			// only reached in opt-in mode; the guard keeps it correct regardless.
-			if d.enterAdvances && (cur == focusName || cur == focusBranch) {
-				d.moveFocus(1)
-				return d, nil
-			}
 			if cur == focusPath {
-				// Issue #1536: Enter on an actively-typed path (not the
-				// soft-selected pre-fill) that already resolves to an existing
-				// directory advances to the next field instead of re-opening the
-				// browse dropdown. Previously Enter here unconditionally
-				// re-activated suggestions, so after typing a custom path Enter
-				// looped straight back into browse and only Ctrl+S proceeded.
-				// This mirrors the #896 Tab guard. Enter still opens browse for
-				// the soft-selected pre-fill and for empty or not-yet-existing
-				// paths (where the dropdown is genuinely useful).
-				if !d.pathSoftSelected {
-					v := strings.Trim(strings.TrimSpace(d.pathInput.Value()), "'\"")
-					if v != "" {
-						expanded := session.ExpandPath(v)
-						if info, err := os.Stat(expanded); err == nil && info.IsDir() {
-							d.moveFocus(1)
-							if d.currentTarget() != focusPath {
-								d.suggestionNavigated = false
-							}
-							return d, nil
+				// Issue #1536: Enter on a path that already resolves to an
+				// existing directory advances to the next field instead of
+				// re-opening the browse dropdown. Previously Enter here
+				// unconditionally re-activated suggestions, so after typing a
+				// custom path Enter looped straight back into browse and only
+				// Ctrl+S proceeded. This mirrors the #896 Tab guard. The
+				// soft-selected pre-fill (the group default / cwd) advances the
+				// same way — browsing it is Space or → — so a plain Enter walk
+				// never stalls on an already-usable path. Enter still opens
+				// browse for empty or not-yet-existing paths (where the
+				// dropdown is genuinely useful).
+				v := strings.Trim(strings.TrimSpace(d.pathInput.Value()), "'\"")
+				if d.remoteTarget && v != "" {
+					d.moveFocus(1)
+					return d, nil
+				}
+				if v != "" {
+					expanded := session.ExpandPath(v)
+					if info, err := os.Stat(expanded); err == nil && info.IsDir() {
+						d.moveFocus(1)
+						if d.currentTarget() != focusPath {
+							d.suggestionNavigated = false
 						}
+						return d, nil
 					}
 				}
 				d.suggestionsActive = true
@@ -2430,10 +2729,11 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 				return d, nil
 			}
 			if cur == focusModel {
-				d.filterModelSuggestions()
-				d.modelSuggestionActive = true
-				d.modelSuggestionHidden = false
-				d.modelInput.Blur()
+				// Enter accepts whatever is in the field (empty = tool default)
+				// and moves on. Opening the list is ↓ or Space; Enter used to
+				// open it, and Enter on the list's default "Type custom" entry
+				// closed it again, so Enter never left this row.
+				d.moveFocus(1)
 				return d, nil
 			}
 			if cur == focusMultiRepo && d.multiRepoEnabled {
@@ -2456,10 +2756,27 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 				}
 				return d, nil
 			}
+			// Enter-advances mode: every remaining row (name, branch, tool,
+			// effort, checkboxes, conductor, tool options) steps to the next
+			// field, so typing a name + Enter no longer silently creates a
+			// session with all defaults. Inside the tool options panel that
+			// means the next option row; past its last row focus leaves for the
+			// Create button. Only focusCreate reaches home.go's submit path
+			// (shouldHandleEnterLocally); with the toggle off home.go never
+			// forwards Enter here, and the guard keeps it correct regardless.
+			if d.enterAdvances && cur != focusCreate {
+				if cur == focusOptions && d.toolOptions != nil && !d.toolOptions.AtBottom() {
+					return d, d.toolOptions.Update(tea.KeyMsg{Type: tea.KeyTab})
+				}
+				d.moveFocus(1)
+			}
 			return d, nil
 
 		case "left":
 			if cur == focusCommand {
+				if len(d.presetCommands) == 0 {
+					return d, nil
+				}
 				d.commandCursor--
 				if d.commandCursor < 0 {
 					d.commandCursor = len(d.presetCommands) - 1
@@ -2473,6 +2790,10 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 				d.cycleReasoningEffort(-1)
 				return d, nil
 			}
+			if cur == focusWhere {
+				d.cycleWhere(-1)
+				return d, nil
+			}
 			if cur == focusRemoteMCPs {
 				d.moveRemoteMCPCursor(-1)
 				return d, nil
@@ -2483,6 +2804,9 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 
 		case "right":
 			if cur == focusCommand {
+				if len(d.presetCommands) == 0 {
+					return d, nil
+				}
 				d.commandCursor = (d.commandCursor + 1) % len(d.presetCommands)
 				d.modelInput.SetValue("")
 				d.updateToolOptions()
@@ -2491,6 +2815,10 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 			}
 			if cur == focusReasoningEffort {
 				d.cycleReasoningEffort(1)
+				return d, nil
+			}
+			if cur == focusWhere {
+				d.cycleWhere(1)
 				return d, nil
 			}
 			if cur == focusRemoteMCPs {
@@ -2537,10 +2865,14 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 				defaultPath := ""
 				for i := len(d.multiRepoPaths) - 1; i >= 0; i-- {
 					if p := strings.TrimSpace(d.multiRepoPaths[i]); p != "" {
-						defaultPath = filepath.Dir(session.ExpandPath(p))
+						if d.remoteTarget {
+							defaultPath = filepath.Dir(p)
+						} else {
+							defaultPath = filepath.Dir(session.ExpandPath(p))
+						}
 						if defaultPath != "" && defaultPath != "." {
 							// Collapse home dir back to ~
-							if home, err := os.UserHomeDir(); err == nil && strings.HasPrefix(defaultPath, home) {
+							if home, err := os.UserHomeDir(); !d.remoteTarget && err == nil && strings.HasPrefix(defaultPath, home) {
 								defaultPath = "~" + defaultPath[len(home):]
 							}
 							defaultPath += string(os.PathSeparator)
@@ -2587,8 +2919,26 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 			}
 
 		case " ":
+			if cur == focusModel && !d.modelSuggestionActive {
+				// Space (like ↓) steps into the model list; a model ID never
+				// contains a space, so the input loses nothing.
+				d.openModelSuggestions()
+				return d, nil
+			}
 			if cur == focusReasoningEffort {
 				d.cycleReasoningEffort(1)
+				return d, nil
+			}
+			if cur == focusWhere {
+				d.cycleWhere(1)
+				return d, nil
+			}
+			if cur == focusHooks {
+				d.hooksTicked = !d.hooksTicked
+				return d, nil
+			}
+			if cur == focusMore {
+				d.toggleMoreOptions()
 				return d, nil
 			}
 			if cur == focusWorktree {
@@ -2641,6 +2991,10 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 		oldValue := d.pathInput.Value()
 		d.pathInput, cmd = d.pathInput.Update(msg)
 		if d.pathInput.Value() != oldValue {
+			// A branch derived from an empty name follows the folder (#2913).
+			if d.worktreeEnabled && d.branchAutoSet && strings.TrimSpace(d.nameInput.Value()) == "" {
+				d.autoBranchFromName()
+			}
 			d.suggestionNavigated = false
 			d.suggestionsActive = false
 			d.suggestionsHidden = false // typing re-opens the dropdown
@@ -2649,7 +3003,7 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 			d.filterPathSuggestions()
 		}
 	case focusCommand:
-		if d.commandCursor == 0 {
+		if d.customCommandSelected() {
 			d.commandInput, cmd = d.commandInput.Update(msg)
 		}
 	case focusModel:
@@ -2661,6 +3015,7 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 			d.modelSuggestionCursor = 0
 			d.modelNavigated = false
 			d.filterModelSuggestions()
+			d.dropUnsupportedReasoningEffort()
 		}
 	case focusMultiRepo:
 		// When editing a multi-repo path, forward keystrokes to pathInput.
@@ -2674,7 +3029,7 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 				d.filterPathSuggestions()
 			}
 		}
-	case focusWorktree, focusSandbox, focusConductor, focusInherited, focusRemoteMCPs:
+	case focusWorktree, focusSandbox, focusConductor, focusInherited, focusRemoteMCPs, focusWhere, focusHooks, focusMore:
 		// Checkbox/toggle rows and conductor dropdown — no text input to update.
 	case focusBranch:
 		oldBranch := d.branchInput.Value()
@@ -2732,54 +3087,48 @@ func (d *NewDialog) renderRemoteMCPRow(focused bool) string {
 	return b.String()
 }
 
-func (d *NewDialog) renderCommandSection(content *strings.Builder, cur focusTarget) {
+func (d *NewDialog) renderCommandSection(content *strings.Builder, cur focusTarget, dialogWidth int) {
 	labelStyle := lipgloss.NewStyle().Foreground(ColorText)
 	activeLabelStyle := lipgloss.NewStyle().Foreground(ColorCyan).Bold(true)
 
+	label := "  " + newDialogInlineLabel("Agent:")
 	if cur == focusCommand {
-		content.WriteString(activeLabelStyle.Render("▶ Command:"))
+		label = activeLabelStyle.Render("▶ " + newDialogInlineLabel("Agent:"))
 	} else {
-		content.WriteString(labelStyle.Render("  Command:"))
+		label = labelStyle.Render(label)
 	}
-	content.WriteString("\n  ")
 
-	// Render command options as consistent pill buttons.
-	var cmdButtons []string
-	for i, cmd := range d.presetCommands {
-		displayName := cmd
-		if displayName == "" {
-			displayName = "shell"
-		} else {
-			displayName = displayCommandPreset(cmd)
+	// The shared pill renderer owns spacing and wraps whole tool names with
+	// the same indent on continuation lines. The label sits in front of the
+	// first row (onboarding, ASK-211: one line per field); missing tools are
+	// grey.
+	innerWidth := dialogWidth - 8 // Padding(2,4) → 4 columns each side.
+	indent := strings.Repeat(" ", newDialogInlineIndent)
+	var missing []bool
+	if d.toolInstalled != nil {
+		missing = make([]bool, len(d.presetCommands))
+		for i, cmd := range d.presetCommands {
+			missing[i] = !d.toolIsInstalled(cmd)
 		}
-		// Prepend icon for custom tools.
-		if icon := session.GetToolIcon(cmd); cmd != "" && icon != "" {
-			if toolDef := session.GetToolDef(cmd); toolDef != nil && toolDef.Icon != "" {
-				displayName = icon + " " + displayName
-			}
-		}
-
-		var btnStyle lipgloss.Style
-		if i == d.commandCursor {
-			btnStyle = lipgloss.NewStyle().
-				Foreground(ColorBg).
-				Background(ColorAccent).
-				Bold(true).
-				Padding(0, 2)
-		} else {
-			btnStyle = lipgloss.NewStyle().
-				Foreground(ColorTextDim).
-				Background(ColorSurface).
-				Padding(0, 2)
-		}
-
-		cmdButtons = append(cmdButtons, btnStyle.Render(displayName))
 	}
-	content.WriteString(lipgloss.JoinHorizontal(lipgloss.Left, cmdButtons...))
+	pills := renderToolPillsMarked(toolPillLabels(d.presetCommands), d.commandCursor, missing, indent, innerWidth)
+	content.WriteString(label + strings.TrimPrefix(pills, indent))
 	content.WriteString("\n")
+	if d.anyToolMissing() {
+		dim := lipgloss.NewStyle().Foreground(ColorComment)
+		content.WriteString(indent + "  " + dim.Render("←→ change   grey = not installed"))
+		content.WriteString("\n")
+	}
+	if lines := d.missingToolLines(); len(lines) > 0 {
+		warn := lipgloss.NewStyle().Foreground(ColorYellow)
+		for _, l := range lines {
+			content.WriteString(indent + "  " + warn.Render(l))
+			content.WriteString("\n")
+		}
+	}
 
 	// show_only_installed_tools empty-fallback hint (issue #1259).
-	if session.ToolFilterFallbackActive() {
+	if !d.remoteTarget && session.ToolFilterFallbackActive() {
 		hintStyle := lipgloss.NewStyle().Foreground(ColorTextDim).Italic(true)
 		content.WriteString("  ")
 		content.WriteString(hintStyle.Render("No tools matched PATH; showing all. Set show_only_installed_tools = false to silence."))
@@ -2788,7 +3137,7 @@ func (d *NewDialog) renderCommandSection(content *strings.Builder, cur focusTarg
 	content.WriteString("\n")
 
 	// Custom command input (only if shell is selected).
-	if d.commandCursor == 0 {
+	if d.customCommandSelected() {
 		if cur == focusCommand {
 			content.WriteString(activeLabelStyle.Render("  ▸ Custom:"))
 		} else {
@@ -2871,12 +3220,10 @@ func (d *NewDialog) renderSinglePathSection(content *strings.Builder, cur focusT
 	labelStyle := lipgloss.NewStyle().Foreground(ColorText)
 	activeLabelStyle := lipgloss.NewStyle().Foreground(ColorCyan).Bold(true)
 	if cur == focusPath {
-		content.WriteString(activeLabelStyle.Render("▶ Path:"))
+		content.WriteString(activeLabelStyle.Render("▶ " + newDialogInlineLabel("Path:")))
 	} else {
-		content.WriteString(labelStyle.Render("  Path:"))
+		content.WriteString(labelStyle.Render("  " + newDialogInlineLabel("Path:")))
 	}
-	content.WriteString("\n")
-	content.WriteString("  ")
 	if cur == focusPath && d.pathSoftSelected && d.pathInput.Value() != "" {
 		// Soft-select highlight: render the textinput's own View() with reverse
 		// colors so the blinking cursor is preserved (#765).
@@ -2884,10 +3231,10 @@ func (d *NewDialog) renderSinglePathSection(content *strings.Builder, cur focusT
 		d.pathInput.TextStyle = lipgloss.NewStyle().
 			Background(ColorAccent).
 			Foreground(ColorBg)
-		content.WriteString(d.pathInput.View())
+		content.WriteString(renderFieldBar(d.pathInput.View(), d.pathInput.Width))
 		d.pathInput.TextStyle = savedTextStyle
 	} else {
-		content.WriteString(d.pathInput.View())
+		content.WriteString(renderFieldBar(d.pathInput.View(), d.pathInput.Width))
 	}
 	content.WriteString("\n")
 
@@ -2987,11 +3334,17 @@ func (d *NewDialog) View() string {
 
 	dialogWidth := d.effectiveDialogWidth()
 
+	// The first session's short form (ASK-211) uses one row of vertical
+	// padding so it fits 80x24 whole, More options included.
+	padY := 2
+	if d.firstSession {
+		padY = 1
+	}
 	dialogStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(ColorCyan).
 		Background(ColorSurface).
-		Padding(2, 4).
+		Padding(padY, 4).
 		Width(dialogWidth)
 
 	// Active field indicator style
@@ -3013,11 +3366,24 @@ func (d *NewDialog) View() string {
 	}
 
 	// Title with parent group info
-	content.WriteString(titleStyle.Render("New Session"))
+	title := "New Session"
+	if d.remoteName != "" {
+		title += " (remote: " + d.remoteName + ")"
+	}
+	content.WriteString(titleStyle.Render(title))
 	content.WriteString("\n")
 	groupInfoStyle := lipgloss.NewStyle().Foreground(ColorPurple) // Purple for group context
 	content.WriteString(groupInfoStyle.Render("  in group: " + d.parentGroupName))
 	content.WriteString("\n")
+
+	if d.remoteCatalog != nil && d.remoteCatalog.Legacy {
+		content.WriteString("\n")
+		// Wrapped here at the box's inner width: left to the box, the wrap
+		// would see the surface fill's codes (ASK-211 round 2) and break the
+		// sentence at "agent-".
+		content.WriteString(lipgloss.NewStyle().Foreground(ColorComment).Width(max(1, dialogWidth-8)).Render("  " + legacyRemoteCreationNotice))
+		content.WriteString("\n")
+	}
 
 	// Recent sessions picker
 	if d.showRecentPicker && len(d.recentSessions) > 0 {
@@ -3081,88 +3447,145 @@ func (d *NewDialog) View() string {
 	content.WriteString("\n")
 
 	// Name input
+	// Onboarding (ASK-211): Name, Agent and Path are one line each.
 	if cur == focusName {
-		writeActiveLabel("▶ Name:")
+		writeActiveLabel("▶ " + newDialogInlineLabel("Name:"))
 	} else {
-		content.WriteString(labelStyle.Render("  Name:"))
+		content.WriteString(labelStyle.Render("  " + newDialogInlineLabel("Name:")))
 	}
-	content.WriteString("\n")
-	content.WriteString("  ")
-	content.WriteString(d.nameInput.View())
+	// ASK-110: an empty local name is taken from the folder on submit; show
+	// that name so Enter is not a guess.
+	d.nameInput.Placeholder = "session-name"
+	if !d.createsOffMachine() {
+		if derived := d.DerivedName(); derived != "" {
+			d.nameInput.Placeholder = derived
+		}
+	}
+	content.WriteString(renderFieldBar(d.nameInput.View(), d.nameInput.Width))
 	content.WriteString("\n\n")
 
-	// Hot path (UX top-3 #3): Tool -> (Model) -> Path render right after Name.
-	// The Multi-repo toggle and its path list move below the common fields
-	// (see renderMultiRepoSection, called after the Branch input). In multi-repo
-	// mode the single Path field is hidden — its list renders below the fold.
+	// Hot path: Agent -> Path right after Name (one line each, so Path shows
+	// at 80x24 without scrolling), then the optional model rows. The
+	// Multi-repo toggle and its path list sit under "More options"; in
+	// multi-repo mode the single Path field is hidden.
 	markFocusedRow(focusCommand)
-	d.renderCommandSection(&content, cur)
-	markFocusedRow(focusModel)
-	d.renderModelSection(&content, cur, dialogWidth)
-	markFocusedRow(focusReasoningEffort)
-	d.renderReasoningEffortSection(&content, cur)
+	d.renderCommandSection(&content, cur, dialogWidth)
 	if !d.multiRepoEnabled {
 		markFocusedRow(focusPath)
 		d.renderSinglePathSection(&content, cur, dialogWidth)
 	}
-
-	// (Tool, Model, and the single Path field render above, right after Name —
-	// see renderCommandSection / renderModelSection / renderSinglePathSection.)
-
-	// Worktree checkbox — individually focusable.
-	worktreeLabel := "Create in worktree"
-	if cur == focusCommand {
-		worktreeLabel = "Create in worktree (w)"
+	// The Claude hooks line (replaces the Claude Code Hooks box), right under
+	// Path so the consent the first Enter gives is on screen at 80x24.
+	if d.showHooksLine() {
+		markFocusedRow(focusHooks)
+		content.WriteString(d.renderHooksLine(cur == focusHooks, max(1, dialogWidth-8)))
+		content.WriteString("\n")
 	}
-	markFocusedRow(focusWorktree)
-	content.WriteString(renderCheckboxLine(worktreeLabel, d.worktreeEnabled, cur == focusWorktree))
-
-	// Docker sandbox checkbox — individually focusable.
-	sandboxLabel := "Run in Docker sandbox"
-	if cur == focusCommand {
-		sandboxLabel = "Run in Docker sandbox (s)"
+	modelRows := func() {
+		markFocusedRow(focusModel)
+		d.renderModelSection(&content, cur, dialogWidth)
+		markFocusedRow(focusReasoningEffort)
+		d.renderReasoningEffortSection(&content, cur)
 	}
-	markFocusedRow(focusSandbox)
-	content.WriteString(renderCheckboxLine(sandboxLabel, d.sandboxEnabled, cur == focusSandbox))
+	if !d.firstSession {
+		modelRows()
+	}
+
+	markFocusedRow(focusWhere)
+	d.renderWhereSection(&content, cur)
+
+	// "More options": worktree, Docker sandbox and multi-repo (and, for a
+	// first session, the model rows and the tool's options).
+	markFocusedRow(focusMore)
+	content.WriteString(d.renderMoreOptionsLine(cur == focusMore))
+	if d.firstSession && !d.modelRowsFolded() {
+		content.WriteString("\n")
+		modelRows()
+	}
+	if d.advancedShown() {
+		// Worktree checkbox — individually focusable.
+		worktreeLabel := "Create in worktree"
+		if cur == focusCommand {
+			worktreeLabel = "Create in worktree (w)"
+		}
+		markFocusedRow(focusWorktree)
+		content.WriteString(renderCheckboxLine(worktreeLabel, d.worktreeEnabled, cur == focusWorktree))
+
+		// Docker sandbox checkbox — individually focusable.
+		sandboxLabel := "Run in Docker sandbox"
+		if cur == focusCommand {
+			sandboxLabel = "Run in Docker sandbox (s)"
+		}
+		markFocusedRow(focusSandbox)
+		content.WriteString(renderCheckboxLine(sandboxLabel, d.sandboxEnabled, cur == focusSandbox))
+
+		// Inherited Docker settings (only visible when sandbox is enabled).
+		if d.sandboxEnabled && len(d.inheritedSettings) > 0 {
+			focused := cur == focusInherited
+			dimStyle := lipgloss.NewStyle().Foreground(ColorComment)
+			settingStyle := lipgloss.NewStyle().Foreground(ColorTextDim)
+
+			// Render toggle line.
+			arrow := "▸"
+			if d.inheritedExpanded {
+				arrow = "▾"
+			}
+			summary := fmt.Sprintf("%d active", len(d.inheritedSettings))
+			toggleLine := fmt.Sprintf("%s Docker Settings (%s)", arrow, summary)
+			if focused {
+				writeActiveLabel("▶ " + toggleLine)
+			} else {
+				content.WriteString("  " + dimStyle.Render(toggleLine))
+			}
+			content.WriteString("\n")
+
+			// Render expanded settings.
+			if d.inheritedExpanded {
+				for _, s := range d.inheritedSettings {
+					content.WriteString(settingStyle.Render(fmt.Sprintf("    %s: %s", s.label, s.value)))
+					content.WriteString("\n")
+				}
+			}
+		} else if d.sandboxEnabled {
+			// Sandbox enabled but all defaults — show informational line.
+			dimStyle := lipgloss.NewStyle().Foreground(ColorComment)
+			content.WriteString("  " + dimStyle.Render("Docker Settings (all defaults)"))
+			content.WriteString("\n")
+		}
+
+		// Branch input (only visible when worktree is enabled).
+		if d.worktreeEnabled {
+			content.WriteString("\n")
+			if cur == focusBranch {
+				writeActiveLabel("▶ Branch:")
+			} else {
+				content.WriteString(labelStyle.Render("  Branch:"))
+			}
+			content.WriteString("\n")
+			content.WriteString("  ")
+			content.WriteString(d.branchInput.View())
+			content.WriteString("\n")
+			if d.branchPicker != nil && d.branchPicker.IsVisible() {
+				content.WriteString("  ")
+				content.WriteString(strings.ReplaceAll(d.branchPicker.View(), "\n", "\n  "))
+				content.WriteString("\n")
+			}
+		}
+
+		// Multi-repo toggle (below the fold, UX top-3 #3). Its path list renders
+		// here when enabled; in the common single-repo case it's just a checkbox.
+		if d.remoteCatalog == nil || !d.remoteCatalog.Legacy {
+			content.WriteString("\n")
+			markFocusedRow(focusMultiRepo)
+			d.renderMultiRepoSection(&content, cur)
+		}
+
+	}
 
 	// Remote MCP picks (only for a remote target that reported MCPs).
 	if d.hasRemoteMCPRow() {
 		markFocusedRow(focusRemoteMCPs)
 		content.WriteString(d.renderRemoteMCPRow(cur == focusRemoteMCPs))
-	}
-
-	// Inherited Docker settings (only visible when sandbox is enabled).
-	if d.sandboxEnabled && len(d.inheritedSettings) > 0 {
-		focused := cur == focusInherited
-		dimStyle := lipgloss.NewStyle().Foreground(ColorComment)
-		settingStyle := lipgloss.NewStyle().Foreground(ColorTextDim)
-
-		// Render toggle line.
-		arrow := "▸"
-		if d.inheritedExpanded {
-			arrow = "▾"
-		}
-		summary := fmt.Sprintf("%d active", len(d.inheritedSettings))
-		toggleLine := fmt.Sprintf("%s Docker Settings (%s)", arrow, summary)
-		if focused {
-			writeActiveLabel("▶ " + toggleLine)
-		} else {
-			content.WriteString("  " + dimStyle.Render(toggleLine))
-		}
-		content.WriteString("\n")
-
-		// Render expanded settings.
-		if d.inheritedExpanded {
-			for _, s := range d.inheritedSettings {
-				content.WriteString(settingStyle.Render(fmt.Sprintf("    %s: %s", s.label, s.value)))
-				content.WriteString("\n")
-			}
-		}
-	} else if d.sandboxEnabled {
-		// Sandbox enabled but all defaults — show informational line.
-		dimStyle := lipgloss.NewStyle().Foreground(ColorComment)
-		content.WriteString("  " + dimStyle.Render("Docker Settings (all defaults)"))
-		content.WriteString("\n")
 	}
 
 	// Conducting parent selector (only visible when conductor sessions exist).
@@ -3186,7 +3609,7 @@ func (d *NewDialog) View() string {
 		items := make([]conductorItem, 0, len(d.conductorSessions)+1)
 		items = append(items, conductorItem{label: "None", idx: 0})
 		for i, inst := range d.conductorSessions {
-			name := strings.TrimPrefix(inst.Title, "conductor-")
+			name := conductorDisplayName(inst)
 			shortPath := inst.ProjectPath
 			if home, err := os.UserHomeDir(); err == nil {
 				shortPath = strings.Replace(shortPath, home, "~", 1)
@@ -3208,33 +3631,8 @@ func (d *NewDialog) View() string {
 		}
 	}
 
-	// Branch input (only visible when worktree is enabled).
-	if d.worktreeEnabled {
-		content.WriteString("\n")
-		if cur == focusBranch {
-			writeActiveLabel("▶ Branch:")
-		} else {
-			content.WriteString(labelStyle.Render("  Branch:"))
-		}
-		content.WriteString("\n")
-		content.WriteString("  ")
-		content.WriteString(d.branchInput.View())
-		content.WriteString("\n")
-		if d.branchPicker != nil && d.branchPicker.IsVisible() {
-			content.WriteString("  ")
-			content.WriteString(strings.ReplaceAll(d.branchPicker.View(), "\n", "\n  "))
-			content.WriteString("\n")
-		}
-	}
-
-	// Multi-repo toggle (below the fold, UX top-3 #3). Its path list renders
-	// here when enabled; in the common single-repo case it's just a checkbox.
-	content.WriteString("\n")
-	markFocusedRow(focusMultiRepo)
-	d.renderMultiRepoSection(&content, cur)
-
 	// Tool options panel
-	if d.toolOptions != nil {
+	if d.toolOptions != nil && d.toolOptionsShown() {
 		content.WriteString("\n")
 		panelStart := strings.Count(content.String(), "\n")
 		if cur == focusOptions {
@@ -3242,6 +3640,17 @@ func (d *NewDialog) View() string {
 		}
 		content.WriteString(d.toolOptions.View())
 	}
+
+	// Create button: the explicit end of the Enter walk. Ctrl+S still creates
+	// from any row.
+	content.WriteString("\n")
+	markFocusedRow(focusCreate)
+	if cur == focusCreate {
+		content.WriteString(activeLabelStyle.Render("▶ [ Create session ]"))
+	} else {
+		content.WriteString(labelStyle.Render("  [ Create session ]"))
+	}
+	content.WriteString("\n")
 
 	// Inline validation error
 	if d.validationErr != "" {
@@ -3260,19 +3669,29 @@ func (d *NewDialog) View() string {
 	if len(d.recentSessions) > 0 {
 		recentPrefix = "^R recent │ "
 	}
-	// createHint reflects the active Enter mode on free-text fields. With the
-	// opt-in toggle on, Enter advances and Ctrl+S creates; with it off (default),
-	// Enter still creates (Ctrl+S also works, but Enter is the legacy primary).
-	createHint := "Enter create"
-	if d.enterAdvances {
-		createHint = "^S create"
+	// Every row's footer says what Enter does there. By default (ASK-110)
+	// Enter creates from any row; in the opt-in Enter-advances mode Enter
+	// steps to the next field and only the Create button or Ctrl+S creates.
+	rowHint := "Enter next │ ^S create"
+	if !d.enterAdvances {
+		rowHint = "Enter create"
 	}
-	helpText := recentPrefix + "Tab next │ ↑↓ navigate │ " + createHint + " │ Esc cancel"
+	helpText := recentPrefix + "Tab next │ ↑↓ navigate │ " + rowHint + " │ Esc cancel"
+	if d.firstSession && !d.enterAdvances {
+		// The first session's form, as in Sharjeel's prototype.
+		helpText = "Tab next │ ←→ agent │ Space tick │ Enter create │ Esc cancel"
+	}
 	if cur == focusPath {
 		if d.suggestionsActive {
 			helpText = "↑/↓ navigate │ Space/Enter select │ Tab next │ Esc back"
+		} else if !d.enterAdvances {
+			if d.pathSoftSelected {
+				helpText = "Type to replace │ Enter create │ Space/→ browse │ ← edit │ Esc cancel"
+			} else {
+				helpText = "Tab autocomplete │ Enter create │ Esc cancel"
+			}
 		} else if d.pathSoftSelected {
-			helpText = "Type to replace │ Enter browse list │ ← edit │ Tab next │ Esc cancel"
+			helpText = "Type to replace │ Enter next │ Space/→ browse │ ← edit │ Esc cancel"
 		} else {
 			// Issue #1536: on a path that resolves to an existing directory,
 			// Enter advances to the next field; otherwise it opens the browse
@@ -3288,40 +3707,61 @@ func (d *NewDialog) View() string {
 			helpText = "^F branch search │ Tab next │ Enter create │ Esc cancel"
 		}
 	} else if cur == focusCommand {
+		// The form calls this row "agent" (ASK-211 round 3). w/s/y are
+		// left out on the first form (those options sit under More
+		// options) and whenever the line would not fit on one row.
 		selectedCmd := d.GetSelectedCommand()
+		extras := []string{"w worktree", "s sandbox"}
 		if selectedCmd == "gemini" || selectedCmd == "codex" || selectedCmd == "hermes" {
-			helpText = "←→ command │ w worktree │ s sandbox │ y yolo │ Tab next │ ^S create │ Esc cancel"
-		} else {
-			helpText = "←→ command │ w worktree │ s sandbox │ Tab next │ ^S create │ Esc cancel"
+			extras = append(extras, "y yolo")
+		}
+		if d.firstSession {
+			extras = nil
+		}
+		for {
+			items := append(append([]string{"←→ agent"}, extras...), rowHint, "Esc cancel")
+			helpText = strings.Join(items, " │ ")
+			if len(extras) == 0 || lipgloss.Width(helpText) <= max(1, dialogWidth-8) {
+				break
+			}
+			extras = extras[:len(extras)-1]
 		}
 	} else if cur == focusModel {
 		if d.modelSuggestionActive {
 			helpText = "↑/↓ navigate │ Space/Enter select │ Esc back │ ^S create"
 		} else if d.IsModelPickerOpen() {
-			helpText = "Type custom model ID │ Enter browse IDs │ Tab next │ Esc back │ ^S create"
+			helpText = "Type an ID │ ↓/Space browse IDs │ " + rowHint + " │ Esc back"
 		} else {
-			helpText = "Type custom model ID │ Enter browse IDs │ Tab next │ Esc cancel │ ^S create"
+			helpText = "Type an ID │ ↓/Space browse IDs │ " + rowHint + " │ Esc cancel"
 		}
 	} else if cur == focusReasoningEffort {
-		helpText = "←→/Space choose effort │ Tab next │ Enter/^S create │ Esc cancel"
+		helpText = "←→/Space choose effort │ Tab next │ " + rowHint + " │ Esc cancel"
+	} else if cur == focusWhere {
+		helpText = "←→/Space choose where │ Tab next │ " + rowHint + " │ Esc cancel"
 	} else if cur == focusConductor {
-		helpText = "↑↓ select parent │ Tab next │ Enter/^S create │ Esc cancel"
+		helpText = "↑↓ select parent │ Tab next │ " + rowHint + " │ Esc cancel"
+	} else if cur == focusHooks {
+		helpText = "Space tick │ Tab next │ " + rowHint + " │ Esc cancel"
+	} else if cur == focusMore {
+		helpText = "Space open/close │ Tab next │ " + rowHint + " │ Esc cancel"
 	} else if cur == focusWorktree || cur == focusSandbox {
-		helpText = "Space toggle │ ↑↓ navigate │ Enter/^S create │ Esc cancel"
+		helpText = "Space toggle │ ↑↓ navigate │ " + rowHint + " │ Esc cancel"
 	} else if cur == focusInherited {
-		helpText = "Space expand/collapse │ ↑↓ navigate │ Enter/^S create │ Esc cancel"
+		helpText = "Space expand/collapse │ ↑↓ navigate │ " + rowHint + " │ Esc cancel"
 	} else if cur == focusRemoteMCPs {
-		helpText = "←→ choose MCP │ Space attach/detach │ ↑↓ navigate │ Enter/^S create │ Esc cancel"
+		helpText = "←→ choose MCP │ Space attach/detach │ ↑↓ navigate │ " + rowHint + " │ Esc cancel"
 	} else if cur == focusOptions && d.toolOptions != nil {
-		helpText = "Space/y toggle │ ↑↓ navigate │ Enter/^S create │ Esc cancel"
+		helpText = "Space/y toggle │ Tab/↑↓ navigate │ " + rowHint + " │ Esc cancel"
+	} else if cur == focusCreate {
+		helpText = "Enter create │ Shift+Tab back │ ↑↓ navigate │ Esc cancel"
 	}
 	content.WriteString(helpStyle.Render(helpText))
 
-	// Border plus Padding(2, 4) consume six terminal rows. At constrained
+	// Border plus Padding(padY, 4) consume 2+2*padY terminal rows. At constrained
 	// heights, viewport only the form body; wide/tall dialogs remain byte-for-
 	// byte on the original rendering path.
 	innerWidth := max(1, dialogWidth-8)
-	maxContentHeight := d.height - 6
+	maxContentHeight := d.height - 2 - 2*padY
 	fullContent := content.String()
 	viewported := viewportDialogContent(fullContent, innerWidth, maxContentHeight, focusLogicalLine)
 
@@ -3334,12 +3774,16 @@ func (d *NewDialog) View() string {
 				d.modelLineOffset = i + 3 // title margin + label + input
 			}
 			if strings.Contains(plain, "▶ Path:") {
-				d.suggestionsLineOffset = i + 3 // title margin + label + input
+				d.suggestionsLineOffset = i + 2 // title margin + the one-line label/input row
 			}
 		}
 	}
 
-	// Wrap in dialog box
+	// Wrap in dialog box. Keep the surface fill uniform: every inline
+	// segment and textinput part resets SGR state, which would otherwise let
+	// the terminal background show through the box (#2449; dark theme too
+	// since ASK-211 round 2, where it left strips through the first form).
+	viewported = fillSurfaceAfterResets(trimPaddingOverflow(viewported, innerWidth), surfaceBackgroundSGR())
 	dialog := dialogStyle.Render(viewported)
 
 	// Center the dialog
@@ -3361,9 +3805,15 @@ func (d *NewDialog) View() string {
 
 		// suggestionsLineOffset is the content line where the dropdown should appear.
 		// Add border (1) + top padding (2) to get the actual row within the dialog box.
-		overlayRow := topRow + 1 + 2 + d.suggestionsLineOffset
-		// Align with the path input: border (1) + padding (4)
-		overlayCol := leftCol + 1 + 4
+		overlayRow := topRow + 1 + padY + d.suggestionsLineOffset
+		// Align with the path input: border (1) + padding (4) + the inline
+		// "Path:" label column (ASK-211).
+		overlayCol := leftCol + 1 + 4 + newDialogInlineIndent
+		// The hooks line right under Path is the consent Enter gives: open
+		// the menu above the Path row instead of over it (ASK-211 round 2).
+		if d.showHooksLine() && !d.multiRepoEnabled {
+			overlayRow = max(0, overlayRow-1-lipgloss.Height(suggestionsOverlay))
+		}
 
 		placed = overlayDropdown(placed, suggestionsOverlay, overlayRow, overlayCol)
 	}
@@ -3371,13 +3821,90 @@ func (d *NewDialog) View() string {
 	if modelOverlay := d.renderModelSuggestionsDropdown(); modelOverlay != "" {
 		topRow, leftCol := dialogOrigin(d.width, d.height, lipgloss.Width(dialog), lipgloss.Height(dialog))
 
-		overlayRow := topRow + 1 + 2 + d.modelLineOffset
+		overlayRow := topRow + 1 + padY + d.modelLineOffset
 		overlayCol := leftCol + 1 + 4
 
 		placed = overlayDropdown(placed, modelOverlay, overlayRow, overlayCol)
 	}
 
 	return placed
+}
+
+// trimPaddingOverflow cuts the trailing blank cells of a line wider than
+// width. A text input's padding can run a cell past the box; lipgloss used
+// to drop those spaces when it wrapped, but once the surface fill puts SGR
+// codes between them the wrap breaks the line inside the typed text instead
+// (a model ID "qwen3-custom-" + "zzz" on the next row).
+func trimPaddingOverflow(s string, width int) string {
+	lines := strings.Split(s, "\n")
+	for i, l := range lines {
+		w := ansi.StringWidth(l)
+		if w <= width {
+			continue
+		}
+		if strings.TrimSpace(ansi.Strip(ansi.Cut(l, width, w))) == "" {
+			lines[i] = ansi.Truncate(l, width, "")
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// renderFieldBar draws a one-line text input on a field background of one
+// width, so Name and Path are two equal bars (Sharjeel's prototype) instead
+// of a bar that ends where the text or the placeholder ends (ASK-211 round 2).
+// inputWidth is the textinput's Width; the bar is the prompt, that width and
+// the cursor cell.
+func renderFieldBar(view string, inputWidth int) string {
+	bg := dropdownMenuBg()
+	sgr := ""
+	if c := lipgloss.ColorProfile().Color(string(bg)); c != nil {
+		if seq := c.Sequence(true); seq != "" {
+			sgr = "\x1b[" + seq + "m"
+		}
+	}
+	width := max(lipgloss.Width(view), lipgloss.Width("> ")+inputWidth+1)
+	return lipgloss.NewStyle().Background(bg).Width(width).Render(fillSurfaceAfterResets(view, sgr))
+}
+
+// sgrResetRE matches an SGR sequence that resets every attribute, the form
+// lipgloss and the bubbles textinput end each styled segment with, or only
+// the background (49, the end of an inner Background style).
+var sgrResetRE = regexp.MustCompile(`\x1b\[(0*|49)m`)
+
+// surfaceBackgroundSGR returns the SGR sequence that sets ColorSurface as the
+// background in the active colour profile, or "" when colours are disabled.
+func surfaceBackgroundSGR() string {
+	c := lipgloss.ColorProfile().Color(string(ColorSurface))
+	if c == nil {
+		return ""
+	}
+	seq := c.Sequence(true)
+	if seq == "" {
+		return ""
+	}
+	return "\x1b[" + seq + "m"
+}
+
+// fillSurfaceAfterResets re-establishes the surface background after every
+// SGR reset in s. lipgloss v1 applies a box's Background only up to the first
+// reset emitted by inner content, so without this each styled label, pill,
+// placeholder or cursor punches a hole through to the terminal background
+// for the rest of its line (#2449).
+func fillSurfaceAfterResets(s, surface string) string {
+	if surface == "" {
+		return s
+	}
+	return sgrResetRE.ReplaceAllStringFunc(s, func(reset string) string {
+		return reset + surface
+	})
+}
+
+// renderSurfaceBox renders content in a box style whose Background is
+// ColorSurface, with the surface fill re-established after every inner
+// reset, so names, details and footers sit on the box colour instead of
+// punching through to the terminal background (ASK-211 review).
+func renderSurfaceBox(style lipgloss.Style, content string) string {
+	return style.Render(fillSurfaceAfterResets(content, surfaceBackgroundSGR()))
 }
 
 // renderSuggestionsDropdown renders the path suggestions as a standalone block
@@ -3702,3 +4229,100 @@ func (d *NewDialog) GetParentProjectPath() string {
 	}
 	return d.conductorSessions[d.conductorCursor-1].ProjectPath
 }
+
+// reapplyDefaultAccount re-runs the #2895 default after the Parent row
+// moved, so a conductor with its own config_dir keeps the session on
+// inherit and moving off it restores the default. A pick the user made on
+// the Account row in this opening stays.
+func (d *NewDialog) reapplyDefaultAccount() {
+	if d.remoteTarget || d.claudeOptions.AccountTouched() {
+		return
+	}
+	userConfig, err := session.LoadUserConfig()
+	if err != nil || userConfig == nil {
+		return
+	}
+	d.claudeOptions.SetAccount(session.DefaultAccountForNewSession(userConfig, d.parentGroupPath, d.selectedConductor()))
+}
+
+// selectedConductor returns the selected conductor parent, or nil.
+func (d *NewDialog) selectedConductor() *session.Instance {
+	if d.conductorCursor <= 0 || d.conductorCursor > len(d.conductorSessions) {
+		return nil
+	}
+	return d.conductorSessions[d.conductorCursor-1]
+}
+
+// toolKind uses only the owning host's compatibility catalog for remote tools.
+func (d *NewDialog) toolKind(name string) string {
+	if !d.remoteTarget {
+		if session.IsClaudeCompatible(name) {
+			return "claude"
+		}
+		if session.IsCodexCompatible(name) {
+			return "codex"
+		}
+		return name
+	}
+	if d.remoteCatalog != nil {
+		for _, tool := range d.remoteCatalog.Tools {
+			if tool.Name == name {
+				return tool.Kind
+			}
+		}
+	}
+	return ""
+}
+
+// walk defect #6: a legacy catalog (no capability catalog at all, #2275's
+// fallback) used to collapse the Command picker to shell-only ({Name: ""}),
+// hiding claude/codex/pi/etc even though the remote's bare -c/--cmd flag
+// happily runs any of them (agent-deck just execs the tool). Degrade
+// gracefully instead: offer the same built-in tool list the local dialog
+// does. Their *kind* is still unverified (Legacy's Tools stays
+// [{Name: ""}], so toolKind() returns "" for all of them), which is what
+// correctly keeps the catalog-dependent rows — model ids, account slots,
+// MCPs, worktree/sandbox availability — hidden.
+const legacyRemoteCreationNotice = "Remote runs an older agent-deck; options are not verified on the remote (model, account, MCP and worktree options hidden)."
+
+func (d *NewDialog) SetRemoteCreationCatalog(catalog *session.RemoteCreationCatalog) {
+	d.remoteCatalog = catalog
+	d.claudeOptions.SetFromOptions(&session.ClaudeOptions{SessionMode: "new", SkipPermissions: catalog.Defaults["skip_permissions"], AutoMode: catalog.Defaults["auto_mode"], UseChrome: catalog.Defaults["chrome"], UseTeammateMode: catalog.Defaults["teammate_mode"]})
+	d.codexOptions.SetDefaults(catalog.Defaults["codex_yolo"])
+	d.geminiOptions.SetDefaults(catalog.Defaults["gemini_yolo"])
+	d.hermesOptions.SetDefaults(catalog.Defaults["hermes_yolo"])
+	d.presetCommands = nil
+	if catalog.Legacy {
+		d.presetCommands = buildPresetCommands()
+	} else {
+		for _, tool := range catalog.Tools {
+			d.presetCommands = append(d.presetCommands, tool.Name)
+		}
+	}
+	d.commandCursor = 0
+	d.SetDefaultTool(catalog.DefaultTool)
+	// The model field is deliberately left as PrepareForRemoteTarget cleared
+	// it. Unlike preselectDefaultModel, which prefills only from the *local
+	// user's own* configured default_model, the catalog's tool.DefaultModel
+	// is the remote host's config — never a choice this user made here — so
+	// seeding from it silently pinned a concrete model (e.g. "fable") before
+	// any tool was even chosen. Leaving it empty shows the same "tool
+	// default (↓ to browse)" placeholder the local dialog shows.
+	d.SetRemoteAccounts(catalog.Accounts)
+	d.SetRemoteMCPs(catalog.MCPs)
+	d.conductorSessions = nil
+	for _, parent := range catalog.Conductors {
+		d.conductorSessions = append(d.conductorSessions, &session.Instance{ID: parent.ID, Title: parent.Title})
+	}
+	d.validationErr = ""
+	d.updateToolOptions()
+}
+
+func (d *NewDialog) customCommandSelected() bool {
+	// Both local presets and the remote producer represent shell with an empty name.
+	// An absent catalog also reads as an empty command, so require a valid entry.
+	return d.commandCursor >= 0 && d.commandCursor < len(d.presetCommands) && d.presetCommands[d.commandCursor] == ""
+}
+
+// SetRemoteName labels the owning host of a remote creation dialog.
+func (d *NewDialog) SetRemoteName(name string) { d.remoteName = name }

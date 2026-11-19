@@ -1,0 +1,110 @@
+# Comms Ledger test matrix
+
+Every harness, local and remote, urgent and info: a scripted scenario that
+proves produce -> ledger -> consume -> ack with timing. Automated cases run
+in CI (Docker, `go test`); lab cases run against a live harness on a
+machine with the binary installed and are recorded in the build worker's
+RESULTS. The matrix grows with each phase; the status column says where a
+cell stands today.
+
+Legend: **auto** = a Go test in this repository runs the scenario;
+**lab** = a scripted manual run (command and expected output below);
+**P2** / **P3** = the stage that adds the consume/ack or remote leg.
+
+## Scenario shape
+
+1. Produce: the harness finishes a turn (the hook fires with the text), or
+   a status edge is observed (shell).
+2. Ledger: the notify daemon drains the spool and commits one `turn` (or
+   `status`) record with `tier`, `trigger`, `text`, `t_signal`, `t_record`.
+3. Consume: the parent's next prompt carries the record (prompt-time
+   injection) or a typed nudge wakes it; `t_pushed` / `t_seen` are stamped.
+4. Ack: the consumer advances its cursor; `msg stats` shows the latency.
+
+Timing: `latency_ms` (signal to commit) is on every record; P2 adds
+`t_pushed` and `t_seen` so signal-to-seen is measured per record.
+
+## Matrix
+
+| Harness | Leg | Tier | Produce -> ledger | Consume -> ack | Status | Test |
+|---|---|---|---|---|---|---|
+| Claude | local | urgent | human prompt, Stop with text (fixtures `claude_stop_v1.json`, `claude_userpromptsubmit_v1.json`) | UPS additionalContext | **auto** (P0+P1) / P2 | `TestCommsIngest_ClaudeTurnMatchesTheInboxClassification`, `TestHookHandler_ClaudeFixturesSpoolBothEdges`, `TestCommsIngest_LongClaudeReplyStillMatchesItsTranscriptTurn`, `TestCommsIngest_SameTextClaudeBacklogIsThreeRecords` |
+| Claude | local | info | task-notification turn, Stop with text | rides next turn / digest | **auto** / P2 | same, plus `TestCommsIngest_ClaudeBacklogKeepsEveryTurnsOwnText` (daemon down, three turns queued) |
+| Claude | remote | urgent, info | same on the remote; `msg export` over ssh; `Import(origin)` | as local, origin shown | **auto** (import semantics) / P3 (transport) | `TestRemoteFirstExportImportIsIdempotentPerOrigin` |
+| Codex | local | urgent | `[agent-deck from:]` prompt, notify with `last-assistant-message` (fixture `codex_notify_v1.json`); a Codex Stop hook never spools (fixture `codex_stop_v1.json`) | typed nudge when idle | **auto** / P2 | `TestCommsIngest_CodexTurnTakesTriggerFromThePromptEdge`, `TestCodexNotify_FixtureSpoolsLastAssistantMessageOnce` |
+| Codex | local | info | `[HEARTBEAT]` prompt, notify with text | next typed nudge bundle | **auto** / P2 | same |
+| Codex | remote | urgent, info | as local + import | as local | P3 | matrix row only |
+| Gemini | local | urgent | **status-only in P1** (text producer specified: BeforeAgent prompt, AfterAgent `prompt_response`; needs its own fixture + lab before enablement) | BeforeAgent additionalContext (P2) | **auto** (status record) / deferred | `TestCommsIngest_StatusEdgesCollapseByContentNotTime` (gemini row), `TestHookHandler_OnlyClaudeSpoolsInP1` |
+| Gemini | local | info | n/a until the producer is enabled | | deferred | |
+| Gemini | remote | urgent, info | as local + import | as local | P3 | matrix row only |
+| Cursor | local | urgent | **status-only in P1** (text producer specified: beforeSubmitPrompt, afterAgentResponse `text`, which needs one more event in the installed hooks.json and a lossless merge; deferred) | stop `followup_message` / typed nudge (P2) | **auto** (status record) / deferred | `TestHookHandler_OnlyClaudeSpoolsInP1` |
+| Cursor | local | info | n/a until the producer is enabled | | deferred | |
+| Cursor | remote | urgent, info | as local + import | as local | P3 | matrix row only |
+| Pi | local | urgent | extension v6: the last `input` is the prompt, `agent_settled` carries the run's last `turn_end` text; a run without text is one status edge | a listed pi parent: `before_agent_start` context, accepted on the extension's receipt; its doorbell is a frame on the extension's socket, delivered as `pi.sendMessage(..., {triggerTurn: true})` | **auto** | `TestHookHandler_PiSettleSpoolsOneTurnEnd`, `TestHookHandler_PiNoTextSettleSpoolsOneStatusEdge`, `TestHookHandler_PiSettleSpoolsTheRunToken`, `TestPiHookExtension_*`, `TestCommsIngest_Pi*`, `TestCommsIngest_APi*`, `TestLedgerConsumer_APi*`, `TestLedgerConsumer_AnErrorOrRemoteRecordOfAShownPiRunIsStillShown`, `TestLedgerConsumer_AnOrphanedPiRunIsShownOnceWithItsText`, `TestPiLedgerE2E_*` (a ledger-consuming parent); matrix pi cells (single-turn: `one_turn`, `urgent_woken_once`); the second-turn wake is the `pi-child-two-turns` scenario (`urgent_woken_twice`)[^pi-turn]; a Claude parent listed in `[comms] consumers` with a pi child is the `ledger-parent-pi-child` scenario (`run_shown_once_or_twice`, `ledger_first_run_shown_once`)[^pi-ledger] |
+| Pi | local | info | as urgent; `<task-notification>` prompt is tier info | | **auto** | `TestCommsIngest_PiTurnTiersFromThePromptAndSentinel` |
+| Pi | remote | urgent, info | as local + import | as local | P3 | matrix row only |
+| Pi (listed) | local | urgent | child `pi` run as above; the parent is named in `[comms] consumers`, so it enrols (`comms/consumers/<id>.json`, `tool: pi`) | doorbell over the parent extension's socket (`submitted`), then the run's `before_agent_start` returns the ledger context; the receipt is echoed and the next run start acks | **auto** | matrix cell `pi listed urgent`: `enrolment_file`, `urgent_woken_once`, `wake_via_socket`, `no_tmux_wake_record`, `single_wake_record`, `parent_pane_untouched`, `wake_injected_context`, `receipt_echoed_and_acked`, `next_prompt_does_not_reinject` |
+| Pi (listed) | local | info | as above, tier info | no doorbell; the next run start carries the text, and the one after carries nothing again | **auto** | matrix cell `pi listed info`: `info_no_input`, `info_no_doorbell_frame`, `info_no_wake_record`, `prompt_context_carries_text`, `next_prompt_does_not_reinject` |
+| Pi (unlisted) | local | urgent, info | the same rig with the extension installed (socket on at launch) but the parent not listed | PR-A's typed behaviour: one typed wake (urgent), nothing for info; no enrolment, no frame, no socket record | **auto** | matrix cells `pi unlisted urgent/info`: `enrolment_file` false, `no_socket_frame`, `no_socket_wake_record`, `single_tmux_wake_record`, `typed_line_is_the_legacy_doorbell` |
+| Hermes | local | urgent | **status-only in P1** (text producer specified: pre_llm_call `user_message`, post_llm_call `assistant_response`; the shell-hook payload shape is unverified) | pre_llm_call `{context}` / typed nudge (P2) | **auto** (status record) / deferred | `TestHookHandler_OnlyClaudeSpoolsInP1` |
+| Hermes | local | info | n/a until the producer is enabled | | deferred | |
+| Hermes | remote | urgent, info | as local + import | as local | P3 | matrix row only |
+| OpenCode | local | urgent | **status-only in P1** (text producer specified: root idle with a 2 s debounce and `GET /session/:id/message`, stream-decoded; deferred, needs lab L2) | `POST /session/:id/prompt_async` (P2) | **auto** (status record) / deferred | `TestCommsIngest_ShellToolGetsAStatusRecordOnce` (same path) |
+| OpenCode | local | info | n/a until the producer is enabled | | deferred | |
+| OpenCode | remote | urgent, info | as local + import | as local | P3 | matrix row only |
+| Shell | local | urgent | observed edge -> `status` record | one typed line | **auto** / P2 | `TestCommsIngest_ShellToolGetsAStatusRecordOnce` |
+| Shell | local | info | n/a (status records have no tier) | | n/a | |
+| Shell | remote | urgent | as local + import | as local | P3 | matrix row only |
+| any | local | off | `[comms] ledger = false`: no spool, no ledger dir | | **auto** | `TestCommsIngest_OffByDefaultWritesNothing`, `TestHookHandler_SpoolsNothingWithLedgerOff` |
+| any | local | isolation | ledger disk failure leaves the inbox record and wake untouched; inbox parity with the ledger on | | **auto** | `TestCommsIngest_LedgerDiskFailureNeverTouchesTheInboxPath`, `TestCommsIngest_InboxParityWithTheLedgerOn` |
+| any | local | identity | one event replayed 100 times is one record; two identical answers are two; status edges collapse by content only | | **auto** | `TestCommsIngest_OneEventReplayedAHundredTimesIsOneRecord`, `TestCommsIngest_SameTextDifferentTurnsAreTwoRecords`, `TestCommsIngest_StatusEdgesCollapseByContentNotTime` |
+| any | local | ownership | a second daemon never ingests while the first owns the ledger | | **auto** | `TestCommsIngest_SecondDaemonDoesNotOwnTheLedger` |
+| any | local | hostile input | symlink, oversized, malformed spool entries and traversal ids are rejected | | **auto** | `TestCommsSpoolRejectsSymlinksOversizedAndMalformedEntries`, `TestHookHandler_RejectsATraversalInstanceID` |
+| primitive | | | torn tail truncated, mid-history corruption kept and skipped, owner-only modes, short write rolled back | | **auto** | `TestRecoveryTruncatesOnlyATornTailAndKeepsMidHistoryCorruption`, `TestPrivateBusCreatesOwnerOnlyFiles`, `TestCommitShortWriteIsRolledBackAndReported` |
+| contract | | | receipt states, watermark + sparse acks, retention and gaps (fixtures) | | **auto** | `TestReceiptTransitionsMatchFixture`, `TestConsumerStateWatermarkAndSparseAcksMatchFixture`, `TestConsumerStateNeverSkipsPendingInfoWhenUrgentOvertakes`, `TestRetentionKeepsPendingAndReportsGaps`, `TestRecordCarriesSchemaVersionStoreAndEpoch` |
+| any | local | restart | daemon restart keeps keys and sequences | | **auto** | `TestCommsIngest_RecordsSurviveADaemonRestart`, `TestLedgerCommitStampsSequencesAndDedupsByKey` |
+| any | local | failure | a failed commit keeps the spool entry and its trigger; the ledger reopens | | **auto** | `TestCommsIngest_FailedCommitIsRetriedWithItsTrigger` |
+| any | local | config | per-conductor `[conductors.<c>.inbox]` applies to the ledger tier | | **auto** | `TestCommsIngest_UsesTheParentConductorsInboxConfig` |
+| CLI | | | `events follow\|stats --bus comms` open the ledger read-only | | **auto** | `TestOpenBusForRead` |
+| primitive | | | synchronous commit, two writers, read-only follower, retention | | **auto** | `internal/events/commit_test.go` |
+
+## Lab scripts
+
+Run on a machine with the built binary and the harness installed, with
+`[comms] ledger = true`, the notify daemon restarted, and a conductor plus
+one child of the harness under test.
+
+Lab L2 applies once the OpenCode producer is enabled (not in P1). Lab L1 applies to the pi producer.
+
+**L1 pi (info, local)**
+```
+agent-deck launch /tmp/lab-pi -t lab-pi -c pi -m "Reply with exactly: PI READY"
+agent-deck events follow --bus comms --json --session <lab-pi id>
+```
+Expect within 10 s of pi's prompt returning: one `turn` record, `tool: pi`,
+`trigger: human`, `tier: info` (a plain reply; urgent needs a done sentinel,
+an error, or a question), `text: PI READY`, `latency_ms` < 5000.
+
+**L2 opencode (urgent, local)**
+```
+agent-deck launch /tmp/lab-oc -t lab-oc -c opencode -m "Reply with exactly: OC READY"
+agent-deck events follow --bus comms --json --session <lab-oc id>
+```
+Needs a TUI open (the SSE watcher lives there) and the session launched
+with a port. Expect one `turn` record with `tool: opencode`, `text: OC READY`.
+
+**L3 any harness (info, local)**
+Send `[HEARTBEAT] anything new?` with `agent-deck session send`; expect the
+reply as a `turn` record with `trigger: inbox`, `tier: info`.
+
+**L4 remote (P3)**
+`agent-deck msg export --after <cursor> --json` on the remote over ssh,
+import on the conductor's host; expect `origin: <remote>`, `src_cursor`
+set, a second pull adds nothing.
+
+Consume and ack rows are filled by the P2 PR (`agent-deck msg read|ack`,
+`t_pushed`, `t_seen`, `msg stats`).
+
+[^pi-turn]: The pi cells above drive one child turn, so they cannot see the inbox producer's per-run identity. Until the pi turn-fingerprint fix, a pi child's fingerprint fell back to the constant running-to-waiting flip and every run after the first was skipped as a known turn (no inbox record, no wake). The `pi-child-two-turns` scenario asserts both turns are recorded and the parent is rung twice.
+
+[^pi-ledger]: A ledger parent is shown a pi run once or twice, never zero times: when the ledger shows the run first, its textless inbox twin (`<child>: waiting`) is retired, so the run is shown once; when the inbox shows it first, it is shown twice and the ledger turn still brings the text. The `ledger-parent-pi-child` scenario drives two pi runs through the installed extension and the live daemon, with a prompt after each, and asserts each run's text and record id arrive in its own prompt exactly once, each prompt names the child once (the ledger came first) and within the once-or-twice bound, a later prompt repeats nothing, and the inbox still rings the parent twice. On a binary without the pi run key in the ledger, each prompt names the child twice (`ledger_first_run_shown_once` fails with `[2, 2]`).

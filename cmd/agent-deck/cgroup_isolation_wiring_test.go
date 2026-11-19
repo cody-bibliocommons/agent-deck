@@ -48,11 +48,7 @@ func TestLogCgroupIsolationDecision_WiredIntoBootstrap(t *testing.T) {
 		if err := os.MkdirAll(filepath.Join(xdgCacheHome, "agent-deck"), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		binPath := filepath.Join(t.TempDir(), "agent-deck-test")
-		build := exec.Command("go", "build", "-o", binPath, ".")
-		if out, err := build.CombinedOutput(); err != nil {
-			t.Fatalf("go build: %v\noutput: %s", err, out)
-		}
+		binPath := agentDeckBinaryAs(t, "agent-deck-test")
 
 		// Strip TMUX* and AGENTDECK_* env from the parent process so the
 		// nested-session guard in main.go (isNestedSession → GetCurrentSessionID)
@@ -82,6 +78,11 @@ func TestLogCgroupIsolationDecision_WiredIntoBootstrap(t *testing.T) {
 			"AGENTDECK_SKIP_UPDATE_CHECK=1",
 			"AGENTDECK_PROFILE=test-obs01",
 			"TERM=dumb",
+			// This test deliberately boots the TUI with no PTY to read the log
+			// line it emits on the way up. Without the opt-in the binary now
+			// refuses that, because for a human it is an unkillable full-screen
+			// app on a pipe.
+			"AGENT_DECK_ALLOW_NO_TTY=1",
 		)
 		cmd := exec.Command(binPath)
 		cmd.Env = env

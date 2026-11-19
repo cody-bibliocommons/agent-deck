@@ -8,7 +8,9 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/costs"
@@ -24,6 +26,7 @@ type Config struct {
 	ReadOnly     bool
 	WebMutations bool // When false, POST/PATCH/DELETE endpoints return 403
 	Token        string
+	AllowedHosts []string // Additional exact Host values, optionally including a port.
 	// InsecureBind explicitly acknowledges binding a non-loopback address
 	// with no auth token (an unauthenticated RCE surface). Without it the
 	// server refuses to start in that configuration. See bind.go / report #1.
@@ -35,7 +38,10 @@ type Config struct {
 	// ConfirmLinkOpen gates the web terminal's link-open confirm for hosts
 	// that are NOT trusted. nil means "confirm" — the safe default, so a
 	// Config built without this field never silently disables the prompt.
-	ConfirmLinkOpen     *bool
+	ConfirmLinkOpen *bool
+	// FileLinkRoots are the absolute `[web] file_link_roots` directories
+	// GET /api/files may read (issue #2676). Empty turns the route off.
+	FileLinkRoots       []string
 	MenuData            MenuDataLoader
 	PushVAPIDPublicKey  string
 	PushVAPIDPrivateKey string
@@ -50,107 +56,6 @@ func (c Config) confirmLinkOpen() bool {
 	return c.ConfirmLinkOpen == nil || *c.ConfirmLinkOpen
 }
 
-// DefaultUndoWindow is the default Chrome-style undo grace period for
-// session deletes (POST /api/sessions/undelete). Mirrors the TUI ctrl+z
-// in-memory undo stack window.
-const DefaultUndoWindow = 30 * time.Second
-
-// ErrUndoNothing is returned by SessionMutator.UndoDelete when the undo
-// stack is empty.
-var ErrUndoNothing = errors.New("nothing to undo")
-
-// ErrUndoExpired is returned by SessionMutator.UndoDelete when the most
-// recent delete is older than the configured undo window.
-var ErrUndoExpired = errors.New("undo window expired")
-
-// ErrSessionNotFound is returned by SessionMutator.FinishWorktree when the
-// target session id does not resolve to a live instance. The handler maps
-// this to 404. See issue #1126.
-var ErrSessionNotFound = errors.New("session not found")
-
-// ErrNotAWorktree is returned by SessionMutator.FinishWorktree when the
-// target session exists but is not in a git/jujutsu worktree (so there is
-// nothing to merge or clean up). The handler maps this to 400. See issue
-// #1126.
-var ErrNotAWorktree = errors.New("session is not in a worktree")
-
-// WorktreeFinishOptions configures a SessionMutator.FinishWorktree call.
-// All fields are optional; the zero value asks the implementation to
-// auto-detect the target branch, perform the merge, delete the source
-// branch, and refuse if the worktree is dirty.
-type WorktreeFinishOptions struct {
-	// Into is the target branch to merge the worktree branch into. When
-	// empty the backend's default branch is used (matches the
-	// `agent-deck worktree finish --into` flag).
-	Into string
-	// NoMerge skips the merge step (mirrors --no-merge). The branch is
-	// still removed (unless KeepBranch) and the worktree torn down.
-	NoMerge bool
-	// KeepBranch leaves the source branch in place after finishing
-	// (mirrors --keep-branch). Useful when the branch already lives on a
-	// remote PR.
-	KeepBranch bool
-	// Force skips the dirty-worktree safety check and forces branch
-	// deletion even if the merge fast-forward didn't succeed.
-	Force bool
-}
-
-// WorktreeFinishResult is what SessionMutator.FinishWorktree returns on
-// success. Mirrors the JSON-output payload of `agent-deck worktree finish
-// --json`.
-type WorktreeFinishResult struct {
-	SessionID     string
-	Branch        string
-	MergedInto    string
-	Merged        bool
-	BranchDeleted bool
-}
-
-// MenuDataLoader provides menu snapshots for web APIs and push notifications.
-type MenuDataLoader interface {
-	LoadMenuSnapshot() (*MenuSnapshot, error)
-}
-
-// SessionMutator is implemented by internal/ui.WebMutator and injected at startup.
-// It bridges web HTTP handlers to the TUI session/group management methods.
-type SessionMutator interface {
-	CreateSession(title, tool, projectPath, groupPath, modelID, reasoningEffort string) (string, error)
-	StartSession(sessionID string) error
-	StopSession(sessionID string) error
-	RestartSession(sessionID string) error
-	DeleteSession(sessionID string) error
-	// CloseSession stops the session process while keeping its metadata
-	// in storage (TUI Shift+D — non-destructive close).
-	CloseSession(sessionID string) error
-	ArchiveSession(sessionID string) error
-	UnarchiveSession(sessionID string) error
-	ForkSession(sessionID string) (string, error)
-	// UndoDelete restores the most-recently deleted session if it was
-	// deleted within the implementation's undo window. Returns the
-	// restored session id. Implementations should return ErrUndoNothing
-	// when the stack is empty and ErrUndoExpired when the most recent
-	// entry is older than the window — the handler maps both to 404.
-	UndoDelete() (string, error)
-	// UpdateSession applies one or more field edits to a session. updates maps
-	// session.Field* constants (raw strings — see internal/session/mutators.go)
-	// to their string-encoded new values; bools are "true"/"false". Returns the
-	// list of fields that actually changed (a no-op subset is permitted; only
-	// fields whose new value differs from the stored value are reported) and
-	// whether any updated field requires a restart to take effect. Validation
-	// errors (unknown field, invalid value) leave the session unchanged.
-	UpdateSession(sessionID string, updates map[string]string) (updatedFields []string, restartRequired bool, err error)
-	CreateGroup(name, parentPath string) (string, error)
-	RenameGroup(groupPath, newName string) error
-	DeleteGroup(groupPath string) error
-	// FinishWorktree merges (or skips), removes the worktree, optionally
-	// deletes the source branch, kills the tmux session, and removes the
-	// session from storage. Mirrors the TUI W/shift+w hotkey and the
-	// `agent-deck worktree finish` CLI. Returns ErrSessionNotFound when
-	// the id doesn't resolve and ErrNotAWorktree when the session exists
-	// but lacks worktree metadata. See issue #1126.
-	FinishWorktree(sessionID string, opts WorktreeFinishOptions) (WorktreeFinishResult, error)
-}
-
 // Server wraps an HTTP server for Agent Deck web mode.
 type Server struct {
 	cfg         Config
@@ -160,6 +65,7 @@ type Server struct {
 	baseCtx     context.Context
 	cancelBase  context.CancelFunc
 	hookWatcher *session.StatusFileWatcher
+	onListening func()
 
 	menuSubscribersMu sync.Mutex
 	menuSubscribers   map[chan struct{}]struct{}
@@ -175,6 +81,20 @@ type Server struct {
 	// whose hook file is present on disk. Defaults to defaultLoadHookStatuses
 	// (which reads ~/.agent-deck/hooks/) but is injectable for tests.
 	hookStatusLoader func() map[string]*session.HookStatus
+
+	// annotationLoader returns recall hints/tags per instance for a
+	// profile (snapshot_annotations.go). Injectable for tests; nil disables.
+	annotationLoader annotationLoader
+	annotationReader *stateDBAnnotationReader
+
+	// assistant serves /mcp, /api/assistant/v1/ and the /connect form
+	// (handlers_assistant.go). nil until SetAssistantService.
+	assistant *assistantWiring
+
+	// inFlight counts requests inside a handler, excluding the event
+	// streams (see trackInFlight). It is what Idle reports for the
+	// headless self-restart.
+	inFlight atomic.Int64
 }
 
 // NewServer creates a new web server with base routes and middleware.
@@ -201,7 +121,9 @@ func NewServer(cfg Config) *Server {
 		menuSubscribers:  make(map[chan struct{}]struct{}),
 		mutationLimiter:  mutationLimiter,
 		hookStatusLoader: defaultLoadHookStatuses,
+		annotationReader: &stateDBAnnotationReader{},
 	}
+	s.annotationLoader = s.annotationReader.load
 	if s.remoteFleet == nil {
 		s.remoteFleet = session.NewRemoteFleetScanner()
 	}
@@ -216,6 +138,7 @@ func NewServer(cfg Config) *Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/s/", s.handleIndex)
+	mux.HandleFunc("/g/", s.handleIndex)
 	mux.HandleFunc("/manifest.webmanifest", s.handleManifest)
 	mux.HandleFunc("/sw.js", s.handleServiceWorker)
 	mux.Handle("/static/", gzipAndCacheStatic(http.StripPrefix("/static/", s.staticFileServer())))
@@ -255,6 +178,7 @@ func NewServer(cfg Config) *Server {
 	mux.HandleFunc("/api/groups", s.handleGroupsCollection)
 	mux.HandleFunc("/api/groups/", s.handleGroupByPath)
 	mux.HandleFunc("/api/settings", s.handleSettings)
+	mux.HandleFunc("/api/path-suggestions", s.handlePathSuggestions)
 	mux.HandleFunc("/api/profiles", s.handleProfiles)
 	mux.HandleFunc("/api/push/config", s.handlePushConfig)
 	mux.HandleFunc("/api/push/subscribe", s.handlePushSubscribe)
@@ -263,36 +187,11 @@ func NewServer(cfg Config) *Server {
 	mux.HandleFunc("/events/menu", s.handleMenuEvents)
 	mux.HandleFunc("/ws/session/", s.handleSessionWS)
 
-	// Command Center (the embedded live fleet god-view — see
-	// conductor/agent-deck/COMMAND-CENTER-DESIGN.md). Two read endpoints and
-	// one write endpoint, all behind the existing authorize/CSRF/mutation gates.
-	mux.HandleFunc("/api/command-center/status", s.handleCommandCenterStatus)
-	mux.HandleFunc("/events/command-center", s.handleCommandCenterEvents)
-	mux.HandleFunc("POST /api/command-center/ask", s.handleCommandCenterAsk)
+	// Feature routes (command center, costs, system, skills, MCPs) register
+	// themselves from their handlers_<feature>.go files; see routes.go.
+	s.mountFeatureRoutes(mux)
 
-	mux.HandleFunc("/api/costs/summary", s.handleCostsSummary)
-	mux.HandleFunc("/api/costs/daily", s.handleCostsDaily)
-	mux.HandleFunc("/api/costs/sessions", s.handleCostsSessions)
-	mux.HandleFunc("/api/costs/models", s.handleCostsModels)
-	mux.HandleFunc("/api/costs/export", s.handleCostsExport)
-	mux.HandleFunc("/api/costs/groups", s.handleCostsGroups)
-	mux.HandleFunc("/api/costs/session", s.handleCostsSessionDetail)
-	mux.HandleFunc("/api/costs/batch", s.handleCostsBatch)
-	mux.HandleFunc("/api/costs/stream", s.handleCostsStream)
-
-	mux.HandleFunc("/api/system/stats", s.handleSystemStats)
-
-	mux.HandleFunc("/api/skills", s.handleSkillsCatalog)
-
-	// MCP management (Web UI parity with TUI `m` key dialog). Closes the
-	// four MISSING rows under "MCP MANAGEMENT" in PARITY_MATRIX.md.
-	mux.HandleFunc("/api/mcps", s.handleMCPsCatalog)
-	mux.HandleFunc("GET /api/sessions/{id}/mcps", s.handleSessionMCPsRouter)
-	mux.HandleFunc("POST /api/sessions/{id}/mcps/{name}", s.handleSessionMCPsRouter)
-	mux.HandleFunc("DELETE /api/sessions/{id}/mcps/{name}", s.handleSessionMCPsRouter)
-	mux.HandleFunc("PATCH /api/sessions/{id}/mcps/{name}", s.handleSessionMCPsRouter)
-
-	handler := withRecover(s.csrfProtect(mux))
+	handler := frameProtect(s.allowHosts(s.tokenCookie(s.trackInFlight(withRecover(s.csrfProtect(mux))))))
 
 	s.httpServer = &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -315,6 +214,12 @@ func (s *Server) Handler() http.Handler {
 	return s.httpServer.Handler
 }
 
+// SetOnListening sets fn to run once Start has bound the listen address,
+// before it serves requests. It is not called when binding fails.
+func (s *Server) SetOnListening(fn func()) {
+	s.onListening = fn
+}
+
 // Start starts the HTTP server and blocks until shutdown or error.
 // Returns nil on graceful shutdown.
 func (s *Server) Start() error {
@@ -326,6 +231,9 @@ func (s *Server) Start() error {
 	if s.remoteFleet != nil {
 		s.remoteFleet.Start(s.baseCtx)
 	}
+	// Probe CLIs for model lists in the background, so /api/settings never
+	// waits on one (#2664).
+	session.WarmModelCatalog()
 
 	webLog := logging.ForComponent(logging.CompWeb)
 	if watcher, err := session.NewStatusFileWatcher(func() {
@@ -343,10 +251,13 @@ func (s *Server) Start() error {
 	if s.push != nil {
 		s.push.Start(s.baseCtx)
 	}
-	err := s.httpServer.ListenAndServe()
+	err := s.listenAndServe()
 	if s.hookWatcher != nil {
 		s.hookWatcher.Stop()
 		s.hookWatcher = nil
+	}
+	if s.annotationReader != nil {
+		s.annotationReader.close()
 	}
 	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		if s.cancelBase != nil {
@@ -357,8 +268,56 @@ func (s *Server) Start() error {
 	return nil
 }
 
-// Shutdown gracefully stops the server.
+// listenAndServe is http.Server.ListenAndServe with the onListening hook
+// between binding and serving.
+func (s *Server) listenAndServe() error {
+	addr := s.httpServer.Addr
+	if addr == "" {
+		addr = ":http"
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	if s.onListening != nil {
+		s.onListening()
+	}
+	return s.httpServer.Serve(ln)
+}
+
+// pendingDeleteFinalizer is implemented by a mutator whose deletes stay
+// undoable for a while (ui.WebMutator): once the server stops they can no
+// longer be undone, so Shutdown finalizes them.
+type pendingDeleteFinalizer interface {
+	FinalizePendingDeletes()
+}
+
+// pendingDeleteFinalizeTimeout caps the undoable-delete sweep in Shutdown:
+// an inbox file under lock contention can hold it for seconds, and whatever
+// is not swept by then keeps its pending record for the next start's
+// reconcile.
+var pendingDeleteFinalizeTimeout = 5 * time.Second
+
+// finalizePendingDeletesBounded runs f.FinalizePendingDeletes and waits at
+// most timeout for it.
+func finalizePendingDeletesBounded(f pendingDeleteFinalizer, timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.FinalizePendingDeletes()
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+	}
+}
+
+// Shutdown gracefully stops the server. Deletes still undoable through the
+// mutator are finalized once the listener is down.
 func (s *Server) Shutdown(ctx context.Context) error {
+	if f, ok := s.mutator.(pendingDeleteFinalizer); ok {
+		defer finalizePendingDeletesBounded(f, pendingDeleteFinalizeTimeout)
+	}
 	if s.cancelBase != nil {
 		// Signal long-lived handlers (SSE/WS) to stop promptly.
 		s.cancelBase()
@@ -384,6 +343,46 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 
 	return err
+}
+
+// streamPathPrefixes are the long-lived responses that never count as
+// in-flight work: the browser's EventSource reconnects on its own the
+// moment the connection drops, so an open event stream must not keep a
+// headless server from restarting into a new build. A terminal WebSocket
+// (/ws/session/) is not on this list: someone is typing into it.
+var streamPathPrefixes = []string{"/events/", "/api/costs/stream"}
+
+func isStreamPath(path string) bool {
+	for _, p := range streamPathPrefixes {
+		if strings.HasPrefix(path, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// trackInFlight counts requests from handler entry to exit so Idle can
+// tell when it is safe to hand the process over.
+func (s *Server) trackInFlight(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isStreamPath(r.URL.Path) {
+			s.inFlight.Add(1)
+			defer s.inFlight.Add(-1)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// InFlightRequests is the number of requests currently inside a handler,
+// event streams excluded.
+func (s *Server) InFlightRequests() int64 {
+	return s.inFlight.Load()
+}
+
+// Idle reports whether no request (event streams excluded) is being
+// served right now. `web --no-tui` uses it as the self-restart gate.
+func (s *Server) Idle() bool {
+	return s.inFlight.Load() == 0
 }
 
 func withRecover(next http.Handler) http.Handler {

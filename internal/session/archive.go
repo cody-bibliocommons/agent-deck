@@ -2,9 +2,49 @@ package session
 
 import "time"
 
-// IsArchived reports whether the session is in the user archive.
+// IsArchived reports whether the session is in the user archive. It reads
+// ArchivedAt under the instance's archive lock: the TUI renders, filters and
+// looks up conductors on other goroutines than the background commands that
+// archive, unarchive, restart from the archive or switch harness, which
+// write it through SetArchivedAtThreadSafe. That lock guards ArchivedAt
+// alone, so a render never waits on a status sweep holding mu.
 func (i *Instance) IsArchived() bool {
-	return i != nil && !i.ArchivedAt.IsZero()
+	if i == nil {
+		return false
+	}
+	i.archiveMu.RLock()
+	defer i.archiveMu.RUnlock()
+	return !i.ArchivedAt.IsZero()
+}
+
+// ArchivedAtThreadSafe returns ArchivedAt, read under the archive lock.
+func (i *Instance) ArchivedAtThreadSafe() time.Time {
+	i.archiveMu.RLock()
+	defer i.archiveMu.RUnlock()
+	return i.ArchivedAt
+}
+
+// SetArchivedAtThreadSafe sets ArchivedAt under the archive lock. The zero
+// time unarchives the session.
+func (i *Instance) SetArchivedAtThreadSafe(t time.Time) {
+	i.archiveMu.Lock()
+	i.ArchivedAt = t
+	i.archiveMu.Unlock()
+}
+
+// MarkStopped records a deliberate stop for a session whose pane is already
+// gone, so there is nothing for Kill to tear down. Archiving such a session
+// would otherwise keep whatever status the dead pane left behind (usually
+// error), and every status count would report the archive as a crash.
+//
+// Like Kill, it releases any auth hold: this is a deliberate stop, so a later
+// restart is a user act, not automation the hold should block.
+func (i *Instance) MarkStopped() {
+	i.mu.Lock()
+	i.Status = StatusStopped
+	i.stopRevision++
+	i.clearAuthHoldLocked()
+	i.mu.Unlock()
 }
 
 // FilterInstancesByArchive returns instances whose archive state matches archived.
@@ -17,7 +57,7 @@ func FilterInstancesByArchive(instances []*Instance, archived bool) []*Instance 
 		if inst == nil {
 			continue
 		}
-		isArchived := !inst.ArchivedAt.IsZero()
+		isArchived := inst.IsArchived()
 		if archived == isArchived {
 			out = append(out, inst)
 		}
@@ -25,12 +65,18 @@ func FilterInstancesByArchive(instances []*Instance, archived bool) []*Instance 
 	return out
 }
 
-// ArchiveTimeUTC returns the archive timestamp in UTC, or zero when not archived.
-func ArchiveTimeUTC(t time.Time) time.Time {
-	if t.IsZero() {
-		return time.Time{}
+// VisibleInstances returns instances excluding archived rows retained for
+// cross-harness recovery (superseded sources) — the canonical tracked set
+// that list --json, status --json, TUI header counts and group preview panels
+// must all derive from, so aggregates never diverge from the enumerable list.
+func VisibleInstances(instances []*Instance) []*Instance {
+	visible := make([]*Instance, 0, len(instances))
+	for _, inst := range instances {
+		if inst != nil && !(inst.IsArchived() && inst.SupersededBy != "") {
+			visible = append(visible, inst)
+		}
 	}
-	return t.UTC()
+	return visible
 }
 
 // SameArchivePartition reports whether two sessions sit in the same archive
@@ -45,4 +91,31 @@ func ArchiveTimeUTC(t time.Time) time.Time {
 // did nothing.
 func SameArchivePartition(a, b *Instance) bool {
 	return a.IsArchived() == b.IsArchived()
+}
+
+// ArchivedClaudeSessionIDHolder returns the ARCHIVED record, other than self,
+// that already holds sessionID as its Claude conversation id, or nil.
+//
+// Issue #2683: the save-time duplicate guard (UpdateClaudeSessionsWithDedup)
+// keeps the id on the oldest record and silently clears it on the newer one,
+// archived or not. An archived holder is invisible in the normal list, so
+// `add --resume-session <id>` quietly launched a fresh conversation and
+// `session set <x> claude-session-id <id>` printed success and then reverted.
+// Callers use this to refuse up front, naming the holder.
+func ArchivedClaudeSessionIDHolder(instances []*Instance, self *Instance, sessionID string) *Instance {
+	if sessionID == "" {
+		return nil
+	}
+	for _, inst := range instances {
+		if inst == nil || inst == self || (self != nil && inst.ID == self.ID) {
+			continue
+		}
+		if !inst.IsArchived() || !IsClaudeCompatible(inst.Tool) {
+			continue
+		}
+		if inst.ClaudeSessionID == sessionID {
+			return inst
+		}
+	}
+	return nil
 }

@@ -1,0 +1,1143 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/comms"
+	"github.com/asheshgoplani/agent-deck/internal/costs"
+	"github.com/asheshgoplani/agent-deck/internal/recall/query"
+	"github.com/asheshgoplani/agent-deck/internal/send"
+	"github.com/asheshgoplani/agent-deck/internal/sendqueue"
+	"github.com/asheshgoplani/agent-deck/internal/session"
+)
+
+// imageList is the repeatable --image flag.
+type imageList []string
+
+func (l *imageList) String() string     { return strings.Join(*l, ",") }
+func (l *imageList) Set(v string) error { *l = append(*l, v); return nil }
+
+var imageExtensions = map[string]bool{".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".webp": true, ".pdf": true}
+
+// errImagesUnsupported marks a harness that cannot take an image in a
+// running session; the CLI exits 2 for it.
+var errImagesUnsupported = errors.New("images not supported")
+
+// attachImages copies images next to the session and returns the message
+// with the harness's image reference appended. Claude Code and Gemini CLI
+// read `@path` from the composer. Codex takes images only at launch (-i), so
+// a running Codex session refuses them, as does any other harness.
+func attachImages(inst *session.Instance, message string, images []string, now time.Time) (string, []string, error) {
+	if len(images) == 0 {
+		return message, nil, nil
+	}
+	switch {
+	case session.IsClaudeCompatible(inst.Tool), inst.Tool == "gemini":
+	case session.IsCodexCompatible(inst.Tool):
+		return "", nil, fmt.Errorf("%w for codex in a running session (Codex accepts images only at launch with -i)", errImagesUnsupported)
+	default:
+		return "", nil, fmt.Errorf("%w for %s", errImagesUnsupported, inst.Tool)
+	}
+	dir := filepath.Join(inst.EffectiveWorkingDir(), ".agentdeck-images")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", nil, fmt.Errorf("image dir: %w", err)
+	}
+	// Keep the copies out of the user's git status.
+	ignore := filepath.Join(dir, ".gitignore")
+	if _, err := os.Stat(ignore); os.IsNotExist(err) {
+		_ = os.WriteFile(ignore, []byte("*\n"), 0o644)
+	}
+	var saved []string
+	refs := []string{strings.TrimSpace(message)}
+	for i, src := range images {
+		if !imageExtensions[strings.ToLower(filepath.Ext(src))] {
+			return "", nil, fmt.Errorf("%s: not an attachment (png, jpg, jpeg, gif, webp, pdf)", src)
+		}
+		in, err := os.Open(src)
+		if err != nil {
+			return "", nil, err
+		}
+		info, err := in.Stat()
+		if err != nil || !info.Mode().IsRegular() {
+			in.Close()
+			return "", nil, fmt.Errorf("%s: not a regular file", src)
+		}
+		// The composer reads @path up to the first space: the copy's name
+		// never has one.
+		name := strings.Join(strings.Fields(filepath.Base(src)), "-")
+		dst := filepath.Join(dir, fmt.Sprintf("%d-%d-%s", now.UnixMilli(), i, name))
+		out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err == nil {
+			_, err = io.Copy(out, in)
+			if cerr := out.Close(); err == nil {
+				err = cerr
+			}
+		}
+		in.Close()
+		if err != nil {
+			return "", nil, fmt.Errorf("copy %s: %w", src, err)
+		}
+		saved = append(saved, dst)
+		refs = append(refs, "@"+dst)
+	}
+	return strings.TrimSpace(strings.Join(refs, " ")), saved, nil
+}
+
+// profileArgs prefixes -p <profile> when a profile was chosen explicitly.
+func profileArgs(profile string, args ...string) []string {
+	if profile == "" {
+		return args
+	}
+	return append([]string{"-p", profile}, args...)
+}
+
+func sendQueueDir(storage *session.Storage) string {
+	return sendqueue.Dir(filepath.Dir(storage.Path()))
+}
+
+// queuedSendChanged is every state change of a queued send after it is
+// written: the bus frame, and once the send is final its terminal journal
+// record and, for a failure, a notice to the sender (issue #2481).
+func queuedSendChanged(profile string, prev, r *sendqueue.Record) {
+	if r.State != prev.State || r.Reason != prev.Reason || r.Verdict != prev.Verdict {
+		sendqueue.PublishState(profile, r)
+	}
+	if !prev.Final() && r.Final() {
+		finishQueuedSend(profile, r, true)
+	}
+}
+
+// ledgerQueuedSend mirrors a queued send's final state into the Comms
+// Ledger (P3), addressed back to the sender persisted in the queue record.
+func ledgerQueuedSend(r *sendqueue.Record, inboxOwned bool) {
+	if !r.Final() {
+		return
+	}
+	// Match the synchronous send evidence: confirmed submission is landed,
+	// while typed alone makes no claim about submission or transcript receipt.
+	var state string
+	switch r.State {
+	case sendqueue.StateLanded, sendqueue.StateSubmitted:
+		state = comms.StateLanded
+	case sendqueue.StateTyped:
+		state = comms.StateTyped
+	case sendqueue.StateFailed, sendqueue.StateCancelled:
+		// Cancelled is not delivered: nothing was typed.
+		state = comms.StateFailed
+	default:
+		return // No final delivery evidence to publish.
+	}
+	reason := r.Reason
+	if r.Settled {
+		reason = strings.TrimSpace("settled: " + reason)
+	}
+	// Use the durable queue identity, never the worker's environment.
+	if inboxOwned {
+		session.SpoolCommsInboxFailure(r.Sender, r.SessionID, r.SendID, "queue", reason)
+	} else {
+		session.SpoolCommsDelivery(r.Sender, r.SessionID, r.SendID, state, "queue", reason, true)
+	}
+}
+
+// queueSend records the send and hands it to the target's worker. It never
+// types anything itself; it returns at once.
+func queueSend(profile string, storage *session.Storage, inst *session.Instance, message string, images []string, tagged bool, ledgerSender string, requireInputPrompt, ignoreBudget bool, out *CLIOutput) {
+	now := time.Now()
+	status := "unknown"
+	s := sendqueue.Send{
+		SessionID: inst.ID, SessionTitle: inst.Title, Tool: inst.Tool, Running: inst.Exists(),
+		Message: message, Images: images, RequireInputPrompt: requireInputPrompt,
+		Sender: ledgerSender, Deadline: now.Add(sendqueue.DefaultRetryBudget), Ledger: ledgerSendAllowed(),
+		IgnoreBudget: ignoreBudget,
+	}
+	if s.Sender == "" {
+		s.Sender = sendSenderCLI
+	}
+	if session.IsClaudeCompatible(inst.Tool) {
+		s.ClaudeSessionID = inst.ClaudeSessionID
+	}
+	rec, err := sendqueue.Enqueue(profile, sendQueueDir(storage), s, now)
+	if err != nil {
+		out.Error(fmt.Sprintf("cannot queue send: %v", err), ErrCodeInvalidOperation)
+		exitCLI(1)
+	}
+	if rec.State == sendqueue.StateFailed {
+		out.ErrorWithData(fmt.Sprintf("send %s failed: %s", rec.SendID, rec.Reason), ErrCodeDeliveryFailed, queuedSendFields(rec))
+		// After the verdict; the exit code already tells the sender.
+		finishQueuedSend(profile, rec, false)
+		exitCLI(1)
+	}
+	if err := sendqueue.SpawnWorker(profile, inst.ID); err != nil {
+		// The record stays queued; the next --queue or send-status for
+		// this target starts a worker again.
+		fmt.Fprintf(os.Stderr, "Warning: could not start the delivery worker yet: %v\n", err)
+	}
+	fields := queuedSendFields(rec)
+	fields["tagged"] = tagged
+	summary := fmt.Sprintf("Queued %s for '%s' (%s)", rec.SendID, inst.Title, status)
+	out.Success(summary, fields)
+	out.QuietNotice(summary + "; not delivered yet, see session send-status")
+}
+
+// queuedSendFields is the immediate --json reply for a queued send: the
+// record plus the documented sync-send keys (success, delivery, submitted,
+// confirmation), so a reader written against the synchronous reply keeps
+// working. A queued send has been accepted, not yet submitted, and its
+// confirmation is unknown until send-status reports; a record that failed
+// at once reports the failure the same way the sync path does.
+func queuedSendFields(rec *sendqueue.Record) map[string]interface{} {
+	fields := recordFields(rec)
+	fields["submitted"] = false
+	if rec.State == sendqueue.StateFailed {
+		fields["success"], fields["delivery"], fields["confirmation"] = false, deliveryPaneGone, send.ConfirmationFailed
+		return fields
+	}
+	fields["success"], fields["delivery"], fields["confirmation"] = true, deliveryQueued, send.ConfirmationUnknown
+	return fields
+}
+
+func recordFields(r *sendqueue.Record) map[string]interface{} {
+	b, _ := json.Marshal(r)
+	var m map[string]interface{}
+	_ = json.Unmarshal(b, &m)
+	return m
+}
+
+// handleSessionSendStatus implements `agent-deck session send-status <send-id> --json`.
+func handleSessionSendStatus(profile string, args []string) {
+	fs := flag.NewFlagSet("session send-status", flag.ContinueOnError)
+	fs.SetOutput(os.Stdout)
+	jsonOutput := fs.Bool("json", false, "Output as JSON")
+	fs.Usage = func() {
+		fmt.Println("Usage: agent-deck session send-status <send-id> [--json]")
+		fmt.Println()
+		fmt.Println("State of a `session send --queue` message: queued, typing, typed, submitted, landed or failed,")
+		fmt.Println("with reason, target_status, attempts, and landed_row_id/landed_at once the text is")
+		fmt.Println("in the transcript (the row id recall timeline/follow use). Exit 0 when found, 2 for an unknown id.")
+		fmt.Println()
+		fmt.Println("landed is reported only on transcript evidence (a user row, or a queued message absorbed")
+		fmt.Println("into the turn). failed means nothing was typed, so resending is safe. A send whose outcome")
+		fmt.Println("could not be proven settles as typed/submitted (settled: true) and is never typed again.")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return
+		}
+		exitCLI(2)
+	}
+	out := NewCLIOutput(*jsonOutput, false)
+	if fs.NArg() != 1 {
+		fs.Usage()
+		exitCLI(2)
+	}
+	storage, err := session.NewStorageWithProfile(profile)
+	if err != nil {
+		out.Error(err.Error(), ErrCodeInvalidOperation)
+		exitCLI(1)
+	}
+	defer storage.Close()
+	dir := sendQueueDir(storage)
+	rec, err := sendqueue.Load(dir, fs.Arg(0))
+	if err != nil {
+		out.Error(fmt.Sprintf("send %s: %v", fs.Arg(0), err), ErrCodeNotFound)
+		exitCLI(2)
+	}
+	if !rec.Final() {
+		// A worker that died (reboot, kill) is restarted by any status read.
+		_ = sendqueue.SpawnWorker(profile, rec.SessionID)
+	}
+	out.Success(fmt.Sprintf("%s: %s %s", rec.SendID, rec.State, rec.Reason), recordFields(rec))
+}
+
+// envDuration reads a positive duration from the environment, so tests can
+// tune the worker's timing; def otherwise.
+func envDuration(name string, def time.Duration) time.Duration {
+	if d, err := time.ParseDuration(os.Getenv(name)); err == nil && d > 0 {
+		return d
+	}
+	return def
+}
+
+// sendWorkerPoll is how often the worker rechecks a busy target.
+func sendWorkerPoll() time.Duration {
+	return envDuration("AGENTDECK_SEND_WORKER_POLL", time.Second)
+}
+
+// sendRetryBackoffMax caps the wait between attempts of a send refused
+// before typing; AGENTDECK_SEND_RETRY_BACKOFF_MAX overrides it.
+func sendRetryBackoffMax() time.Duration {
+	return envDuration("AGENTDECK_SEND_RETRY_BACKOFF_MAX", sendqueue.DefaultRetryBackoffMax)
+}
+
+// sendLandWindow is how long a delivered send is watched for in the
+// transcript before it is settled without a landed row.
+func sendLandWindow() time.Duration {
+	return envDuration("AGENTDECK_SEND_LAND_WINDOW", 2*time.Minute)
+}
+
+// handleSessionSendWorker is the hidden detached worker: it owns delivery
+// for one target, walks its queued records oldest first, and exits when
+// none are left.
+func handleSessionSendWorker(profile string, args []string) {
+	fs := flag.NewFlagSet("session send-worker", flag.ContinueOnError)
+	target := fs.String("target", "", "deck session id")
+	watch := fs.String("watch", "", "send id whose transcript is being watched")
+	if err := fs.Parse(args); err != nil || (*target == "" && *watch == "") {
+		exitCLI(2)
+	}
+	storage, err := session.NewStorageWithProfile(profile)
+	if err != nil {
+		exitCLI(1)
+	}
+	dir := sendQueueDir(storage)
+	storage.Close()
+	if *watch != "" {
+		watchQueuedSend(profile, dir, *watch)
+		return
+	}
+	sendqueue.Prune(dir, time.Now().Add(-sendqueue.RetainFinished))
+	runSendWorker(profile, dir, *target)
+}
+
+// runSendWorker delivers target's queued records oldest first while it holds
+// target's worker lock, and returns when none are left or another worker
+// holds the lock.
+func runSendWorker(profile, dir, target string) {
+	for {
+		lock, ok, err := sendqueue.TryLock(dir, target)
+		if err != nil || !ok {
+			return // another worker owns this target
+		}
+		for {
+			if !adoptHandedOff(profile, dir, target) {
+				// A replaced session's worker is still handing its routed
+				// events over: they are older, so they go first. That
+				// worker always gets to them: a queued `session send` has a
+				// retry budget, a child send is waited for at most
+				// sendChildWaitMax, and a routed event is handed over at
+				// once. Cancel and release requests for this target are
+				// answered meanwhile.
+				serviceOtherQueueControls(profile, dir, target, "")
+				sleepUnlessQueueControl(dir, target, sendWorkerPoll())
+				continue
+			}
+			rec := nextPending(dir, target)
+			if rec == nil {
+				break
+			}
+			deliverQueuedAsync(profile, dir, rec)
+		}
+		startPendingWatchers(profile, dir, target)
+		releaseQueueLock(lock)
+		// A send queued while this worker was finishing: pick it up.
+		if nextPending(dir, target) == nil {
+			return
+		}
+	}
+}
+
+// adoptHandedOff moves to target the routed events still queued for
+// sessions a cross-harness switch replaced with target (#2537), so target's
+// worker delivers them, older as they are, before its own. It moves a
+// replaced session's records only under that session's worker lock, the
+// one writer of its records; when that worker is still running it hands
+// them over itself (deliverQueuedMode), and adoptHandedOff reports false
+// so the caller waits for it. It also reports false when the sessions
+// cannot be read, since the lineage is then unknown.
+func adoptHandedOff(profile, dir, target string) bool {
+	recs, _ := sendqueue.List(dir, "")
+	var instances []*session.Instance
+	loaded, ready := false, true
+	seen := map[string]bool{}
+	for _, r := range recs {
+		if r.State != sendqueue.StateQueued || !r.WaitWhileStopped || r.SessionID == target || seen[r.SessionID] {
+			continue
+		}
+		seen[r.SessionID] = true
+		if !loaded {
+			loaded = true
+			all, err := loadSessions(profile)
+			if err != nil {
+				return false
+			}
+			instances = all
+		}
+		replaced := instanceByID(instances, r.SessionID)
+		if replaced == nil || !replaced.IsArchived() {
+			continue
+		}
+		next := handoffSuccessor(instances, replaced)
+		if next == nil || next.ID != target {
+			continue
+		}
+		lock, ok, err := sendqueue.TryLock(dir, replaced.ID)
+		if err != nil || !ok {
+			ready = false
+			continue
+		}
+		own, _ := sendqueue.List(dir, replaced.ID)
+		for _, o := range own {
+			if o.State == sendqueue.StateQueued && o.WaitWhileStopped {
+				_, _ = sendqueue.Update(dir, o.SendID, time.Now(), func(u *sendqueue.Record) { handOff(u, next) })
+			}
+		}
+		releaseQueueLock(lock)
+	}
+	return ready
+}
+
+// loadSessions reads the profile's sessions and closes the storage it opened
+// for that: a worker polls it for as long as a routed event waits. Tests
+// replace it.
+var loadSessions = func(profile string) ([]*session.Instance, error) {
+	storage, instances, _, err := loadSessionData(profile)
+	if err != nil {
+		return nil, err
+	}
+	_ = storage.Close()
+	return instances, nil
+}
+
+// handOff readdresses a queued routed event to the session that replaced
+// its target.
+func handOff(r *sendqueue.Record, next *session.Instance) {
+	r.SessionID, r.SessionTitle, r.Tool, r.TargetStatus = next.ID, next.Title, next.Tool, ""
+}
+
+func nextPending(dir, target string) *sendqueue.Record {
+	recs, _ := sendqueue.List(dir, target)
+	for _, r := range recs {
+		if r.State == sendqueue.StateQueued || r.State == sendqueue.StateTyping {
+			return r
+		}
+	}
+	return nil
+}
+
+// Transcript confirmation is independent of typing. Watching one send must
+// not block later messages from entering a busy Claude harness's own queue.
+func startPendingWatchers(profile, dir, target string) {
+	recs, _ := sendqueue.List(dir, target)
+	for _, r := range recs {
+		if !r.Final() && (r.State == sendqueue.StateTyped || r.State == sendqueue.StateSubmitted) {
+			if err := spawnSendWatcher(profile, r.SendID); err != nil {
+				watchQueuedSend(profile, dir, r.SendID)
+			}
+		}
+	}
+}
+
+func spawnSendWatcher(profile, sendID string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	// exe is this agent-deck binary (os.Executable) and argv goes straight to
+	// execve with no shell: every flag is a literal and profile and sendID are
+	// single values of those flags.
+	cmd := exec.Command(exe, profileArgs(profile, "session", "send-worker", "--watch", sendID)...) //nolint:gosec // G702: own binary, literal flags, no shell (see above)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, nil, nil
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	return cmd.Process.Release()
+}
+
+// releaseQueueLock drops a worker lock, reporting a failed close.
+func releaseQueueLock(lock *sendqueue.Lock) {
+	if err := lock.Release(); err != nil {
+		fmt.Fprintln(os.Stderr, "agent-deck: release send queue lock:", err)
+	}
+}
+
+func watchQueuedSend(profile, dir, sendID string) {
+	lock, ok, err := sendqueue.TryLock(dir, "watch-"+sendID)
+	if err != nil || !ok {
+		return
+	}
+	defer releaseQueueLock(lock)
+	rec, err := sendqueue.Load(dir, sendID)
+	if err != nil || rec.Final() || (rec.State != sendqueue.StateTyped && rec.State != sendqueue.StateSubmitted) {
+		return
+	}
+	set := func(fn func(*sendqueue.Record)) error {
+		r, err := sendqueue.Update(dir, sendID, time.Now(), fn)
+		if err != nil {
+			return err
+		}
+		queuedSendChanged(profile, rec, r)
+		*rec = *r
+		return nil
+	}
+	watchLanded(profile, rec, set)
+}
+
+// childOutcome is what a `session send` child's result says happened.
+type childOutcome int
+
+const (
+	childTyped     childOutcome = iota // exit 0: typed, submission not confirmed
+	childSubmitted                     // exit 0 with confirmed submission
+	childNotSent                       // refused before typing: safe to retry
+	childUnknown                       // anything else: may have been typed
+)
+
+// notSentDeliveries are the `session send` outcomes that guarantee nothing
+// was typed, so the worker may try again once the target settles.
+var notSentDeliveries = map[string]bool{
+	deliveryTargetBusy:        true,
+	deliveryComposerBlocked:   true,
+	deliveryAcceptanceRefused: true,
+}
+
+// codexUnavailableRefusalLimit is how many consecutive "Codex identity
+// provably unavailable" refusals end a queued send. Contention (a busy target,
+// another send's acceptance lock) resolves by waiting; an identity that is
+// still unavailable after a few backed-off attempts does not, so retrying it
+// for the whole budget only hides the failure (#2549: 26 attempts). The first
+// refusals still retry, so a fresh composer that has not taken its thread yet
+// gets about fifteen seconds at the default poll.
+const codexUnavailableRefusalLimit = 5
+
+// classifyChild reads a `session send --json` result. Only a refusal that
+// guarantees nothing was typed may be retried. Every other failure — an open
+// menu, a readiness timeout, no_evidence, a crash — may have typed the text,
+// so it is never reported failed (a client that resends on failed would
+// double the message): it settles as typed and the transcript decides.
+func classifyChild(result map[string]interface{}, code int) (childOutcome, string) {
+	delivery, _ := result["delivery"].(string)
+	success, _ := result["success"].(bool)
+	if code == 0 && (success || len(result) == 0) {
+		if submitted, _ := result["submitted"].(bool); submitted || result["confirmation"] == "confirmed" {
+			return childSubmitted, ""
+		}
+		return childTyped, ""
+	}
+	if notSentDeliveries[delivery] {
+		return childNotSent, delivery
+	}
+	if delivery == deliveryMenuOpen {
+		if reason, _ := result["error"].(string); strings.Contains(reason, "no keys typed") {
+			return childNotSent, delivery
+		}
+	}
+	reason, _ := result["error"].(string)
+	if reason == "" {
+		reason = fmt.Sprintf("session send exited %d", code)
+	}
+	if delivery != "" {
+		reason = delivery + ": " + reason
+	}
+	return childUnknown, reason
+}
+
+// sendChild starts the child that types one queued message; tests replace it.
+var sendChild = startChildSend
+
+// sendChildRelease types an entry released by `session queue release`: the
+// guarded child (--require-input-prompt) without the readiness wait
+// (--no-wait), so a released entry is typed now only when an input prompt is
+// visible and is refused untyped otherwise. Tests replace it.
+var sendChildRelease = func(profile, id, message, resultPath string) (int, func() int, error) {
+	return startChildSendWithOptions(profile, id, message, resultPath, releaseChildOptions)
+}
+
+// deliverQueued drives one record to landed, failed (only when nothing was
+// typed), or settled typed/submitted.
+func deliverQueued(profile, dir string, rec *sendqueue.Record) {
+	deliverQueuedMode(profile, dir, rec, true)
+}
+
+func deliverQueuedAsync(profile, dir string, rec *sendqueue.Record) {
+	deliverQueuedMode(profile, dir, rec, false)
+}
+
+func deliverQueuedMode(profile, dir string, rec *sendqueue.Record, watch bool) {
+	poll := sendWorkerPoll()
+	deadline, _ := time.Parse(time.RFC3339Nano, rec.Deadline)
+	set := func(fn func(*sendqueue.Record)) error {
+		r, err := sendqueue.Update(dir, rec.SendID, time.Now(), fn)
+		if err != nil {
+			return err
+		}
+		queuedSendChanged(profile, rec, r)
+		*rec = *r
+		return nil
+	}
+	fail := func(reason string) {
+		_ = set(func(r *sendqueue.Record) { r.State, r.Reason, r.Verdict = sendqueue.StateFailed, reason, "unknown" })
+	}
+	pastDeadline := func() bool { return !deadline.IsZero() && time.Now().After(deadline) }
+	if rec.State == sendqueue.StateTyping {
+		// The previous worker died while its child was delivering.
+		reconcileTyping(dir, rec, set)
+	}
+	stoppedPolls := 0
+	for rec.State == sendqueue.StateQueued {
+		// session queue release|cancel: the worker answers at the typing
+		// boundary, for this entry and for later ones waiting behind it.
+		if processQueueControl(profile, dir, rec) && rec.State != sendqueue.StateQueued {
+			break
+		}
+		serviceOtherQueueControls(profile, dir, rec.SessionID, rec.SendID)
+		instances, err := loadSessions(profile)
+		if err != nil {
+			if rec.WaitWhileStopped && !pastDeadline() {
+				// A routed event outlasts a passing storage error: try
+				// again at the next poll instead of failing it.
+				sleepUnlessQueueControl(dir, rec.SessionID, poll)
+				continue
+			}
+			fail("cannot load sessions: " + err.Error())
+			return
+		}
+		inst := instanceByID(instances, rec.SessionID)
+		if inst == nil {
+			fail("target removed")
+			return
+		}
+		// A routed watcher event is for the conductor, not for one session of
+		// it (#2537). A cross-harness switch archives the conductor's session
+		// but keeps its pane, and activates a successor under the same title:
+		// the event moves to the successor, whose worker delivers it, instead
+		// of reaching the replaced harness or waiting on the archived session
+		// for good. The successor's worker is started first: if it cannot
+		// start, the event stays here and is handed over on a later poll,
+		// never left with no worker. The successor's worker waits for these
+		// older events before it delivers its own (adoptHandedOff). An
+		// archived conductor with no successor is waited for like a stopped
+		// one.
+		archived := rec.WaitWhileStopped && inst.IsArchived()
+		if archived {
+			if next := handoffSuccessor(instances, inst); next != nil {
+				if err := startSendWorker(profile, next.ID); err == nil {
+					if err := set(func(r *sendqueue.Record) { handOff(r, next) }); err == nil {
+						return
+					}
+				}
+			}
+		}
+		if archived || !inst.Exists() {
+			if !rec.WaitWhileStopped {
+				fail("target not running")
+				return
+			}
+			// A routed watcher event waits for its stopped conductor
+			// (#2537), up to the deadline if it has one, polling less often
+			// the longer it stays down.
+			if pastDeadline() {
+				fail("target not running when the delivery deadline passed")
+				return
+			}
+			stoppedPolls++
+			if rec.TargetStatus != targetStatusStopped {
+				_ = set(func(r *sendqueue.Record) { r.TargetStatus = targetStatusStopped })
+			}
+			wait := sendqueue.RetryDelay(poll, sendRetryBackoffMax(), stoppedPolls)
+			if left := time.Until(deadline); !deadline.IsZero() && left < wait {
+				wait = left
+			}
+			sleepUnlessQueueControl(dir, rec.SessionID, wait)
+			continue
+		}
+		stoppedPolls = 0
+		status, _ := fetchHookDrivenStatus(profile, inst.ID)
+		if shouldWaitForIdle(inst.Tool, status) {
+			if pastDeadline() {
+				fail("target stayed busy past the retry budget")
+				return
+			}
+			_ = set(func(r *sendqueue.Record) { r.TargetStatus = status })
+			sleepUnlessQueueControl(dir, rec.SessionID, poll)
+			continue
+		}
+		if processQueueControl(profile, dir, rec) {
+			continue
+		}
+		path := session.LiveTranscriptPath(inst, instances)
+		var from int64
+		if info, err := os.Stat(path); err == nil {
+			from = info.Size()
+		}
+		if !typeQueued(profile, dir, rec, inst, instances, status, path, from, set) {
+			fail("cannot record the send before typing it")
+			return
+		}
+		if rec.State == sendqueue.StateQueued {
+			// Refused before typing: safe to try again once the target settles,
+			// within the retry budget. The wait doubles per refusal (capped),
+			// so a composer a human is typing into is not hit every second.
+			if pastDeadline() {
+				fail(fmt.Sprintf("not delivered before the retry budget ran out (%d attempts): %s", rec.Attempts, strings.TrimPrefix(rec.Reason, "retrying: ")))
+				return
+			}
+			wait := sendqueue.RetryDelay(poll, sendRetryBackoffMax(), rec.Attempts)
+			if left := time.Until(deadline); !deadline.IsZero() && left < wait {
+				wait = left // one last attempt at the end of the budget
+			}
+			sleepUnlessQueueControl(dir, rec.SessionID, wait)
+		}
+	}
+	if rec.Final() {
+		return
+	}
+	if watch {
+		watchLanded(profile, rec, set)
+	}
+}
+
+// targetStatusStopped is the target_status of a send waiting for a target
+// that is not running (Record.WaitWhileStopped).
+const targetStatusStopped = "stopped"
+
+// startSendWorker starts a target's send worker; tests replace it.
+var startSendWorker = sendqueue.SpawnWorker
+
+// handoffSuccessor follows inst's cross-harness lineage (SupersededBy) to the
+// session that replaced it, past successors that were replaced in turn. It
+// returns nil when inst was not replaced, or when the lineage ends in a
+// missing or archived session or loops.
+func handoffSuccessor(instances []*session.Instance, inst *session.Instance) *session.Instance {
+	seen := map[string]bool{inst.ID: true}
+	for next := inst.SupersededBy; next != "" && !seen[next]; {
+		s := instanceByID(instances, next)
+		if s == nil {
+			return nil
+		}
+		if !s.IsArchived() {
+			return s
+		}
+		seen[next] = true
+		next = s.SupersededBy
+	}
+	return nil
+}
+
+func shouldWaitForIdle(tool, status string) bool {
+	return status == "" || status == "unknown" || status == "starting" || (status == "running" && !session.AcceptsInputWhileBusy(tool))
+}
+
+// typeQueued hands one queued record to a `session send` child. The record
+// is written as typing (attempts, sent_at, transcript offset) BEFORE the
+// child starts, so a worker that dies at any point after this leaves a
+// record no later worker types again. It returns false only when that
+// write failed, in which case nothing was typed.
+func typeQueued(profile, dir string, rec *sendqueue.Record, inst *session.Instance, instances []*session.Instance, status, path string, from int64, set func(func(*sendqueue.Record)) error) bool {
+	// Budget gate at the typing boundary: a queued send or a released entry
+	// whose target went over an enforced cost budget while it waited fails
+	// untyped. It reuses the sessions the caller loaded for this attempt.
+	// A record queued with --ignore-budget is a person's message.
+	if !rec.IgnoreBudget {
+		if budget := budgetForSend(profile, inst, instances, nil); budget.Action == costs.BudgetActionStop {
+			if err := set(func(r *sendqueue.Record) {
+				r.State, r.Verdict = sendqueue.StateFailed, "unknown"
+				r.Reason = "budget exceeded: " + budget.Describe() + "; nothing was typed"
+			}); err != nil {
+				return false
+			}
+			session.PublishBudgetExceeded(profile, rec.SessionID, "queue", budget)
+			return true
+		}
+	}
+	result := sendqueue.ResultPath(dir, rec.SendID)
+	_ = os.Remove(result)
+	if err := set(func(r *sendqueue.Record) {
+		r.State, r.Reason, r.ChildPID = sendqueue.StateTyping, "", 0
+		r.DeliveryEvidence = nil // evidence belongs to one attempt
+		r.Attempts++
+		r.TargetStatus, r.TranscriptPath, r.TranscriptFrom = status, path, from
+		r.SentAt = time.Now().UTC().Format(time.RFC3339Nano)
+		if status == queueReleaseStatus {
+			// A released entry keeps the guard on any later attempt too.
+			r.RequireInputPrompt = true
+		}
+	}); err != nil {
+		return false
+	}
+	child := sendChild
+	if status == queueReleaseStatus {
+		child = sendChildRelease
+	} else if rec.RequireInputPrompt {
+		child = sendChildGuarded
+	}
+	pid, wait, err := child(profile, rec.SessionID, rec.Message, result)
+	if err != nil {
+		// The child never started, so nothing was typed.
+		_ = set(func(r *sendqueue.Record) {
+			r.State, r.Reason = sendqueue.StateQueued, "retrying: cannot start session send: "+err.Error()
+		})
+		return true
+	}
+	_ = set(func(r *sendqueue.Record) { r.ChildPID = pid })
+	code, exited := waitChild(pid, wait, sendChildWaitMax())
+	if !exited {
+		// A child still running after the longest wait the queue allows
+		// is killed, and the send settles as typed with an unknown
+		// outcome, as a restarted worker settles it: never typed again,
+		// and the target's queue moves on.
+		if res, ok := parseChildResult(result); ok {
+			applyChildResult(rec, res, 0, true, set)
+		} else {
+			applyChildResult(rec, nil, 0, false, set)
+		}
+		return true
+	}
+	applyChildResult(rec, readChildResult(result), code, true, set)
+	return true
+}
+
+// killChild ends a hung `session send` child through its process handle.
+// A child already reaped is not in liveChildren and is left alone, and the
+// handle does not signal a process that has finished. Tests replace it.
+var killChild = func(pid int) {
+	if p, ok := liveChildren.Load(pid); ok {
+		_ = p.(*os.Process).Kill()
+	}
+}
+
+// childReapGrace bounds how long the worker waits for a killed child to be
+// reaped before it moves on.
+const childReapGrace = 10 * time.Second
+
+// waitChild waits up to max for a `session send` child to exit and returns
+// its exit code. A child still running at max is killed and then reaped,
+// for up to childReapGrace, before waitChild returns with exited false.
+// When the child finishes just as max passes, its own exit is taken.
+func waitChild(pid int, wait func() int, max time.Duration) (code int, exited bool) {
+	done := make(chan int, 1)
+	go func() { done <- wait() }()
+	select {
+	case code := <-done:
+		return code, true
+	case <-time.After(max):
+	}
+	select {
+	case code := <-done:
+		return code, true
+	default:
+	}
+	killChild(pid)
+	select {
+	case <-done:
+	case <-time.After(childReapGrace):
+	}
+	return 0, false
+}
+
+// applyChildResult moves a typing record on from its child's result.
+func applyChildResult(rec *sendqueue.Record, result map[string]interface{}, code int, haveResult bool, set func(func(*sendqueue.Record)) error) {
+	outcome, reason := childUnknown, "worker restarted mid-send and the child left no result"
+	if haveResult {
+		outcome, reason = classifyChild(result, code)
+	}
+	_ = set(func(r *sendqueue.Record) {
+		r.ChildPID = 0
+		if haveResult && len(result) > 0 {
+			r.DeliveryEvidence = result
+		}
+		if id, _ := result["claude_session_id"].(string); id != "" {
+			r.ClaudeSessionID = id
+		}
+		switch outcome {
+		case childSubmitted:
+			r.State, r.Reason, r.Verdict = sendqueue.StateSubmitted, "", "delivered"
+		case childTyped:
+			r.State, r.Reason = sendqueue.StateTyped, ""
+			if result["delivery"] == deliveryQueued || result["delivery"] == deliveryDelivered {
+				r.Verdict = "delivered"
+			} else {
+				r.Verdict = "unknown"
+			}
+		case childNotSent:
+			r.State, r.Reason, r.Verdict = sendqueue.StateQueued, "retrying: "+reason, "queued"
+			streak := r.UnavailableRefusals + 1
+			r.UnavailableRefusals = 0
+			if unavailable, _ := result["acceptance_unavailable"].(bool); unavailable {
+				r.UnavailableRefusals = streak
+				if r.UnavailableRefusals >= codexUnavailableRefusalLimit {
+					detail, _ := result["error"].(string)
+					r.State, r.Verdict = sendqueue.StateFailed, "unknown"
+					r.Reason = fmt.Sprintf("not delivered: the Codex session identity stayed unavailable for %d attempts (%s); "+
+						"nothing was typed. Restart the session, or resend with --codex-composer-fallback", r.UnavailableRefusals, detail)
+				}
+			}
+		default:
+			r.State, r.Reason, r.Verdict = sendqueue.StateTyped, "outcome unknown ("+reason+"); not retyped, watching the transcript", "unknown"
+		}
+	})
+}
+
+// reconcileTyping settles a record a dead worker left in typing. The
+// child may still be running (it outlives the worker): wait for it, then
+// use its result file. Without a result the outcome is unknown and the
+// record goes to the transcript watch; it is never typed again.
+func reconcileTyping(dir string, rec *sendqueue.Record, set func(func(*sendqueue.Record)) error) {
+	resultPath := sendqueue.ResultPath(dir, rec.SendID)
+	end := time.Now().Add(sendChildWaitMax())
+	for {
+		if result, ok := parseChildResult(resultPath); ok {
+			code := 1
+			if success, _ := result["success"].(bool); success {
+				code = 0
+			}
+			applyChildResult(rec, result, code, true, set)
+			return
+		}
+		if !processAlive(rec.ChildPID) || time.Now().After(end) {
+			applyChildResult(rec, nil, 0, false, set)
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// watchLanded waits for a typed or submitted record's text to land in the
+// transcript, then for the target to take the turn up, so the next queued
+// message is not typed into this one's turn. Without evidence it settles
+// typed/submitted with a reason: never landed, and never typed again.
+func watchLanded(profile string, rec *sendqueue.Record, set func(func(*sendqueue.Record)) error) {
+	harness := rowsHarness(rec.Tool)
+	if !query.SupportsDirectRows(harness) {
+		_ = set(func(r *sendqueue.Record) {
+			r.Settled = true
+			if r.Reason == "" {
+				r.Reason = "no transcript to confirm landing for " + r.Tool
+			}
+		})
+		return
+	}
+	sentAt, _ := time.Parse(time.RFC3339Nano, rec.SentAt)
+	landBy := time.Now().Add(sendLandWindow())
+	for time.Now().Before(landBy) {
+		if rec.TranscriptPath == "" {
+			if p := liveTranscriptForID(profile, rec.SessionID); p != "" {
+				_ = set(func(r *sendqueue.Record) { r.TranscriptPath = p })
+			}
+		}
+		if rec.TranscriptPath != "" {
+			if id, ts, ok := query.FindLanded(context.Background(), harness, rec.TranscriptPath, rec.TranscriptFrom, rec.Message, sentAt); ok {
+				_ = set(func(r *sendqueue.Record) {
+					r.State, r.Reason, r.Verdict, r.LandedRowID, r.LandedAt = sendqueue.StateLanded, "", "delivered", id, ts
+					if sid := claudeSessionIDFromTranscript(harness, r.TranscriptPath); sid != "" {
+						r.ClaudeSessionID = sid
+					}
+				})
+				waitTurnStarted(profile, rec.SessionID, 5*time.Second)
+				return
+			}
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	_ = set(func(r *sendqueue.Record) {
+		if r.Reason == "" {
+			r.Reason = "not seen in the transcript within " + sendLandWindow().String()
+		}
+		r.Settled = true
+	})
+}
+
+// claudeSessionIDFromTranscript is the Claude conversation a transcript
+// holds: Claude names each transcript <session id>.jsonl.
+func claudeSessionIDFromTranscript(harness, path string) string {
+	if harness != "claude" || filepath.Ext(path) != ".jsonl" {
+		return ""
+	}
+	return strings.TrimSuffix(filepath.Base(path), ".jsonl")
+}
+
+// sendChildWaitMax bounds how long a restarted worker waits for the child
+// a dead worker left running.
+func sendChildWaitMax() time.Duration {
+	return envDuration("AGENTDECK_SEND_CHILD_WAIT", 15*time.Minute)
+}
+
+func processAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+// parseChildResult reads a child's complete JSON result; a partial write
+// does not parse.
+func parseChildResult(path string) (map[string]interface{}, bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false
+	}
+	result := map[string]interface{}{}
+	if json.Unmarshal(bytes.TrimSpace(b), &result) != nil {
+		return nil, false
+	}
+	return result, true
+}
+
+func readChildResult(path string) map[string]interface{} {
+	result, _ := parseChildResult(path)
+	if result == nil {
+		result = map[string]interface{}{}
+	}
+	return result
+}
+
+func instanceByID(instances []*session.Instance, id string) *session.Instance {
+	for _, i := range instances {
+		if i.ID == id {
+			return i
+		}
+	}
+	return nil
+}
+
+func liveTranscriptForID(profile, id string) string {
+	instances, err := loadSessions(profile)
+	if err != nil {
+		return ""
+	}
+	if inst := instanceByID(instances, id); inst != nil {
+		return session.LiveTranscriptPath(inst, instances)
+	}
+	return ""
+}
+
+func waitTurnStarted(profile, id string, max time.Duration) {
+	end := time.Now().Add(max)
+	for time.Now().Before(end) {
+		if s, _ := fetchHookDrivenStatus(profile, id); s == "running" {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// startChildSend delivers through the normal `session send` path (readiness
+// wait, composer guard, submit verification) in a child process. Its input
+// and JSON result are files, not pipes: the child outlives a worker that
+// dies, reads the whole message regardless, and the next worker reads the
+// outcome from resultPath.
+var sendChildGuarded = func(profile, id, message, resultPath string) (int, func() int, error) {
+	return startChildSendWithOptions(profile, id, message, resultPath, childSendOptions{requireInputPrompt: true})
+}
+
+func startChildSend(profile, id, message, resultPath string) (int, func() int, error) {
+	return startChildSendWithOptions(profile, id, message, resultPath, childSendOptions{})
+}
+
+// childSendOptions are the extra `session send` flags a queue child carries.
+type childSendOptions struct {
+	requireInputPrompt bool // --require-input-prompt: refuse untyped without an input prompt
+	noWait             bool // --no-wait: skip the readiness wait
+}
+
+// releaseChildOptions: `session queue release` forces the guarded send and
+// skips the readiness wait, as in the lab core.
+var releaseChildOptions = childSendOptions{requireInputPrompt: true, noWait: true}
+
+// childSendArgs is the argv (after the executable) of a queue child.
+func childSendArgs(profile, id, msgPath string, opts childSendOptions) []string {
+	args := profileArgs(profile, "session", "send", id, "--message-file", msgPath, "--json", "--queue-worker")
+	if opts.requireInputPrompt {
+		args = append(args, "--require-input-prompt")
+	}
+	if opts.noWait {
+		args = append(args, "--no-wait")
+	}
+	return args
+}
+
+func startChildSendWithOptions(profile, id, message, resultPath string, opts childSendOptions) (int, func() int, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return 0, nil, err
+	}
+	msgPath := strings.TrimSuffix(resultPath, ".result") + ".message"
+	if err := os.WriteFile(msgPath, []byte(message), 0o600); err != nil {
+		return 0, nil, err
+	}
+	out, err := os.OpenFile(resultPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return 0, nil, err
+	}
+	// exe is this agent-deck binary (os.Executable) and argv goes straight to
+	// execve with no shell: childSendArgs emits literal flags, and profile, id
+	// and msgPath are single positional or flag values.
+	cmd := exec.Command(exe, childSendArgs(profile, id, msgPath, opts)...) //nolint:gosec // G702: own binary, literal flags, no shell (see above)
+	// The send id rides in the environment, not argv: a binary that predates
+	// it ignores the variable instead of refusing an unknown flag. The rest
+	// of the environment is passed through unchanged, exactly as before
+	// (cmd.Env was nil): this child is agent-deck itself delivering the
+	// send, not a harness, and it resolves the target's transcript through
+	// the same CLAUDE_CONFIG_DIR its parent sees.
+	cmd.Env = append(os.Environ(), queueSendIDEnv+"="+strings.TrimSuffix(filepath.Base(resultPath), ".result")) //nolint:forbidigo // verbatim pass-through, see above
+	cmd.Stdout = out
+	if err := cmd.Start(); err != nil {
+		return 0, nil, errors.Join(err, out.Close())
+	}
+	pid := cmd.Process.Pid
+	liveChildren.Store(pid, cmd.Process)
+	wait := func() int {
+		err := cmd.Wait()
+		liveChildren.Delete(pid)
+		// The child wrote the result through its own descriptor; the next
+		// step reads the file, so a failed close here is only reported.
+		if cerr := out.Close(); cerr != nil {
+			fmt.Fprintln(os.Stderr, "agent-deck: close send result:", cerr)
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return exitErr.ExitCode()
+		}
+		if err != nil {
+			return 1
+		}
+		return 0
+	}
+	return pid, wait, nil
+}
+
+// liveChildren maps the pid of each `session send` child this process
+// started and has not reaped yet to its process handle, so killChild signals
+// the child itself, never a later process that reused the pid.
+var liveChildren sync.Map
+
+// deliveryFrames turns queued sends of one session into follow delivery
+// frames: every state change after the first scan, plus the current state
+// of sends still in flight at start.
+func deliveryFrames(profile string, storage *session.Storage, sessionID string) func() []query.RowFrame {
+	if storage == nil || sessionID == "" {
+		return nil
+	}
+	dir := sendQueueDir(storage)
+	sendqueue.KickWorkers(profile, dir, sessionID)
+	seen := map[string]string{}
+	first := true
+	return func() []query.RowFrame {
+		recs, _ := sendqueue.List(dir, sessionID)
+		var out []query.RowFrame
+		for _, r := range recs {
+			prev, known := seen[r.SendID]
+			seen[r.SendID] = r.State + ":" + r.Verdict
+			if (first && !r.Final()) || (!first && (!known || prev != seen[r.SendID])) {
+				out = append(out, query.RowFrame{Frame: "delivery", Reason: r.Reason, Delivery: &query.Delivery{SendID: r.SendID, State: r.State, Verdict: r.Verdict}})
+			}
+		}
+		first = false
+		return out
+	}
+}

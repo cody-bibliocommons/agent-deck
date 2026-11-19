@@ -1,13 +1,20 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
+	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/testutil"
 )
 
 // channelsCLIBuildOnce builds the agent-deck binary exactly once per test
@@ -19,28 +26,105 @@ var (
 	channelsCLIBuildOK bool
 )
 
-func channelsCLIBinary(t *testing.T) string {
-	t.Helper()
+// Helper test processes with deliberately sparse PATH reuse the parent process's
+// already-built fixture through AGENTDECK_TEST_CLI_BIN.
+func ensureChannelsCLIBinary() error {
 	channelsCLIBuildMu.Lock()
 	defer channelsCLIBuildMu.Unlock()
-
-	if channelsCLIBuildOK {
-		return channelsCLIBinPath
+	if inherited := os.Getenv("AGENTDECK_TEST_CLI_BIN"); inherited != "" {
+		if info, err := os.Stat(inherited); err == nil && !info.IsDir() {
+			channelsCLIBinPath = inherited
+			channelsCLIBuildOK = true
+			return nil
+		}
 	}
-
+	if channelsCLIBuildOK {
+		return nil
+	}
 	binDir, err := os.MkdirTemp("", "agent-deck-channels-bin-*")
 	if err != nil {
-		t.Fatalf("mkdir bin tmp: %v", err)
+		return fmt.Errorf("mkdir bin tmp: %w", err)
 	}
 	bin := filepath.Join(binDir, "agent-deck-test")
-
 	build := exec.Command("go", "build", "-o", bin, ".")
 	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("go build: %v\noutput: %s", err, out)
+		return fmt.Errorf("go build: %w\noutput: %s", err, out)
 	}
 	channelsCLIBinPath = bin
 	channelsCLIBuildOK = true
-	return bin
+	if err := os.Setenv("AGENTDECK_TEST_CLI_BIN", bin); err != nil {
+		return err
+	}
+	return nil
+}
+
+func channelsCLIBinary(t *testing.T) string {
+	t.Helper()
+	// Every caller drives the real binary end to end (#2937): distro
+	// builders such as the nix package run `go test -short` in a slow
+	// sandbox. CI runs without -short, so these still run there.
+	testutil.SkipShort(t, "runs the real agent-deck binary end to end")
+	if err := ensureChannelsCLIBinary(); err != nil {
+		t.Fatal(err)
+	}
+	// Read under the lock: ensureChannelsCLIBinary rewrites the path on
+	// every call, and tests (or their goroutines) call this concurrently.
+	channelsCLIBuildMu.Lock()
+	defer channelsCLIBuildMu.Unlock()
+	return channelsCLIBinPath
+}
+
+// agentDeckBinaryAs returns the package's prebuilt CLI (channelsCLIBinary)
+// under t.TempDir()/name, for tests that want their own binary path. It
+// hard-links the fixture (a copy when the link fails) instead of running
+// `go build` again: a per-test build relinks the whole CLI, about a second
+// locally and far more on a CI runner whose build cache is cold.
+func agentDeckBinaryAs(t *testing.T, name string) string {
+	t.Helper()
+	dst := filepath.Join(t.TempDir(), name)
+	if err := linkOrCopyExecutable(channelsCLIBinary(t), dst); err != nil {
+		t.Fatal(err)
+	}
+	return dst
+}
+
+func linkOrCopyExecutable(src, dst string) error {
+	if err := os.Link(src, dst); err == nil {
+		return nil
+	}
+	// Copy with ForkLock held for reading, so no goroutine of this test
+	// binary forks while dst is open for writing. A child forked in that
+	// window inherits the write fd until it execs, and exec of dst then
+	// fails with ETXTBSY ("text file busy") under parallel tests.
+	syscall.ForkLock.RLock()
+	defer syscall.ForkLock.RUnlock()
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
+}
+
+// parallelSubprocessTest runs a slow test beside the other slow ones instead
+// of in the package's serial line. Only for tests that drive agent-deck as
+// subprocesses against their own HOME, tmux socket dir and ports (or run
+// in-process code only on their own temp dirs), and touch no process env
+// (t.Setenv panics under t.Parallel) and no package globals.
+// They wait on real processes (daemons, boot sweeps, ssh dials, ack
+// timeouts), so overlapping them keeps cmd/agent-deck far inside go test's
+// timeout without shortening any wait they assert on.
+func parallelSubprocessTest(t *testing.T) {
+	t.Helper()
+	t.Parallel()
 }
 
 // runAgentDeck invokes the built binary with isolated HOME so each test
@@ -51,22 +135,98 @@ func runAgentDeck(
 	args ...string,
 ) (stdout, stderr string, exitCode int) {
 	t.Helper()
+	return runAgentDeckStdin(t, home, "", args...)
+}
 
-	bin := channelsCLIBinary(t)
-	cmd := exec.Command(bin, args...)
+// runAgentDeckStdin is runAgentDeck with a stdin body (e.g. for --note-stdin).
+func runAgentDeckStdin(
+	t *testing.T,
+	home string,
+	stdin string,
+	args ...string,
+) (stdout, stderr string, exitCode int) {
+	t.Helper()
+	return runAgentDeckEnv(t, home, stdin, nil, args...)
+}
 
+// runAgentDeckEnv is runAgentDeckStdin with extra environment entries
+// appended after the isolation set (e.g. AGENTDECK_INSTANCE_ID for a hook).
+func runAgentDeckEnv(
+	t *testing.T,
+	home string,
+	stdin string,
+	extraEnv []string,
+	args ...string,
+) (stdout, stderr string, exitCode int) {
+	t.Helper()
+
+	stdout, stderr, exitCode, err := execAgentDeckEnv(channelsCLIBinary(t), home, stdin, extraEnv, args...)
+	if err != nil {
+		t.Fatalf("run binary: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+	}
+	return stdout, stderr, exitCode
+}
+
+// execAgentDeckEnv is runAgentDeckEnv without the *testing.T: it returns a
+// start failure instead of calling t.Fatalf, so a test may run it from a
+// goroutine of its own. A non-zero exit is an exitCode, not an error.
+func execAgentDeckEnv(bin, home, stdin string, extraEnv []string, args ...string) (stdout, stderr string, exitCode int, err error) {
+	// A CLI call that never exits fails here instead of hanging until the
+	// package's 10 minute alarm (#2937). WaitDelay bounds the wait on a
+	// grandchild (a tmux server, a daemon) still holding the output pipes.
+	ctx, cancel := context.WithTimeout(context.Background(), agentDeckExecTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.WaitDelay = 10 * time.Second
+	cmd.Env = agentDeckTestEnv(home, extraEnv)
+
+	var outBuf, errBuf strings.Builder
+	cmd.Stdin = strings.NewReader(stdin)
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+
+	if runErr := cmd.Run(); runErr != nil {
+		if ctx.Err() != nil {
+			err = fmt.Errorf("agent-deck %s did not exit within %s: %w", strings.Join(args, " "), agentDeckExecTimeout, runErr)
+		} else if exitErr, ok := runErr.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else {
+			err = runErr
+		}
+	}
+	return outBuf.String(), errBuf.String(), exitCode, err
+}
+
+// agentDeckExecTimeout bounds one execAgentDeckEnv call. No CLI call a test
+// makes waits this long by design; a call that does is hung.
+const agentDeckExecTimeout = 3 * time.Minute
+
+// agentDeckTestEnv is the environment runAgentDeckEnv gives the binary: the
+// parent's environment with HOME, XDG and agent-deck variables pointed at
+// home, then extraEnv.
+func agentDeckTestEnv(home string, extraEnv []string) []string {
 	// Strip TMUX*/AGENTDECK_*/HOME from parent so the test isolation is
 	// total — same pattern used by TestLogCgroupIsolationDecision_*
-	// in cgroup_isolation_wiring_test.go:60-78.
+	// in cgroup_isolation_wiring_test.go:60-78. TMUX_TMPDIR stays: it is
+	// the isolated socket dir TestMain set (testutil.IsolateTmuxSocket), and
+	// without it a session the binary starts lands on the user's real tmux
+	// server under /tmp/tmux-UID/default. extraEnv may still override it.
 	var env []string
 	for _, kv := range os.Environ() {
-		if strings.HasPrefix(kv, "TMUX") {
+		if strings.HasPrefix(kv, "TMUX") && !strings.HasPrefix(kv, "TMUX_TMPDIR=") {
 			continue
 		}
 		if strings.HasPrefix(kv, "AGENTDECK_") {
 			continue
 		}
 		if strings.HasPrefix(kv, "HOME=") {
+			continue
+		}
+		// Strip what trigger source inference reads (#2702): a test run
+		// inside a launchd job, a systemd unit or an ssh session must not
+		// attribute the binary's sends to that host unit.
+		if strings.HasPrefix(kv, "INVOCATION_ID=") || strings.HasPrefix(kv, "XPC_SERVICE_NAME=") ||
+			strings.HasPrefix(kv, "SSH_CONNECTION=") {
 			continue
 		}
 		// Strip CLAUDE_CONFIG_DIR so the test's isolated HOME/.claude is the
@@ -98,20 +258,7 @@ func runAgentDeck(
 		"XDG_CONFIG_HOME="+filepath.Join(home, ".config"),
 		"XDG_DATA_HOME="+filepath.Join(home, ".local", "share"),
 	)
-	cmd.Env = env
-
-	var outBuf, errBuf strings.Builder
-	cmd.Stdout = &outBuf
-	cmd.Stderr = &errBuf
-
-	if err := cmd.Run(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else {
-			t.Fatalf("run binary: %v\nstdout: %s\nstderr: %s", err, outBuf.String(), errBuf.String())
-		}
-	}
-	return outBuf.String(), errBuf.String(), exitCode
+	return append(env, extraEnv...)
 }
 
 // readSessionsJSON reads the persisted sessions for the test profile.

@@ -1,8 +1,9 @@
 // TerminalPanel.js -- Preact component wrapping xterm.js 6.0.0 terminal lifecycle
-// Ports createTerminalUI, connectWS, installTerminalTouchScroll from app.js
+// Ports createTerminalUI, connectWS from app.js (touch handling: terminalTouch.js)
 import { html } from 'htm/preact'
 import { useEffect, useRef, useCallback, useState } from 'preact/hooks'
-import { selectedIdSignal, authTokenSignal, wsStateSignal, readOnlySignal } from './state.js'
+import { effect } from '@preact/signals'
+import { selectedIdSignal, sessionsSignal, authTokenSignal, wsStateSignal, readOnlySignal } from './state.js'
 import { apiFetch } from './api.js'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
@@ -10,7 +11,10 @@ import { WebglAddon } from '@xterm/addon-webgl'
 import { EmptyStateDashboard } from './EmptyStateDashboard.js'
 import { terminalKeymap } from './terminalKeys.js'
 import { createPasteHandler } from './terminalPaste.js'
-import { createTerminalLinkHandler } from './terminalLinks.js'
+import { installTerminalTouch } from './terminalTouch.js'
+import { registerOsc52Handler } from './terminalClipboard.js'
+import { createTerminalLinkHandler, installModifierClickLinks } from './terminalLinks.js'
+import { observeSession, shouldReattach, sessionStartedSignal, noteSessionStarted } from './terminalReconnect.js'
 
 // Mobile detection: pointer:coarse for touch devices
 function isMobileDevice() {
@@ -26,48 +30,6 @@ function wsURLForSession(sessionId, token) {
   )
   if (token) url.searchParams.set('token', token)
   return url.toString()
-}
-
-// Install touch-to-scroll on the terminal container.
-// PERF-E: takes the shared AbortController so every listener registered here
-// is torn down by the single controller.abort() in the useEffect cleanup. No
-// local dispose() return value is needed.
-function installTouchScroll(container, xtermEl, controller) {
-  if (!container || !xtermEl) return
-
-  let active = false
-  let lastY = 0
-
-  function onTouchStart(event) {
-    if (!event.touches || event.touches.length !== 1) return
-    active = true
-    lastY = event.touches[0].clientY
-  }
-
-  function onTouchMove(event) {
-    if (!active || !event.touches || event.touches.length !== 1) return
-    event.preventDefault()
-    const y = event.touches[0].clientY
-    const delta = lastY - y
-    lastY = y
-    if (xtermEl && delta !== 0) {
-      xtermEl.dispatchEvent(
-        new WheelEvent('wheel', {
-          deltaY: delta,
-          deltaMode: 0,
-          bubbles: true,
-          cancelable: true,
-        })
-      )
-    }
-  }
-
-  function onTouchEnd() { active = false }
-
-  container.addEventListener('touchstart', onTouchStart, { capture: true, passive: true, signal: controller.signal })
-  container.addEventListener('touchmove', onTouchMove, { capture: true, passive: false, signal: controller.signal })
-  container.addEventListener('touchend', onTouchEnd, { capture: true, passive: true, signal: controller.signal })
-  container.addEventListener('touchcancel', onTouchEnd, { capture: true, passive: true, signal: controller.signal })
 }
 
 export function TerminalPanel() {
@@ -94,7 +56,7 @@ export function TerminalPanel() {
 
   // Cleanup function: dispose terminal, close WS, remove observers.
   // PERF-E: a single controller.abort() detaches every event listener
-  // registered inside the main useEffect (8 total: 4 touch, 1 window
+  // registered inside the main useEffect (5 touch incl. the tap mousedown guard, 1 window
   // resize, 4 ws).
   const cleanup = useCallback(() => {
     const ctx = ctxRef.current
@@ -134,6 +96,8 @@ export function TerminalPanel() {
     // platforms keep their native Home/End/Ctrl-arrow behavior untouched.
     const isMac = /mac/i.test(navigator.platform || '') || /mac/i.test(navigator.userAgent || '')
 
+    const linkHandler = createTerminalLinkHandler()
+
     // Create Terminal
     const terminal = new Terminal({
       convertEol: false,
@@ -144,10 +108,16 @@ export function TerminalPanel() {
       // Issue #1682: replaces xterm's built-in OSC-8 activate handler, which
       // confirms on every link. Ours skips the confirm for `[web]
       // trusted_domains` hosts and honors `confirm_link_open`.
-      linkHandler: createTerminalLinkHandler(),
+      linkHandler,
+      // Issue #2372: on macOS, Option-drag makes a native selection past an
+      // app's mouse capture (Claude Code, tmux `mouse on`), matching iTerm2 and
+      // Terminal.app. xterm defaults this off, which leaves no modifier that
+      // can select text in those sessions on a Mac.
+      macOptionClickForcesSelection: true,
       scrollback: 10000,
       theme: {
-        background: '#0a1220',
+        // Match .term-frame so the viewport doesn't look like a tinted patch.
+        background: '#0b0f1a',
         foreground: '#d9e2ec',
         cursor: '#9ecbff',
       },
@@ -156,6 +126,17 @@ export function TerminalPanel() {
     const fitAddon = new FitAddon()
     terminal.loadAddon(fitAddon)
     terminal.open(container)
+
+    // Issue #2372: copy a selection as it is made, like iTerm2's copy-on-select.
+    // An empty selection is skipped so a stray click never clears the
+    // clipboard, and navigator.clipboard is absent on plain-http origins other
+    // than localhost, where this quietly does nothing.
+    terminal.onSelectionChange(() => {
+      const text = terminal.getSelection()
+      if (text && navigator.clipboard?.writeText) {
+        navigator.clipboard.writeText(text).catch(() => {})
+      }
+    })
 
     // WebGL renderer with canvas fallback
     try {
@@ -256,9 +237,20 @@ export function TerminalPanel() {
       signal: controller.signal,
     })
 
-    // Touch scrolling for mobile -- listeners attach via the shared
-    // AbortController (PERF-E). No local dispose handle is needed.
-    installTouchScroll(container, terminal.element, controller)
+    // Touch: one-finger drag scrolls, one-finger tap focuses so the phone
+    // keyboard opens (#2680; tap-to-focus idea from #2765). Read-only
+    // sessions never focus. Listeners attach via the shared AbortController
+    // (PERF-E). No local dispose handle is needed.
+    installTerminalTouch(container, terminal.element, {
+      focus: () => terminal.focus(),
+      isReadOnly: () => readOnlySignal.value,
+      controller,
+    })
+
+    // Issue #2675: Cmd-click (Ctrl-click off macOS) opens the hovered link even
+    // when the app captures the mouse (tmux `mouse on`, Claude Code), where a
+    // plain click goes to the app as mouse input.
+    installModifierClickLinks(container, linkHandler, { isMac, signal: controller.signal })
 
     // Keyboard input forwarding (desktop + mobile; server gates on ReadOnly).
     // sendInput is the single guarded path to the pane -- every producer
@@ -295,6 +287,11 @@ export function TerminalPanel() {
         signal: controller.signal,
       })
     }
+
+    // #2370: OSC 52 copies from the pane (tmux copy mode, Claude Code's
+    // selection) reach the browser clipboard. Writes only; see
+    // registerOsc52Handler. Disposed with the terminal.
+    registerOsc52Handler(terminal)
 
     terminal.writeln('Connecting to terminal...')
 
@@ -414,6 +411,27 @@ export function TerminalPanel() {
     }
   }, [sessionId, reconnectKey, cleanup])
 
+  // #2432: a terminal halted by TMUX_SESSION_NOT_FOUND reattaches by itself
+  // once its session runs again, however it was started: the banner, the
+  // header or sidebar Start/Restart (noteSessionStarted), or the CLI/TUI
+  // (the SSE status turning live). Same rebuild as the banner's Restart:
+  // clear the banner and bump reconnectKey.
+  useEffect(() => {
+    if (!sessionId) return
+    let prev = null
+    return effect(() => {
+      const next = observeSession(sessionsSignal.value, sessionStartedSignal.value, sessionId, prev)
+      const ctx = ctxRef.current
+      const halted = !!ctx && ctx.sessionId === sessionId && !ctx.wsReconnectEnabled && !ctx.reattachQueued
+      if (prev && shouldReattach(prev, next, halted)) {
+        ctx.reattachQueued = true // one rebuild per halt; the new ctx starts clear
+        setFatalError(null)
+        setReconnectKey((k) => k + 1)
+      }
+      prev = next
+    })
+  }, [sessionId])
+
   if (!sessionId) {
     return html`<${EmptyStateDashboard} />`
   }
@@ -426,13 +444,10 @@ export function TerminalPanel() {
   async function handleFatalRestart() {
     try {
       await apiFetch('POST', '/api/sessions/' + sessionId + '/restart')
-      setFatalError(null)
-      // #782 (codex review): bumping reconnectKey forces the main effect
-      // to tear down the disabled-reconnect ctx and rebuild a fresh
-      // terminal + WebSocket. Without this, ctx.wsReconnectEnabled stays
-      // false from the prior TMUX_SESSION_NOT_FOUND and the terminal
-      // never reattaches to the freshly-restarted tmux session.
-      setReconnectKey((k) => k + 1)
+      // #782 (codex review) / #2432: the reattach effect above clears the
+      // banner and bumps reconnectKey, rebuilding the terminal + WebSocket
+      // that the TMUX_SESSION_NOT_FOUND halt left with reconnect disabled.
+      noteSessionStarted(sessionId)
     } catch (_e) {
       // Errors surface via the global toast layer; leave the banner up.
     }
@@ -456,6 +471,9 @@ export function TerminalPanel() {
         <div role="alert"
              style=${{
                position: 'absolute', inset: '12px 12px auto 12px',
+               // #2432: above xterm's layers (link canvas, scrollbar at 11),
+               // which otherwise take the clicks meant for Restart.
+               zIndex: 20,
                border: '1px solid rgba(247,118,142,0.4)',
                background: 'rgba(22,22,30,0.95)',
                borderRadius: 'var(--radius-lg)',

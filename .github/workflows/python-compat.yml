@@ -23,9 +23,14 @@ on:
       - 'scripts/watchdog/**'
       - '.github/workflows/python-compat.yml'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   bridge-import:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -46,8 +51,12 @@ jobs:
       - name: Compatibility test suite
         run: python -m pytest conductor/tests/test_python_compat.py -v
 
+      - name: Stage report tests
+        run: python -m pytest conductor/tests/test_stage_report.py -v
+
   watchdog-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:

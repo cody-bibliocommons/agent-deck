@@ -1,15 +1,18 @@
 package session
 
 import (
+	"log/slog"
 	"reflect"
 	"testing"
+
+	"github.com/asheshgoplani/agent-deck/internal/testutil/logassert"
 )
 
 // canonicalBuiltins is the canonical built-in set, in the precedence order that
 // Registry.Match() (and the legacy detectTool() switch) walk.
 var canonicalBuiltins = []string{
-	"claude", "opencode", "gemini", "codex", "pi",
-	"copilot", "crush", "cursor", "hermes", "deepseek", "kiro-cli", "aider", "shell",
+	"claude", "opencode", "gemini", "codex", "pi", "omp",
+	"copilot", "crush", "muse", "cursor", "hermes", "deepseek", "kiro-cli", "aider", "shell",
 }
 
 func TestRegistry_AllReturnsCanonicalBuiltins(t *testing.T) {
@@ -52,10 +55,22 @@ func TestRegistry_MatchAllBranches(t *testing.T) {
 		{"pi uppercase", "Pi", "pi"},
 		{"pi no false match in epic", "epic", "shell"},
 		{"pi no false match in tapioca", "tapioca", "shell"},
+		// omp — whitespace-token match, NOT substring
+		{"omp bare", "omp", "omp"},
+		{"omp with flags", "omp --model sonnet", "omp"},
+		{"omp uppercase", "Omp", "omp"},
+		{"omp no false match in compass", "compass", "shell"},
+		{"omp no false match in accomplish", "accomplish", "shell"},
+		{"omp no false match in component", "component", "shell"},
 		// copilot
 		{"copilot with flags", "copilot --resume", "copilot"},
 		// crush
 		{"crush bare", "crush", "crush"},
+		// muse
+		{"muse bare", "muse", "muse"},
+		{"muse with trust flag", "muse --trust-workspace", "muse"},
+		{"muse no match echo", "echo muse", "shell"},
+		{"muse no match museum", "museum visit", "shell"},
 		// cursor
 		{"cursor agent subcommand", "cursor agent", "cursor"},
 		{"standalone agent binary", "agent", "cursor"},
@@ -220,6 +235,79 @@ func TestRegistry_MatchTokenByPath(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := r.Match(tt.cmd); got != tt.want {
 				t.Errorf("Match(%q) = %q, want %q", tt.cmd, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRegistry_IconAndColor(t *testing.T) {
+	r := Init(map[string]ToolDef{
+		"mywrap":  {Command: "mywrap", Icon: "🧪", Color: "#ff00ff"},
+		"nostyle": {Command: "nostyle"},
+	})
+
+	if got := r.Icon("claude"); got != "🤖" {
+		t.Errorf("Icon(claude) = %q, want 🤖", got)
+	}
+	if got := r.Color("claude"); got != "orange" {
+		t.Errorf("Color(claude) = %q, want orange", got)
+	}
+	if got := r.Color("shell"); got != "" {
+		t.Errorf("Color(shell) = %q, want empty (no brand color)", got)
+	}
+	if got := r.Icon("mywrap"); got != "🧪" {
+		t.Errorf("Icon(mywrap) = %q, want 🧪", got)
+	}
+	if got := r.Color("mywrap"); got != "#ff00ff" {
+		t.Errorf("Color(mywrap) = %q, want #ff00ff", got)
+	}
+	if got := r.Icon("nostyle"); got != "" {
+		t.Errorf("Icon(nostyle) = %q, want empty", got)
+	}
+	if got := r.Color("nostyle"); got != "" {
+		t.Errorf("Color(nostyle) = %q, want empty", got)
+	}
+	if got := r.Icon("unknown"); got != "" {
+		t.Errorf("Icon(unknown) = %q, want empty", got)
+	}
+	if got := r.Color("unknown"); got != "" {
+		t.Errorf("Color(unknown) = %q, want empty", got)
+	}
+}
+
+// TestRegistry_ShadowWarningSkipsPatternOnlyOverrides pins the warning for
+// [tools.<builtin>] entries. Since #3114 MergeToolPatterns applies detection
+// pattern fields on top of a built-in's defaults, so an entry with only those
+// fields is not ignored and must not be reported as a shadow. Entries that set
+// anything else, or name a built-in without pattern defaults, still warn.
+func TestRegistry_ShadowWarningSkipsPatternOnlyOverrides(t *testing.T) {
+	const shadowMsg = "ignored custom tool: name shadows a built-in"
+	cases := []struct {
+		name string
+		tool string
+		def  ToolDef
+		warn bool
+	}{
+		{"pattern only on a built-in with defaults", "pi", ToolDef{BusyPatterns: []string{"Working"}}, false},
+		{"extras only", "claude", ToolDef{BusyPatternsExtra: []string{"thinking"}, SpinnerCharsExtra: []string{"*"}}, false},
+		{"command shadows the built-in", "claude", ToolDef{Command: "my-fork-of-claude"}, true},
+		{"patterns plus a command", "pi", ToolDef{Command: "my-pi", BusyPatterns: []string{"Working"}}, true},
+		{"built-in without pattern defaults", "hermes", ToolDef{BusyPatterns: []string{"busy"}}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			capture := logassert.NewCapture()
+			orig := registryLog
+			registryLog = slog.New(capture)
+			t.Cleanup(func() { registryLog = orig })
+
+			r := Init(map[string]ToolDef{tc.tool: tc.def})
+
+			if def := r.GetCustom(tc.tool); def != nil {
+				t.Errorf("GetCustom(%q) = %+v, want nil (built-in wins)", tc.tool, def)
+			}
+			if got := len(capture.WithMessage(shadowMsg)) > 0; got != tc.warn {
+				t.Errorf("shadow warning logged = %v, want %v", got, tc.warn)
 			}
 		})
 	}

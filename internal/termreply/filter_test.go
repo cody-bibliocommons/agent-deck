@@ -1,6 +1,8 @@
 package termreply
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -100,6 +102,75 @@ func TestFilterDiscardsSplitDCSReplyWhenNotArmed(t *testing.T) {
 	require.False(t, f.Active())
 }
 
+func TestFilterForwardsColorRepliesWhenEnabled(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		reply string
+		armed bool
+	}{
+		{"osc11_st_armed", "\x1b]11;rgb:fefe/ffff/ffff\x1b\\", true},
+		{"osc11_st_not_armed", "\x1b]11;rgb:fefe/ffff/ffff\x1b\\", false},
+		{"osc11_bel_armed", "\x1b]11;rgb:0000/0000/0000\x07", true},
+		{"osc10_st_armed", "\x1b]10;rgb:1d1d/1f1f/2121\x1b\\", true},
+		{"osc10_bel_not_armed", "\x1b]10;#1d1f21\x07", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := Filter{ForwardColorReplies: true}
+
+			got := f.Consume([]byte(tc.reply+"k"), tc.armed, false)
+			require.Equal(t, []byte(tc.reply+"k"), got)
+			require.False(t, f.Active())
+		})
+	}
+}
+
+func TestFilterForwardsColorReplySplitAcrossChunks(t *testing.T) {
+	f := Filter{ForwardColorReplies: true}
+
+	got := f.Consume([]byte("\x1b]11;rgb:fefe/"), true, false)
+	require.Empty(t, got)
+	require.True(t, f.Active())
+
+	got = f.Consume([]byte("ffff/ffff\x1b"), true, false)
+	require.Empty(t, got)
+	require.True(t, f.Active())
+
+	got = f.Consume([]byte("\\j"), true, false)
+	require.Equal(t, []byte("\x1b]11;rgb:fefe/ffff/ffff\x1b\\j"), got)
+	require.False(t, f.Active())
+}
+
+func TestFilterDiscardsOtherEscapeStringsWhenForwardingColorReplies(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		input string
+	}{
+		{"osc4_palette", "\x1b]4;1;rgb:cdcd/0000/0000\x07"},
+		{"osc52_clipboard", "\x1b]52;c;aGVsbG8=\x1b\\"},
+		{"osc110_reset", "\x1b]110\x07"},
+		{"osc1_title", "\x1b]1;title\x1b\\"},
+		{"osc_esc_in_prefix", "\x1b]1\x1b\\"},
+		{"dcs_xtversion", "\x1bP>|iTerm2 3.6.10n\x1b\\"},
+		{"oversized_osc11", "\x1b]11;rgb:" + strings.Repeat("f", 64) + "\x1b\\"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := Filter{ForwardColorReplies: true}
+
+			got := f.Consume([]byte(tc.input+"k"), true, false)
+			require.Equal(t, []byte("k"), got)
+			require.False(t, f.Active())
+		})
+	}
+}
+
+func TestFilterDropsIncompleteColorReplyOnFinal(t *testing.T) {
+	f := Filter{ForwardColorReplies: true}
+
+	got := f.Consume([]byte("\x1b]11;rgb:fefe"), true, true)
+	require.Empty(t, got)
+	require.False(t, f.Active())
+}
+
 // Regression for #738: Coleman (@Clean-Cole) reported that Shift+Enter collapsed
 // to bare CR inside attached Claude/Copilot sessions because the filter was
 // swallowing iTerm2's DA1 reply (`\x1b[?62;4c`). Without DA1 reaching tmux,
@@ -128,6 +199,70 @@ func TestFilterPassesDSRCursorReplyThroughEvenDuringQuarantine(t *testing.T) {
 	input := []byte("\x1b[12;34R")
 	require.Equal(t, input, f.Consume(input, true, false))
 	require.False(t, f.Active())
+}
+
+// Regression for #2356: a DA1/DA2 reply addressed to a just-detached
+// attach's query can still be in flight when the next attach starts. It is
+// byte-for-byte indistinguishable from a fresh reply, so tmux's client
+// consumes the first copy it sees as satisfying its own outstanding query
+// and has nothing pending for any further copy — which then reaches the
+// pane as literal input. The filter must therefore forward at most one
+// DA1, one DA2, and one DSR/CPR reply per attach (per Filter instance)
+// while armed, and drop any further copy of the same kind rather than
+// leaking it through.
+func TestFilterSwallowsDuplicateDAReplyWhileArmed(t *testing.T) {
+	var f Filter
+
+	da1 := []byte("\x1b[?61;4c")
+	require.Equal(t, da1, f.Consume(da1, true, false), "first DA1 reply must pass through")
+	require.Empty(t, f.Consume(da1, true, false), "stray duplicate DA1 reply must be dropped")
+
+	da2 := []byte("\x1b[>0;10;1c")
+	require.Equal(t, da2, f.Consume(da2, true, false), "first DA2 reply must pass through")
+	require.Empty(t, f.Consume(da2, true, false), "stray duplicate DA2 reply must be dropped")
+
+	dsr := []byte("\x1b[12;34R")
+	require.Equal(t, dsr, f.Consume(dsr, true, false), "first DSR/CPR reply must pass through")
+	require.Empty(t, f.Consume(dsr, true, false), "stray duplicate DSR reply must be dropped")
+
+	require.False(t, f.Active())
+}
+
+// A DA1 budget and a DA2 budget are tracked independently: consuming a DA1
+// reply must not consume the DA2 budget (they arrive as a pair from real
+// terminals), and vice versa.
+func TestFilterDA1AndDA2BudgetsAreIndependent(t *testing.T) {
+	var f Filter
+
+	da1 := []byte("\x1b[?61;4c")
+	da2 := []byte("\x1b[>0;10;1c")
+	require.Equal(t, da1, f.Consume(da1, true, false))
+	require.Equal(t, da2, f.Consume(da2, true, false), "DA2 must still pass through after DA1 consumed its own budget")
+}
+
+func TestFilterDSRAndCPRBudgetsAreIndependent(t *testing.T) {
+	for _, first := range []string{"\x1b[0n", "\x1b[12;34R"} {
+		var f Filter
+		second := "\x1b[0n"
+		if first == second {
+			second = "\x1b[12;34R"
+		}
+		require.Equal(t, []byte(first), f.Consume([]byte(first), true, false))
+		require.Equal(t, []byte(second), f.Consume([]byte(second), true, false), "different query replies need separate budgets")
+		require.Empty(t, f.Consume([]byte(first), true, false), "duplicate reply must still be dropped")
+	}
+}
+
+// Outside the quarantine window (armed=false) the original unconditional,
+// unbudgeted passthrough is preserved: a legitimate terminal that replies to
+// repeated live DA queries outside of any attach hand-off must not be
+// throttled.
+func TestFilterDoesNotBudgetDAReplyWhenNotArmed(t *testing.T) {
+	var f Filter
+
+	da1 := []byte("\x1b[?61;4c")
+	require.Equal(t, da1, f.Consume(da1, false, false))
+	require.Equal(t, da1, f.Consume(da1, false, false), "unarmed passthrough must not be budgeted")
 }
 
 // Locks in that generic non-whitelisted CSI finals (e.g. arrow-like bytes
@@ -362,4 +497,169 @@ func TestFilterCrossChunkSplitAfterEscWhenArmed_StillSuppressed(t *testing.T) {
 	got = f.Consume([]byte("]11;rgb:d3d3/f5f5/f5f5\x07after"), true, false)
 	require.Equal(t, []byte("after"), got)
 	require.False(t, f.Active())
+}
+
+// With Option-as-Meta (Terminal.app default profile, iTerm2 "Esc+"), Alt plus
+// an escape-string introducer key sends ESC+introducer: Alt+Shift+- (the
+// em-dash chord) is ESC _ (APC), Alt+Shift+P is ESC P (DCS), Alt+] is ESC ].
+// Treating that as the start of a reply put the filter into discard mode
+// until a BEL or ST that typing never produces, so every later key, Ctrl+Q
+// included, was swallowed and the attach looked frozen (#2931). KeysOnIdle
+// holds the string, and FlushIdle returns it as input once stdin is idle.
+func TestFilterKeysOnIdleReleasesUnterminatedEscapeString(t *testing.T) {
+	for _, introducer := range []byte{'_', 'P', ']', '^', 'X'} {
+		for _, forwardColor := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%c/forward_color=%t", introducer, forwardColor), func(t *testing.T) {
+				f := Filter{ForwardColorReplies: forwardColor, KeysOnIdle: true}
+
+				got := f.Consume([]byte{0x1b, introducer}, false, false)
+				require.Empty(t, got)
+				require.True(t, f.Holding())
+				require.Equal(t, []byte{0x1b, introducer}, f.FlushIdle())
+				require.False(t, f.Active())
+
+				got = f.Consume([]byte("a\x11"), false, false)
+				require.Equal(t, []byte("a\x11"), got, "keys after the chord must not be swallowed")
+			})
+		}
+	}
+}
+
+// Keys typed right behind the chord, before stdin goes idle, are held with
+// it and released together, so a Ctrl+Q among them still reaches the caller.
+func TestFilterKeysOnIdleReleasesKeysQueuedBehindTheChord(t *testing.T) {
+	f := Filter{KeysOnIdle: true}
+
+	got := f.Consume([]byte("x\x1b_"), false, false)
+	require.Equal(t, []byte("x"), got)
+	got = f.Consume([]byte("a\x11"), false, false)
+	require.Empty(t, got)
+
+	require.Equal(t, []byte("\x1b_a\x11"), f.FlushIdle())
+	require.False(t, f.Active())
+	require.Nil(t, f.FlushIdle())
+}
+
+// A reply that terminates is still discarded, also when it is split across
+// reads, and leaves nothing held.
+func TestFilterKeysOnIdleStillDiscardsTerminatedReplies(t *testing.T) {
+	for _, forwardColor := range []bool{false, true} {
+		t.Run(fmt.Sprintf("forward_color=%t", forwardColor), func(t *testing.T) {
+			f := Filter{ForwardColorReplies: forwardColor, KeysOnIdle: true}
+
+			got := f.Consume([]byte("\x1bP>|iTerm2 "), false, false)
+			require.Empty(t, got)
+			got = f.Consume([]byte("3.6.10\x1b\\k"), false, false)
+			require.Equal(t, []byte("k"), got)
+			require.False(t, f.Holding())
+			require.Nil(t, f.FlushIdle())
+
+			got = f.Consume([]byte("\x1b]0;title\x07z"), false, false)
+			require.Equal(t, []byte("z"), got)
+			require.Nil(t, f.FlushIdle())
+		})
+	}
+}
+
+// ForwardColorReplies still forwards a complete OSC 10/11 reply with
+// KeysOnIdle on; only an unterminated one is held.
+func TestFilterKeysOnIdleForwardsColorReply(t *testing.T) {
+	f := Filter{ForwardColorReplies: true, KeysOnIdle: true}
+
+	reply := "\x1b]11;rgb:0000/0000/0000\x1b\\"
+	require.Equal(t, []byte(reply), f.Consume([]byte(reply), false, false))
+	require.False(t, f.Holding())
+}
+
+// Inside the quarantine a reply split right after its introducer is held and
+// still discarded across reads once it terminates.
+func TestFilterKeysOnIdleStillDiscardsSplitReplyWhenArmed(t *testing.T) {
+	f := Filter{KeysOnIdle: true}
+
+	got := f.Consume([]byte("\x1bP"), true, false)
+	require.Empty(t, got)
+	require.True(t, f.Holding())
+
+	got = f.Consume([]byte(">|iTerm2 3.6.10\x1b\\k"), true, false)
+	require.Equal(t, []byte("k"), got)
+	require.False(t, f.Active())
+}
+
+// An escape string begun inside the quarantine may be a reply, so FlushIdle
+// drops it rather than typing it, and the filter goes back to idle: the
+// keys after it, Ctrl+Q included, are input again instead of being
+// discarded until a terminator that never comes.
+func TestFilterKeysOnIdleDropsUnterminatedStringBegunWhenArmed(t *testing.T) {
+	f := Filter{KeysOnIdle: true}
+
+	got := f.Consume([]byte("\x1b_a"), true, false)
+	require.Empty(t, got)
+	require.True(t, f.Holding())
+
+	require.Nil(t, f.FlushIdle())
+	require.False(t, f.Active())
+
+	got = f.Consume([]byte("b\x11"), true, false)
+	require.Equal(t, []byte("b\x11"), got)
+	got = f.Consume([]byte("c"), false, false)
+	require.Equal(t, []byte("c"), got)
+}
+
+// Without KeysOnIdle (a caller with no idle flush) nothing is
+// held, and an introducer keeps starting a discarded reply as before.
+func TestFilterHoldsNothingWithoutKeysOnIdle(t *testing.T) {
+	var f Filter
+
+	got := f.Consume([]byte("\x1bP"), false, false)
+	require.Empty(t, got)
+	require.False(t, f.Holding())
+	require.Nil(t, f.FlushIdle())
+
+	got = f.Consume([]byte(">|iTerm2 3.6.10\x1b\\k"), false, false)
+	require.Equal(t, []byte("k"), got)
+	require.False(t, f.Active())
+}
+
+// No reply is heldInputMaxLen bytes long: past it the held string is ended
+// instead of growing without bound, released as input outside the quarantine
+// and dropped inside it.
+func TestFilterKeysOnIdleEndsOversizedHeldInput(t *testing.T) {
+	typed := "\x1b_" + strings.Repeat("a", heldInputMaxLen)
+
+	f := Filter{KeysOnIdle: true}
+	got := f.Consume([]byte(typed), false, false)
+	require.Equal(t, []byte(typed), got)
+	require.False(t, f.Active())
+
+	f = Filter{KeysOnIdle: true}
+	got = f.Consume([]byte(typed), true, false)
+	require.Equal(t, []byte("a"), got, "only the byte after the dropped string passes")
+	require.False(t, f.Active())
+}
+
+// An unterminated held string is dropped on EOF, like any incomplete reply.
+func TestFilterKeysOnIdleDropsHeldInputOnFinal(t *testing.T) {
+	f := Filter{KeysOnIdle: true}
+
+	require.Empty(t, f.Consume([]byte("\x1b_a"), false, false))
+	require.Empty(t, f.Consume(nil, false, true))
+	require.False(t, f.Active())
+}
+
+// HoldGeneration changes when one Consume ends a hold and begins the next,
+// so a caller timing its window can tell the second hold from the first.
+func TestFilterHoldGenerationChangesForBackToBackHolds(t *testing.T) {
+	f := Filter{KeysOnIdle: true}
+	f.Consume([]byte("\x1b_a"), false, false)
+	first := f.HoldGeneration()
+	if !f.Holding() {
+		t.Fatal("first escape string not held")
+	}
+	f.Consume([]byte("\x1b\\\x1b_"), false, false)
+	if !f.Holding() {
+		t.Fatal("second escape string not held")
+	}
+	if f.HoldGeneration() == first {
+		t.Fatal("HoldGeneration unchanged for a new hold")
+	}
 }

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/costs"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 )
 
@@ -80,29 +81,11 @@ func (s *Server) handleCostsDaily(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	now := time.Now().UTC()
-	from := now.AddDate(0, 0, -days).Truncate(24 * time.Hour)
-	to := now.AddDate(0, 0, 1).Truncate(24 * time.Hour)
-
-	dailyCosts, err := s.costStore.TotalByDateRange(from, to)
+	result, err := s.costStore.DashboardDaily(days)
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to query daily costs")
 		return
 	}
-
-	type dailyEntry struct {
-		Date    string  `json:"date"`
-		CostUSD float64 `json:"cost_usd"`
-	}
-
-	result := make([]dailyEntry, 0, len(dailyCosts))
-	for _, dc := range dailyCosts {
-		result = append(result, dailyEntry{
-			Date:    dc.Date.Format("2006-01-02"),
-			CostUSD: microToUSD(dc.CostMicrodollars),
-		})
-	}
-
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -120,31 +103,25 @@ func (s *Server) handleCostsSessions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sessions, err := s.costStore.TopSessionsByCost(100)
+	limit := 100
+	if value := r.URL.Query().Get("limit"); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 1 || parsed > 500 {
+			writeAPIError(w, http.StatusBadRequest, "INVALID_REQUEST", "limit must be between 1 and 500")
+			return
+		}
+		limit = parsed
+	}
+	period, err := dashboardCostPeriod(r)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
+		return
+	}
+	result, err := s.costStore.DashboardSessions(limit, period)
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to query session costs")
 		return
 	}
-
-	type sessionEntry struct {
-		SessionID string  `json:"session_id"`
-		Title     string  `json:"title"`
-		Group     string  `json:"group"`
-		CostUSD   float64 `json:"cost_usd"`
-		Events    int     `json:"events"`
-	}
-
-	result := make([]sessionEntry, 0, len(sessions))
-	for _, sc := range sessions {
-		result = append(result, sessionEntry{
-			SessionID: sc.SessionID,
-			Title:     sc.SessionTitle,
-			Group:     sc.Group,
-			CostUSD:   microToUSD(sc.CostMicrodollars),
-			Events:    sc.EventCount,
-		})
-	}
-
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -162,17 +139,16 @@ func (s *Server) handleCostsModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	models, err := s.costStore.CostByModel()
+	period, err := dashboardCostPeriod(r)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
+		return
+	}
+	result, err := s.costStore.DashboardModels(period)
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to query model costs")
 		return
 	}
-
-	result := make(map[string]float64, len(models))
-	for model, micro := range models {
-		result[model] = microToUSD(micro)
-	}
-
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -413,40 +389,16 @@ func (s *Server) handleCostsGroups(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sessions, err := s.costStore.TopSessionsByCost(1000)
+	period, err := dashboardCostPeriod(r)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
+		return
+	}
+	result, err := s.costStore.DashboardGroups(period)
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to query costs")
 		return
 	}
-
-	type groupEntry struct {
-		Group    string  `json:"group"`
-		CostUSD  float64 `json:"cost_usd"`
-		Events   int     `json:"events"`
-		Sessions int     `json:"sessions"`
-	}
-
-	groups := make(map[string]*groupEntry)
-	for _, sc := range sessions {
-		g := sc.Group
-		if g == "" {
-			g = "(ungrouped)"
-		}
-		entry, ok := groups[g]
-		if !ok {
-			entry = &groupEntry{Group: g}
-			groups[g] = entry
-		}
-		entry.CostUSD += microToUSD(sc.CostMicrodollars)
-		entry.Events += sc.EventCount
-		entry.Sessions++
-	}
-
-	result := make([]groupEntry, 0, len(groups))
-	for _, entry := range groups {
-		result = append(result, *entry)
-	}
-
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -610,4 +562,26 @@ func (s *Server) computeBatchCosts(ids []string) map[string]float64 {
 
 func microToUSD(microdollars int64) float64 {
 	return float64(microdollars) / 1_000_000
+}
+
+func init() {
+	registerFeatureRoutes(func(s *Server, mux *http.ServeMux) {
+		mux.HandleFunc("/api/costs/summary", s.handleCostsSummary)
+		mux.HandleFunc("/api/costs/daily", s.handleCostsDaily)
+		mux.HandleFunc("/api/costs/sessions", s.handleCostsSessions)
+		mux.HandleFunc("/api/costs/models", s.handleCostsModels)
+		mux.HandleFunc("/api/costs/export", s.handleCostsExport)
+		mux.HandleFunc("/api/costs/groups", s.handleCostsGroups)
+		mux.HandleFunc("/api/costs/session", s.handleCostsSessionDetail)
+		mux.HandleFunc("/api/costs/batch", s.handleCostsBatch)
+		mux.HandleFunc("/api/costs/stream", s.handleCostsStream)
+	})
+}
+
+func dashboardCostPeriod(r *http.Request) (string, error) {
+	period := r.URL.Query().Get("period")
+	if period == "" {
+		period = "all"
+	}
+	return period, costs.ValidateCostPeriod(period)
 }

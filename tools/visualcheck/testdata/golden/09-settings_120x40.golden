@@ -1,0 +1,40 @@
+                           ╭────────────────────────────────────────────────────────────────╮
+                           │                                                                │
+                           │  Settings                                    [Esc] Close       │
+                           │  ------------------------------------------------------------  │
+                           │                                                                │
+                           │  THEME                                                         │
+                           │  ▶ >Dark   Light   System                                      │
+                           │                                                                │
+                           │  DEFAULT TOOL                                                  │
+                           │     Claude   Gemini   OpenCode   OpenCode 2   Codex   Pi       │
+                           │  Copilot   Crush   Muse   Cursor   Hermes   DeepSeek   Oh My   │
+                           │  Pi  >None                                                     │
+                           │    Pre-selected when creating new sessions                     │
+                           │                                                                │
+                           │  CLAUDE                                                        │
+                           │    [x] Dangerous mode - Skip permission prompts                │
+                           │    Config directory: ~/.claude (default)                       │
+                           │    Default account: >None                                      │
+                           │                                                                │
+                           │  GEMINI                                                        │
+                           │    [ ] YOLO mode - Auto-approve all actions                    │
+                           │                                                                │
+                           │  CODEX                                                         │
+                           │    [ ] YOLO mode - Bypass approvals and sandbox                │
+                           │                                                                │
+                           │  HERMES                                                        │
+                           │    [ ] YOLO mode - Auto-approve all tool calls                 │
+                           │                                                                │
+                           │  UPDATES                                                       │
+                           │    [x] Check for updates on startup                            │
+                           │    [ ] Offer to install on startup                             │
+                           │    [x] Install updates automatically                           │
+                           │    [ ] Restart automatically after update                      │
+                           │                                                                │
+                           │  LOGS                                                          │
+                           │    ▼ more below                                                │
+                           │  j/k Navigate  Space Toggle                                    │
+                           │  h/l Adjust  Enter Edit  Esc Close                             │
+                           │                                                                │
+                           ╰────────────────────────────────────────────────────────────────╯

@@ -15,6 +15,10 @@ package terminal
 import (
 	"errors"
 	"strings"
+	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/sshcontrol"
+	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
 // ErrUnsupported is returned by OpenSessionInNewWindow on platforms that have
@@ -56,6 +60,16 @@ type AttachRequest struct {
 	// `agent-deck session attach <Name>` on the remote host. Issue #1100,
 	// follow-up to #1098 — Shift+Enter for remote sessions.
 	Remote *RemoteAttach
+
+	// ForceUTF8 passes tmux's global -u flag on a local attach. The embedded
+	// terminal client runs inside the dashboard's own process, which may have
+	// inherited a non-UTF-8 locale from launchd or systemd; without -u tmux
+	// treats that client as non-UTF-8 and corrupts every non-ASCII cell. The
+	// in-TUI attach path always forces it (internal/tmux/pty.go); the embedded
+	// client keeps the same invariant. A new terminal window (Shift+Enter)
+	// starts its own login shell and locale, so it leaves this unset and its
+	// command shape unchanged. Ignored when Remote != nil.
+	ForceUTF8 bool
 }
 
 // RemoteAttach carries the SSH and agent-deck details needed to attach
@@ -76,19 +90,109 @@ type RemoteAttach struct {
 	// Profile is the remote profile selector. Empty or "default" omits
 	// the -p flag.
 	Profile string
+
+	// Transport is the remote's configured interactive transport: "mosh"
+	// attaches through mosh; anything else uses ssh.
+	Transport string
+
+	// MoshServer is the remote's mosh_server command; empty uses mosh's
+	// default.
+	MoshServer string
+
+	// SSHConfig is the remote's per-sandbox ssh_config (provider sandbox
+	// remotes); when set every ssh in the attach command passes it with -F.
+	SSHConfig string
+
+	// LocalCLI is this machine's agent-deck binary. With RemoteName set, the
+	// window runs `<LocalCLI> [-p LocalProfile] remote attach <RemoteName>
+	// <session>` instead of a raw ssh line, so the attach is the same as
+	// Enter in the TUI: Ctrl+V carries a clipboard image across (ASK-201),
+	// Ctrl+Q detaches, mosh falls back to ssh. Empty keeps the ssh line.
+	LocalCLI string
+
+	// LocalProfile is the profile the TUI runs under; empty or "default"
+	// adds no -p.
+	LocalProfile string
+
+	// RemoteName is the remote's name in this machine's config.
+	RemoteName string
 }
 
-// SSHControlDir is the directory the launcher tells SSH to keep its
-// ControlMaster sockets in. Mirrors internal/session.sshControlDir so a
-// remote attach launched via Shift+Enter shares the same multiplexed
-// connection as a normal in-TUI remote attach.
-const SSHControlDir = "/tmp/agent-deck-ssh"
+// UsesMosh reports whether the attach runs over mosh rather than ssh.
+func (r *RemoteAttach) UsesMosh() bool {
+	return r != nil && strings.EqualFold(strings.TrimSpace(r.Transport), "mosh")
+}
+
+// MoshQuitTimeout bounds how long a mosh attach may take to quit after the
+// deck asks it to. Killing mosh-client strands mosh-server, and the remote
+// attach it runs, waiting indefinitely for the client to roam back, so
+// callers send SIGTERM (which makes the client tell the server to exit) and
+// only kill once this elapses. The server acts on the first shutdown packet
+// it receives, so this only needs to cover a few relayed round trips.
+const MoshQuitTimeout = 5 * time.Second
+
+// MoshServerProbe is the remote shell command that succeeds only when the
+// host can start mosh-server: the program named by mosh_server (its first
+// word), or mosh's default.
+func MoshServerProbe(moshServer string) string {
+	program := "mosh-server"
+	if fields := strings.Fields(moshServer); len(fields) > 0 {
+		program = fields[0]
+	}
+	return "command -v " + shellQuote(program)
+}
+
+// MoshArgs returns mosh's arguments for running argv on host. The bootstrap
+// ssh reuses the deck's ControlMaster, so starting mosh-server costs one
+// multiplexed exec rather than a fresh SSH handshake; the UDP endpoint then
+// comes from the server's SSH_CONNECTION (--experimental-remote-ip=remote),
+// because mosh's default discovery forces its own connection with
+// ControlPath=none. argv is passed unquoted: mosh quotes it for the remote
+// shell and mosh-server execs it directly.
+func MoshArgs(host, moshServer string, argv []string) []string {
+	return MoshArgsWithSSHConfig(host, moshServer, "", argv)
+}
+
+// moshPlainPathChars are the characters a --ssh word may carry unquoted.
+const moshPlainPathChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/._-+@"
+
+// MoshArgsWithSSHConfig is MoshArgs for a remote with its own ssh_config
+// (a provider sandbox): mosh's bootstrap ssh passes it with -F. mosh splits
+// --ssh into words the way a shell does, so a path with anything but plain
+// path characters is single-quoted.
+func MoshArgsWithSSHConfig(host, moshServer, sshConfig string, argv []string) []string {
+	ssh := "--ssh=ssh"
+	sshConfig = strings.TrimSpace(sshConfig)
+	if cfg := sshConfig; cfg != "" {
+		if strings.ContainsFunc(cfg, func(r rune) bool { return !strings.ContainsRune(moshPlainPathChars, r) }) {
+			cfg = shellQuote(cfg)
+		}
+		ssh += " -F " + cfg
+	}
+	args := []string{
+		"--experimental-remote-ip=remote",
+		ssh + " -o ControlMaster=auto -o ControlPath=" + sshcontrol.ControlPathFor(sshConfig) + " -o ControlPersist=600 -o ConnectTimeout=10 -o BatchMode=yes",
+	}
+	if server := strings.TrimSpace(moshServer); server != "" {
+		args = append(args, "--server="+server)
+	}
+	args = append(args, host, "--")
+	return append(args, argv...)
+}
+
+// The launcher's ControlPath comes from internal/sshcontrol, the same helper
+// internal/session uses, so a remote attach launched via Shift+Enter shares
+// the same multiplexed connection as a normal in-TUI remote attach. Its socket
+// name is %C, a fixed-length hash, so a long user@host cannot push the path
+// past the unix socket limit (#2837). A sandbox remote (SSHConfig set) uses
+// sshcontrol.ControlPathFor, its own fixed-length socket, so it never rides
+// another remote's master that %C would match.
 
 // BuildAttachCommand returns the shell command string that, when executed
 // inside a fresh terminal window, attaches to the requested session.
 //
 // For local requests (Remote == nil) it produces a `tmux attach …`
-// invocation. For remote requests it produces an `ssh -tt …
+// invocation, run with the socket's [tmux.binaries] binary when it has one. For remote requests it produces an `ssh -tt …
 // '<agent-deck-path> [-p profile] session attach <name>'` invocation
 // that mirrors session.SSHRunner.Attach.
 //
@@ -104,7 +208,16 @@ func BuildAttachCommand(req AttachRequest) string {
 		return buildRemoteAttachCommand(name, req.Remote)
 	}
 	var b strings.Builder
-	b.WriteString("tmux")
+	// The socket's own binary ([tmux.binaries]), as on every other tmux
+	// call: a tmux client only talks to a server of its own version.
+	if bin := tmux.BinaryFor(req.SocketName); bin == "tmux" {
+		b.WriteString(bin)
+	} else {
+		b.WriteString(shellQuote(bin))
+	}
+	if req.ForceUTF8 {
+		b.WriteString(" -u")
+	}
 	if s := strings.TrimSpace(req.SocketName); s != "" {
 		b.WriteString(" -L ")
 		b.WriteString(shellQuote(s))
@@ -128,20 +241,56 @@ func buildRemoteAttachCommand(remoteName string, r *RemoteAttach) string {
 	if host == "" {
 		return ""
 	}
+	if cli, remote := strings.TrimSpace(r.LocalCLI), strings.TrimSpace(r.RemoteName); cli != "" && remote != "" {
+		parts := []string{shellQuote(cli)}
+		if p := strings.TrimSpace(r.LocalProfile); p != "" && p != "default" {
+			parts = append(parts, "-p", shellQuote(p))
+		}
+		parts = append(parts, "remote", "attach", shellQuote(remote), shellQuote(remoteName))
+		return strings.Join(parts, " ")
+	}
 	agentDeckPath := strings.TrimSpace(r.AgentDeckPath)
 	if agentDeckPath == "" {
 		agentDeckPath = "agent-deck"
 	}
 	profile := strings.TrimSpace(r.Profile)
 
+	sshConfig := strings.TrimSpace(r.SSHConfig)
+	sshCmd := buildRemoteSSHAttachCommand(host, agentDeckPath, profile, remoteName, sshConfig)
+	if !r.UsesMosh() {
+		return sshCmd
+	}
+
+	argv := []string{agentDeckPath}
+	if profile != "" && profile != "default" {
+		argv = append(argv, "-p", profile)
+	}
+	argv = append(argv, "session", "attach", remoteName)
+	parts := []string{"mosh"}
+	for _, arg := range MoshArgsWithSSHConfig(host, r.MoshServer, sshConfig, argv) {
+		parts = append(parts, shellQuote(arg))
+	}
+	// A remote without mosh-server attaches over ssh instead of failing with
+	// mosh's bootstrap errors. The probe reuses the ControlMaster, and both
+	// branches exec so the attach keeps the shell's pid (signals reach it).
+	probe := "ssh -n" + sshConfigFlag(sshConfig) + " -o ControlMaster=auto -o ControlPath=" + shellQuote(sshcontrol.ControlPathFor(sshConfig)) +
+		" -o ControlPersist=600 -o ConnectTimeout=10 -o BatchMode=yes " + shellQuote(host) + " " +
+		shellQuote(MoshServerProbe(r.MoshServer))
+	script := "if " + probe + " >/dev/null 2>&1; then exec " + strings.Join(parts, " ") + "; else exec " + sshCmd + "; fi"
+	return "/bin/sh -c " + shellQuote(script)
+}
+
+// buildRemoteSSHAttachCommand is the ssh command line for a remote attach.
+func buildRemoteSSHAttachCommand(host, agentDeckPath, profile, remoteName, sshConfig string) string {
 	// ssh with -tt (force remote PTY) and the same ControlMaster flags
 	// as the in-TUI remote attach, so the multiplexed connection is
 	// reused.
 	var b strings.Builder
 	b.WriteString("ssh -tt")
+	b.WriteString(sshConfigFlag(sshConfig))
 	b.WriteString(" -o ControlMaster=auto")
 	b.WriteString(" -o ControlPath=")
-	b.WriteString(shellQuote(SSHControlDir + "/%r@%h:%p"))
+	b.WriteString(shellQuote(sshcontrol.ControlPathFor(sshConfig)))
 	b.WriteString(" -o ControlPersist=600")
 	b.WriteString(" ")
 	b.WriteString(shellQuote(host))
@@ -154,6 +303,15 @@ func buildRemoteAttachCommand(remoteName string, r *RemoteAttach) string {
 	b.WriteString(" session attach ")
 	b.WriteString(shellQuote(remoteName))
 	return b.String()
+}
+
+// sshConfigFlag is " -F '<path>'" for a remote with its own ssh_config,
+// else "".
+func sshConfigFlag(sshConfig string) string {
+	if sshConfig == "" {
+		return ""
+	}
+	return " -F " + shellQuote(sshConfig)
 }
 
 // shellQuote single-quotes s for safe use in a /bin/sh command. It is

@@ -6,11 +6,15 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/asheshgoplani/agent-deck/internal/sandboxguard"
+	"github.com/asheshgoplani/agent-deck/internal/send"
+	"github.com/asheshgoplani/agent-deck/internal/termtext"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
 // claudeSessionMeta is the subset of ~/.claude/sessions/<PID>.json that
-// agent-deck reads for title sync (issue #572).
+// agent-deck reads for title sync (issue #572) and, as of #2089, for the
+// Claude messaging-socket send transport.
 type claudeSessionMeta struct {
 	SessionID string `json:"sessionId"`
 	Name      string `json:"name"`
@@ -19,39 +23,44 @@ type claudeSessionMeta struct {
 	// ("derived"). Only user renames are real intent; see ClaudeSessionNameIn.
 	NameSource string `json:"nameSource"`
 	UpdatedAt  *int64 `json:"updatedAt"` // unix ms; nil when absent
+	// Cwd is the working directory of the Claude process that wrote the
+	// record. Title sync uses it to reject a record written by a Claude
+	// running outside the instance's project (issue #2678).
+	Cwd string `json:"cwd"`
+
+	// The fields below are read for ClaudeSessionRecordIn (#2089) and are not
+	// used by the title-sync path.
+	Pid                 int    `json:"pid"`
+	ProcStart           string `json:"procStart"`   // `LC_ALL=C TZ=UTC ps -o lstart= -p <pid>`
+	ProcStartFt         string `json:"procStartFt"` // Linux-side twin of ProcStart
+	PeerProtocol        int    `json:"peerProtocol"`
+	MessagingSocketPath string `json:"messagingSocketPath"`
 }
 
-// ClaudeSessionNameIn scans claudeDir/sessions/*.json and returns the trimmed
-// `name` of the entry whose sessionId matches. Empty string when there's no
-// match, no name, or the sessions dir is unreadable.
+// freshestClaudeSessionMetaIn scans claudeDir/sessions/*.json and returns the
+// entry whose sessionId matches sessionID with the highest updatedAt
+// (falling back to file mtime). ok is false when there's no match or the
+// sessions dir is unreadable.
 //
 // The files are per-PID, so a resumed session can match several entries — the
-// live process plus stale files left by earlier runs. The freshest entry (by
-// updatedAt, falling back to file mtime) is authoritative, even when its name
-// is empty: returning a stale file's old name would re-sync a title the user
-// has since changed or cleared.
+// live process plus stale files left by earlier runs. The freshest entry is
+// authoritative, even when its name is empty: returning a stale file's old
+// name would re-sync a title the user has since changed or cleared.
 //
-// Issue #572: Claude Code writes per-process metadata here when the user starts
-// with `claude --name X` or runs `/rename X` mid-session. claudeDir is an
-// explicit parameter so tests can point it at a temp dir.
-//
-// Claude Code 2.1.19x also auto-derives a name from the cwd folder and stamps
-// nameSource="derived". That is not a user rename, so a derived name is treated
-// as no name at all — including on the freshest entry, where it suppresses any
-// stale user name (mirrors the freshest-unnamed rule). A name with no
-// nameSource (older Claude) is always a user rename, so it is honored.
-func ClaudeSessionNameIn(claudeDir, sessionID string) string {
+// claudeDir is an explicit parameter so tests can point it at a temp dir.
+func freshestClaudeSessionMetaIn(claudeDir, sessionID string) (claudeSessionMeta, bool) {
 	claudeDir = strings.TrimSpace(claudeDir)
 	sessionID = strings.TrimSpace(sessionID)
 	if claudeDir == "" || sessionID == "" {
-		return ""
+		return claudeSessionMeta{}, false
 	}
 	entries, err := os.ReadDir(filepath.Join(claudeDir, "sessions"))
 	if err != nil {
-		return ""
+		return claudeSessionMeta{}, false
 	}
-	bestName := ""
+	var best claudeSessionMeta
 	bestTime := int64(-1)
+	found := false
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
 			continue
@@ -75,26 +84,167 @@ func ClaudeSessionNameIn(claudeDir, sessionID string) string {
 		}
 		if ts > bestTime {
 			bestTime = ts
-			// A folder-derived name is not user intent: treat it as unnamed so it
-			// neither syncs nor lets a stale named entry win.
-			if meta.NameSource == "derived" {
-				bestName = ""
-			} else {
-				bestName = strings.TrimSpace(meta.Name)
-			}
+			best = meta
+			found = true
 		}
 	}
-	return bestName
+	return best, found
+}
+
+// ClaudeSessionNameIn scans claudeDir/sessions/*.json and returns the trimmed
+// `name` of the entry whose sessionId matches. Empty string when there's no
+// match, no name, or the sessions dir is unreadable.
+//
+// Issue #572: Claude Code writes per-process metadata here when the user starts
+// with `claude --name X` or runs `/rename X` mid-session. claudeDir is an
+// explicit parameter so tests can point it at a temp dir.
+//
+// Claude Code 2.1.19x also auto-derives a name from the cwd folder and stamps
+// nameSource="derived". That is not a user rename, so a derived name is treated
+// as no name at all — including on the freshest entry, where it suppresses any
+// stale user name (mirrors the freshest-unnamed rule). A name with no
+// nameSource (older Claude) is always a user rename, so it is honored.
+func ClaudeSessionNameIn(claudeDir, sessionID string) string {
+	name, _ := claudeSessionNameAndCwdIn(claudeDir, sessionID)
+	return name
+}
+
+// claudeSessionNameAndCwdIn is ClaudeSessionNameIn plus the cwd recorded on
+// the same winning (freshest) entry, so the name and the cwd it is checked
+// against always come from one record (issue #2678).
+func claudeSessionNameAndCwdIn(claudeDir, sessionID string) (name, cwd string) {
+	meta, ok := freshestClaudeSessionMetaIn(claudeDir, sessionID)
+	if !ok {
+		return "", ""
+	}
+	cwd = strings.TrimSpace(meta.Cwd)
+	// A folder-derived name is not user intent: treat it as unnamed so it
+	// neither syncs nor lets a stale named entry win.
+	if meta.NameSource == "derived" {
+		return "", cwd
+	}
+	return strings.TrimSpace(meta.Name), cwd
 }
 
 // ClaudeSessionName resolves the user's ~/.claude and returns the Claude
 // session name for sessionID. Empty string on any error or no match.
 func ClaudeSessionName(sessionID string) string {
-	home, err := os.UserHomeDir()
+	dir, err := sandboxguard.HomeJoin("Claude config dir (~/.claude)", ".claude")
 	if err != nil {
 		return ""
 	}
-	return ClaudeSessionNameIn(filepath.Join(home, ".claude"), sessionID)
+	return ClaudeSessionNameIn(dir, sessionID)
+}
+
+// ClaudeSessionNameAndCwd resolves the user's ~/.claude and returns the Claude
+// session name for sessionID together with the cwd of the record it came from.
+func ClaudeSessionNameAndCwd(sessionID string) (name, cwd string) {
+	dir, err := sandboxguard.HomeJoin("Claude config dir (~/.claude)", ".claude")
+	if err != nil {
+		return "", ""
+	}
+	return claudeSessionNameAndCwdIn(dir, sessionID)
+}
+
+// ClaudeSessionRecord is the subset of ~/.claude/sessions/<pid>.json
+// agent-deck needs to deliver a message over Claude Code's messaging socket
+// (#2089). It is a type alias for send.ClaudeSocketRecord, not a separate
+// struct: internal/session already imports internal/send (instance.go, for
+// the #1777 Enter-attribution machinery), so defining the record once in
+// internal/send and aliasing it here avoids both an import cycle and a
+// field-by-field mirror that can silently drift out of sync. See
+// internal/send/claudesocket.go for the transport that consumes it.
+type ClaudeSessionRecord = send.ClaudeSocketRecord
+
+// ClaudeSessionRecordIn scans claudeDir/sessions/*.json and returns the
+// freshest record whose sessionId matches sessionID. ok is false when
+// there's no match or the sessions dir is unreadable — the selector, not
+// this reader, decides what to do about a record with an empty
+// MessagingSocketPath or a PeerProtocol below the minimum.
+func ClaudeSessionRecordIn(claudeDir, sessionID string) (ClaudeSessionRecord, bool) {
+	meta, ok := freshestClaudeSessionMetaIn(claudeDir, sessionID)
+	if !ok {
+		return ClaudeSessionRecord{}, false
+	}
+	return ClaudeSessionRecord{
+		Pid:                 meta.Pid,
+		SessionID:           meta.SessionID,
+		ProcStart:           meta.ProcStart,
+		ProcStartFt:         meta.ProcStartFt,
+		PeerProtocol:        meta.PeerProtocol,
+		MessagingSocketPath: meta.MessagingSocketPath,
+	}, true
+}
+
+// ClaudeSessionRecordsIn scans claudeDir/sessions/*.json and returns EVERY
+// record whose sessionId matches sessionID, in no particular order — the
+// per-PID files mean a resumed or forked conversation legitimately matches
+// several. Unlike ClaudeSessionRecordIn it applies no freshest-wins rule:
+// the send path must see all the candidates so it can disambiguate them by
+// pane-tree membership rather than by timestamp, which can point at the
+// wrong live process (maintainer review of #2100). Returns nil when there
+// is no match or the sessions dir is unreadable.
+func ClaudeSessionRecordsIn(claudeDir, sessionID string) []ClaudeSessionRecord {
+	claudeDir = strings.TrimSpace(claudeDir)
+	sessionID = strings.TrimSpace(sessionID)
+	if claudeDir == "" || sessionID == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(filepath.Join(claudeDir, "sessions"))
+	if err != nil {
+		return nil
+	}
+	var records []ClaudeSessionRecord
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(claudeDir, "sessions", entry.Name()))
+		if err != nil {
+			continue
+		}
+		var meta claudeSessionMeta
+		if err := json.Unmarshal(data, &meta); err != nil {
+			continue
+		}
+		if meta.SessionID != sessionID {
+			continue
+		}
+		records = append(records, ClaudeSessionRecord{
+			Pid:                 meta.Pid,
+			SessionID:           meta.SessionID,
+			ProcStart:           meta.ProcStart,
+			ProcStartFt:         meta.ProcStartFt,
+			PeerProtocol:        meta.PeerProtocol,
+			MessagingSocketPath: meta.MessagingSocketPath,
+		})
+	}
+	return records
+}
+
+// ClaudeConfigDirForSend returns the Claude config directory a send to inst
+// must resolve session records under: the instance's own resolved dir
+// (account > conductor > group > env > profile > global > ~/.claude), with
+// the worker-scratch override applied exactly as the spawn path applies it.
+// The send path used $HOME/.claude unconditionally, which reads a different
+// account's records than the session it is addressing (maintainer review of
+// #2100). Kept next to the record readers because it is the dir they must
+// be given.
+func ClaudeConfigDirForSend(inst *Instance) string {
+	if inst == nil {
+		return ""
+	}
+	return inst.applyWorkerScratchOverride(GetClaudeConfigDirForInstance(inst))
+}
+
+// ClaudeSessionRecordFor resolves the user's ~/.claude and returns the
+// Claude session record for sessionID. Mirrors ClaudeSessionName.
+func ClaudeSessionRecordFor(sessionID string) (ClaudeSessionRecord, bool) {
+	dir, err := sandboxguard.HomeJoin("Claude config dir (~/.claude)", ".claude")
+	if err != nil {
+		return ClaudeSessionRecord{}, false
+	}
+	return ClaudeSessionRecordIn(dir, sessionID)
 }
 
 // ResolveTitleFromClaude is the pure decision half of ReconcileTitleFromClaude:
@@ -119,11 +269,34 @@ func (i *Instance) ResolveTitleFromClaude(sessionID string) (string, bool) {
 	if cfg, err := LoadUserConfig(); err == nil && cfg != nil && !cfg.GetSyncTitle() {
 		return "", false
 	}
-	name := ClaudeSessionName(sessionID)
+	name, cwd := ClaudeSessionNameAndCwd(sessionID)
+	// Titles are stored cleaned; compare the cleaned name, or a name with a
+	// control character would differ forever and be rewritten on every hook.
+	name = termtext.Clean(name)
 	if name == "" || name == i.Title {
 		return "", false
 	}
+	// Issue #2678: the record may belong to a Claude running in another
+	// project (a foreign session id reached this instance). Reject a name
+	// whose record cwd is provably outside every path the instance owns. An
+	// empty cwd, or an instance that declares no path at all, is no evidence:
+	// hookCwdIsForeign calls everything foreign in the latter case, which is
+	// right for binding but would disable title sync for that session.
+	if cwd != "" && i.declaresAnyPath() && i.hookCwdIsForeign(cwd) {
+		return "", false
+	}
 	return name, true
+}
+
+// declaresAnyPath reports whether the instance declares at least one owned
+// path (working dir, project path or an additional path).
+func (i *Instance) declaresAnyPath() bool {
+	for _, p := range append([]string{i.EffectiveWorkingDir()}, i.AllProjectPaths()...) {
+		if strings.TrimSpace(p) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // ReconcileTitleFromClaude refreshes i.Title from the agent's current Claude
@@ -152,8 +325,8 @@ func (i *Instance) ReconcileTitleFromClaude(sessionID string) (string, bool) {
 	}
 	i.SetTitleThreadSafe(name)
 	i.SyncTmuxDisplayName()
-	if tmuxSess := i.GetTmuxSession(); tmuxSess != nil && tmuxSess.Name != "" {
-		_ = tmux.WriteBadgeUpdate(tmuxSess.Name, name)
+	if tmuxSess := i.GetTmuxSession(); tmuxSess != nil && tmuxSess.TmuxName() != "" {
+		_ = tmux.WriteBadgeUpdate(tmuxSess.TmuxName(), name)
 	}
 	return name, true
 }

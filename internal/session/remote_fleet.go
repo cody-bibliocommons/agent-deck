@@ -49,7 +49,7 @@ type RemoteFleetCounts struct {
 }
 
 type remoteFleetRunner interface {
-	FetchSessions(context.Context) ([]RemoteSessionInfo, error)
+	FetchSessions(context.Context) ([]RemoteSessionInfo, *ListStats, error)
 	MeasureLatency(context.Context) (time.Duration, error)
 }
 
@@ -223,7 +223,7 @@ func (s *RemoteFleetScanner) scanRemote(ctx context.Context, name string, config
 	remoteCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	runner := s.newRunner(name, config)
-	sessions, err := runner.FetchSessions(remoteCtx)
+	sessions, _, err := runner.FetchSessions(remoteCtx)
 	if err != nil {
 		s.mu.RLock()
 		prior, hadPrior := s.states[name]
@@ -302,8 +302,14 @@ func countRemoteFleet(remotes []RemoteFleetRemote) RemoteFleetCounts {
 		} else {
 			counts.RemotesOffline++
 		}
-		counts.Sessions += len(remote.Sessions)
 		for _, remoteSession := range remote.Sessions {
+			// An archived session keeps a live-looking status: leave it out of
+			// the counts, as `remote sessions` text output does (#2972). The
+			// row stays in Sessions with "archived": true.
+			if remoteSession.Archived {
+				continue
+			}
+			counts.Sessions++
 			switch remoteSession.Status {
 			case "running", "starting":
 				counts.Running++

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/ui"
 )
 
@@ -19,6 +20,8 @@ func TestTmuxAvailable(t *testing.T) {
 }
 
 func TestHomeInit(t *testing.T) {
+	previousDB := statedb.GetGlobal()
+	t.Cleanup(func() { statedb.SetGlobal(previousDB) })
 	home := ui.NewHome()
 	if home == nil {
 		t.Fatal("NewHome() returned nil")
@@ -26,6 +29,8 @@ func TestHomeInit(t *testing.T) {
 }
 
 func TestHomeView(t *testing.T) {
+	previousDB := statedb.GetGlobal()
+	t.Cleanup(func() { statedb.SetGlobal(previousDB) })
 	home := ui.NewHome()
 	view := home.View()
 	if view == "" {
@@ -77,7 +82,7 @@ func TestNestedSessionAllowsCLICommands(t *testing.T) {
 		subcommands := []string{
 			"add", "list", "ls", "remove", "rm", "status",
 			"session", "mcp", "skill", "group", "try", "worktree", "wt",
-			"profile", "update", "mcp-proxy", "web", "uninstall", "migrate-paths", "hooks", "codex-hooks", "codex-notify", "gemini-hooks", "cursor-hooks",
+			"profile", "update", "mcp-proxy", "web", "uninstall", "migrate-paths", "hooks", "codex-hooks", "codex-notify", "gemini-hooks", "cursor-hooks", "pi-hooks",
 			"version", "--version", "-v",
 			"help", "--help", "-h",
 		}

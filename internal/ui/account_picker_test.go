@@ -239,9 +239,9 @@ func TestEditSessionDialogAccountRowHiddenWithoutAccounts(t *testing.T) {
 	}
 }
 
-// The conversation migration only makes sense for `claude --resume`, so a
-// non-claude session must not be offered the row (SwitchAccount would refuse
-// it at commit time).
+// Account selection belongs to the requested target harness. A Codex source
+// therefore receives the target-account row even when its current harness has
+// no configured named slots; "inherit" is the only valid current-target value.
 func TestEditSessionDialogAccountRowClaudeOnly(t *testing.T) {
 	withAccountsConfig(t, "work")
 
@@ -251,10 +251,13 @@ func TestEditSessionDialogAccountRowClaudeOnly(t *testing.T) {
 
 	d := NewEditSessionDialog()
 	d.Show(inst)
-	for _, f := range d.fields {
-		if f.key == session.FieldAccount {
-			t.Fatal("a non-claude session must not get the account row")
-		}
+	idx := accountFieldIndex(t, d)
+	field := d.fields[idx]
+	if len(field.pillOptions) != 1 || field.pillOptions[0] != "" {
+		t.Fatalf("Codex target account picker = %#v, want inherit-only", field.pillOptions)
+	}
+	if !strings.Contains(field.label, "Account for selected harness") {
+		t.Fatalf("account row label = %q, want target-harness disclosure", field.label)
 	}
 }
 
@@ -277,6 +280,16 @@ func TestEditSessionDialogCommitRoutesAccountThroughSwitch(t *testing.T) {
 	home.instancesMu.Unlock()
 	home.groupTree = session.NewGroupTree(home.instances)
 	home.rebuildFlatItems()
+	// The switch now persists its own account mutation atomically with the
+	// transcript install (instead of relying solely on a later, skippable
+	// caller-side commit), so the storage row must exist beforehand exactly
+	// like it would for any real, already-saved session.
+	if home.storage == nil {
+		t.Fatal("test setup requires a real storage instance")
+	}
+	if err := home.storage.Save([]*session.Instance{inst}); err != nil {
+		t.Fatalf("seed storage: %v", err)
+	}
 
 	home.editSessionDialog.SetSize(home.width, home.height)
 	home.editSessionDialog.Show(inst)
@@ -293,9 +306,22 @@ func TestEditSessionDialogCommitRoutesAccountThroughSwitch(t *testing.T) {
 	home.editSessionDialog.focusIndex = idx
 	home.editSessionDialog.Update(tea.KeyMsg{Type: tea.KeyRight}) // personal -> work
 
+	// A same-harness account change is a stop + conversation move + restart:
+	// Enter asks first (the cross-harness path already does), and the Switch
+	// button runs the switch.
 	_, cmd := home.handleEditSessionDialogKey(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd != nil || !home.confirmDialog.IsVisible() || home.confirmDialog.GetConfirmType() != ConfirmSwitchAccount {
+		t.Fatal("Enter on a changed account row must ask for confirmation before switching")
+	}
+	if !home.editSessionDialog.IsVisible() || inst.Account != "personal" {
+		t.Fatal("while the confirmation is open the dialog stays and nothing is written")
+	}
+	_, cmd = home.handleConfirmDialogKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
 	if cmd == nil {
-		t.Fatal("committing an account change must return the switch command")
+		t.Fatal("confirming the account change must return the switch command")
+	}
+	if home.confirmDialog.IsVisible() {
+		t.Fatal("the confirmation must close once accepted")
 	}
 	// The switch flow captures the SOURCE config dir from the pre-switch
 	// account. If the generic SetField loop wrote the field first, that capture
@@ -394,17 +420,44 @@ func TestEditSessionDialogKeepsUnconfiguredAccountPill(t *testing.T) {
 	}
 }
 
-// Switching account and changing tool in one submit cannot both apply: the
-// switch is claude-only. Refuse the pair before anything is written rather
-// than persisting the tool and then failing the switch.
+// A supported harness/account pair is a lossy fresh-target transfer, not a
+// direct same-instance account write. Submitting it must leave the source
+// untouched and show the explicit loss confirmation before any lifecycle work.
 func TestEditSessionDialogRefusesAccountSwitchWithToolChange(t *testing.T) {
-	withAccountsConfig(t, "work", "personal")
+	cfg := withAccountsConfig(t, "work", "personal")
+	// A cross-harness preview refuses when the target CLI is not on PATH;
+	// this test is about the loss confirmation, so give it a stub codex.
+	fakeBin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(fakeBin, "codex"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	work := cfg.Profiles["work"]
+	work.Codex = session.ProfileCodexSettings{ConfigDir: filepath.Join(t.TempDir(), "codex-work")}
+	cfg.Profiles["work"] = work
+	if err := session.SaveUserConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	session.ClearUserConfigCache()
 
 	home := NewHome()
 	home.width, home.height = 120, 40
 
-	inst := session.NewInstanceWithTool("acct-tool", t.TempDir(), "claude")
+	project := t.TempDir()
+	const sourceSessionID = "11111111-2222-3333-4444-555555555555"
+	inst := session.NewInstanceWithTool("acct-tool", project, "claude")
 	inst.Account = "personal"
+	inst.ClaudeSessionID = sourceSessionID
+	// Cross-harness confirmation is gated on an exact, exportable source
+	// transcript. Seed the native Claude identity rather than weakening that
+	// safety gate for an otherwise fresh-session fixture.
+	transcript := filepath.Join(cfg.Profiles["personal"].Claude.ConfigDir, "projects", session.ConvertToClaudeDirName(project), sourceSessionID+".jsonl")
+	if err := os.MkdirAll(filepath.Dir(transcript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(transcript, []byte(`{"sessionId":"`+sourceSessionID+`","type":"user","message":{"role":"user","content":"seeded source context"}}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	home.instancesMu.Lock()
 	home.instances = []*session.Instance{inst}
 	home.instanceByID[inst.ID] = inst
@@ -415,25 +468,55 @@ func TestEditSessionDialogRefusesAccountSwitchWithToolChange(t *testing.T) {
 	home.editSessionDialog.SetSize(home.width, home.height)
 	home.editSessionDialog.Show(inst)
 
-	// Move the account row to "work" and the tool row to shell.
+	// Select work, then select the supported Codex target. Tool navigation
+	// refreshes the picker, preserving work only because Codex configures it.
 	home.editSessionDialog.focusIndex = accountFieldIndex(t, home.editSessionDialog)
 	home.editSessionDialog.Update(tea.KeyMsg{Type: tea.KeyRight})
 	for i, f := range home.editSessionDialog.fields {
-		if f.key == session.FieldTool {
-			home.editSessionDialog.focusIndex = i
-			home.editSessionDialog.fields[i].pillCursor = 0 // shell
+		if f.key != session.FieldTool {
+			continue
 		}
+		home.editSessionDialog.focusIndex = i
+		for attempts := 0; attempts < len(f.pillOptions); attempts++ {
+			if home.editSessionDialog.fields[i].pillOptions[home.editSessionDialog.fields[i].pillCursor] == "codex" {
+				break
+			}
+			home.editSessionDialog.Update(tea.KeyMsg{Type: tea.KeyRight})
+		}
+		if home.editSessionDialog.fields[i].pillOptions[home.editSessionDialog.fields[i].pillCursor] != "codex" {
+			t.Fatal("Codex is not available in the edit tool picker")
+		}
+	}
+	// Navigating through an unsupported tool clears a now-invalid account slot.
+	// Once Codex is selected, choose its configured work slot through the same
+	// keyboard path a user takes and lock the exact selected value before Enter.
+	home.editSessionDialog.focusIndex = accountFieldIndex(t, home.editSessionDialog)
+	accountField := &home.editSessionDialog.fields[home.editSessionDialog.focusIndex]
+	for attempts := 0; attempts < len(accountField.pillOptions); attempts++ {
+		if accountField.pillOptions[accountField.pillCursor] == "work" {
+			break
+		}
+		home.editSessionDialog.Update(tea.KeyMsg{Type: tea.KeyRight})
+	}
+	if got := accountField.pillOptions[accountField.pillCursor]; got != "work" {
+		t.Fatalf("selected Codex account = %q, want work", got)
 	}
 
 	_, cmd := home.handleEditSessionDialogKey(tea.KeyMsg{Type: tea.KeyEnter})
 	if cmd != nil {
-		t.Error("the conflicting submit must not start a switch")
+		t.Error("loss confirmation must precede a cross-harness switch")
 	}
-	if !home.editSessionDialog.IsVisible() {
-		t.Error("the dialog must stay open so the user can resolve the conflict")
+	if home.editSessionDialog.IsVisible() {
+		t.Error("the edit dialog must yield to the loss confirmation")
+	}
+	if !home.confirmDialog.IsVisible() || home.confirmDialog.GetConfirmType() != ConfirmCrossHarnessTransfer {
+		t.Fatal("supported target harness/account change must require loss confirmation")
+	}
+	if home.confirmDialog.TargetHarness() != "codex" || home.confirmDialog.TargetAccount() != "work" {
+		t.Fatalf("confirmation target = %q/%q, want codex/work", home.confirmDialog.TargetHarness(), home.confirmDialog.TargetAccount())
 	}
 	if inst.Account != "personal" || inst.Tool != "claude" {
-		t.Errorf("nothing must be written: account=%q tool=%q", inst.Account, inst.Tool)
+		t.Errorf("confirmation must not mutate source: account=%q tool=%q", inst.Account, inst.Tool)
 	}
 }
 
@@ -469,4 +552,260 @@ func accountFieldIndex(t *testing.T, d *EditSessionDialog) int {
 	}
 	t.Fatal("expected an account row")
 	return -1
+}
+
+// Declining the "Switch Account?" confirmation returns to the Edit Session
+// dialog with focus on the account row and nothing written; the row's footer
+// says that Enter asks first.
+func TestEditSessionDialogAccountSwitchCancelReturnsToRow(t *testing.T) {
+	withAccountsConfig(t, "work", "personal")
+
+	home := NewHome()
+	home.width, home.height = 120, 40
+
+	inst := session.NewInstanceWithTool("acct-cancel", t.TempDir(), "claude")
+	inst.Account = "personal"
+	home.instancesMu.Lock()
+	home.instances = []*session.Instance{inst}
+	home.instanceByID[inst.ID] = inst
+	home.instancesMu.Unlock()
+	home.groupTree = session.NewGroupTree(home.instances)
+	home.rebuildFlatItems()
+
+	home.editSessionDialog.SetSize(home.width, home.height)
+	home.editSessionDialog.Show(inst)
+	idx := accountFieldIndex(t, home.editSessionDialog)
+	home.editSessionDialog.focusIndex = idx
+	if view := stripAnsi(home.editSessionDialog.View()); !strings.Contains(view, "Enter save") || strings.Contains(view, "asks first") {
+		t.Fatalf("unchanged account row must offer a plain save:\n%s", view)
+	}
+	home.editSessionDialog.Update(tea.KeyMsg{Type: tea.KeyRight}) // personal -> work
+	if view := stripAnsi(home.editSessionDialog.View()); !strings.Contains(view, "Enter switch (asks first)") {
+		t.Fatalf("changed account row footer must say Enter asks first:\n%s", view)
+	}
+	home.editSessionDialog.focusIndex = 0 // wander off to Title before saving
+
+	home.handleEditSessionDialogKey(tea.KeyMsg{Type: tea.KeyEnter})
+	if !home.confirmDialog.IsVisible() {
+		t.Fatal("precondition: confirmation open")
+	}
+	view := stripAnsi(home.confirmDialog.View())
+	for _, want := range []string{"Switch Account?", "personal", "work", "acct-cancel", "conversation"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("confirmation lacks %q:\n%s", want, view)
+		}
+	}
+
+	_, cmd := home.handleConfirmDialogKey(tea.KeyMsg{Type: tea.KeyEsc})
+	if cmd != nil {
+		t.Fatal("declining must not start a switch")
+	}
+	if home.confirmDialog.IsVisible() || !home.editSessionDialog.IsVisible() {
+		t.Fatal("decline must close the confirmation and keep the Edit Session dialog open")
+	}
+	if home.editSessionDialog.focusIndex != idx {
+		t.Fatalf("focus after decline = %d, want the account row %d", home.editSessionDialog.focusIndex, idx)
+	}
+	if inst.Account != "personal" {
+		t.Fatalf("account = %q after decline, want personal", inst.Account)
+	}
+}
+
+// withDefaultAccountConfig is withAccountsConfig plus [claude].default_account
+// (#2895), and lets the caller add group or conductor overrides before save.
+func withDefaultAccountConfig(t *testing.T, defaultAccount string, edit func(*session.UserConfig), accounts ...string) {
+	t.Helper()
+	cfg := withAccountsConfig(t, accounts...)
+	cfg.Claude.DefaultAccount = defaultAccount
+	if edit != nil {
+		edit(cfg)
+	}
+	if err := session.SaveUserConfig(cfg); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+	session.ClearUserConfigCache()
+}
+
+// #2895: with [claude].default_account set, every opening starts on that slot
+// instead of inherit, and the pill says it is the default.
+func TestNewDialogAccountPreselectsConfiguredDefault(t *testing.T) {
+	withDefaultAccountConfig(t, "work", nil, "ai", "it", "work")
+
+	d := NewNewDialog()
+	d.SetDefaultTool("claude")
+	d.SetSize(120, 50)
+	d.ShowInGroup("projects", "Projects", "/tmp", nil, "")
+
+	if got := d.GetClaudeAccount(); got != "work" {
+		t.Fatalf("GetClaudeAccount() = %q, want the configured default \"work\"", got)
+	}
+	view := stripAnsi(d.claudeOptions.View())
+	if !strings.Contains(view, "work (default)") {
+		t.Fatalf("the default slot's pill must read \"work (default)\":\n%s", view)
+	}
+	if strings.Contains(view, "ai (default)") || strings.Contains(view, "inherit (default)") {
+		t.Fatalf("only the configured slot may carry the default label:\n%s", view)
+	}
+
+	// ←/→ still reaches inherit and every slot.
+	p := d.claudeOptions
+	p.focusIndex = p.getFocusCount() - 1
+	seen := map[string]bool{}
+	for i := 0; i < 4; i++ {
+		p.Update(tea.KeyMsg{Type: tea.KeyRight})
+		seen[p.GetAccount()] = true
+	}
+	for _, want := range []string{"", "ai", "it", "work"} {
+		if !seen[want] {
+			t.Errorf("cycling never reached %q (saw %v)", want, seen)
+		}
+	}
+}
+
+// #2895 keeps the #924/#2152 no-leak rule: a one-off pick (another slot, or
+// inherit) is not remembered; the next opening returns to the default.
+func TestNewDialogOneOffAccountRevertsToDefault(t *testing.T) {
+	withDefaultAccountConfig(t, "work", nil, "ai", "work")
+
+	d := NewNewDialog()
+	d.SetDefaultTool("claude")
+	d.SetSize(120, 50)
+	for _, oneOff := range []string{"ai", ""} {
+		d.ShowInGroup("projects", "Projects", "/tmp", nil, "")
+		d.claudeOptions.SetAccount(oneOff)
+		if got := d.GetClaudeAccount(); got != oneOff {
+			t.Fatalf("one-off pick = %q, want %q", got, oneOff)
+		}
+		d.Hide()
+		d.ShowInGroup("projects", "Projects", "/tmp", nil, "")
+		if got := d.GetClaudeAccount(); got != "work" {
+			t.Errorf("after a one-off %q the next opening carries %q, want the default \"work\"", oneOff, got)
+		}
+		d.Hide()
+	}
+}
+
+// A group or conductor config_dir is scoped more narrowly than a machine-wide
+// default, and Instance.Account would beat it, so the dialog starts on inherit
+// there.
+func TestNewDialogDefaultAccountYieldsToGroupConfigDir(t *testing.T) {
+	withDefaultAccountConfig(t, "work", func(cfg *session.UserConfig) {
+		cfg.Groups = map[string]session.GroupSettings{
+			"pinned": {Claude: session.GroupClaudeSettings{ConfigDir: "/tmp/claude-pinned"}},
+		}
+		cfg.Conductors = map[string]session.ConductorOverrides{
+			"ops": {Claude: session.ConductorClaudeSettings{ConfigDir: "/tmp/claude-ops"}},
+		}
+	}, "ai", "work")
+
+	d := NewNewDialog()
+	d.SetDefaultTool("claude")
+	d.SetSize(120, 50)
+
+	d.ShowInGroup("pinned", "Pinned", "/tmp", nil, "")
+	if got := d.GetClaudeAccount(); got != "" {
+		t.Errorf("group with config_dir: account = %q, want inherit", got)
+	}
+	d.Hide()
+
+	d.ShowInGroup("pinned/child", "Child", "/tmp", nil, "")
+	if got := d.GetClaudeAccount(); got != "" {
+		t.Errorf("subgroup of a group with config_dir: account = %q, want inherit", got)
+	}
+	d.Hide()
+
+	ops := &session.Instance{ID: "cond-ops", Title: "conductor-ops", IsConductor: true, ConductorName: "ops"}
+	d.ShowInGroup("projects", "Projects", "/tmp", []*session.Instance{ops}, ops.ID)
+	if got := d.GetClaudeAccount(); got != "" {
+		t.Errorf("conductor parent with config_dir: account = %q, want inherit", got)
+	}
+	d.Hide()
+
+	d.ShowInGroup("projects", "Projects", "/tmp", []*session.Instance{ops}, "")
+	if got := d.GetClaudeAccount(); got != "work" {
+		t.Errorf("no override in play: account = %q, want the default \"work\"", got)
+	}
+}
+
+// Moving the Parent row onto or off a conductor with its own config_dir
+// re-applies the rule while the Account row is untouched; a pick the user
+// made on the Account row is never overwritten.
+func TestNewDialogDefaultAccountFollowsConductorPick(t *testing.T) {
+	withDefaultAccountConfig(t, "work", func(cfg *session.UserConfig) {
+		cfg.Conductors = map[string]session.ConductorOverrides{
+			"ops": {Claude: session.ConductorClaudeSettings{ConfigDir: "/tmp/claude-ops"}},
+		}
+	}, "ai", "work")
+	ops := &session.Instance{ID: "cond-ops", Title: "conductor-ops", IsConductor: true, ConductorName: "ops"}
+
+	d := NewNewDialog()
+	d.SetDefaultTool("claude")
+	d.SetSize(120, 50)
+	d.ShowInGroup("projects", "Projects", "/tmp", []*session.Instance{ops}, "")
+	if got := d.GetClaudeAccount(); got != "work" {
+		t.Fatalf("no parent: account = %q, want the default \"work\"", got)
+	}
+	d.focusIndex = d.indexOf(focusConductor)
+	d.updateFocus()
+
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if d.GetParentSessionID() != ops.ID {
+		t.Fatalf("parent = %q, want %q", d.GetParentSessionID(), ops.ID)
+	}
+	if got := d.GetClaudeAccount(); got != "" {
+		t.Fatalf("moved onto a conductor with config_dir: account = %q, want inherit", got)
+	}
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyUp})
+	if got := d.GetClaudeAccount(); got != "work" {
+		t.Fatalf("moved back to no parent: account = %q, want the default \"work\"", got)
+	}
+
+	// A pick on the Account row stays put when the parent changes.
+	d.claudeOptions.cycleAccount(-1) // work -> ai, as a left arrow on the row
+	if got := d.GetClaudeAccount(); got != "ai" {
+		t.Fatalf("cycle: account = %q, want \"ai\"", got)
+	}
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if got := d.GetClaudeAccount(); got != "ai" {
+		t.Fatalf("user pick overwritten on parent change: account = %q, want \"ai\"", got)
+	}
+}
+
+// A default naming a slot that was removed from config.toml lands on inherit
+// (and is logged) rather than on some neighbour, and no pill claims it.
+func TestNewDialogUnknownDefaultAccountFallsBackToInherit(t *testing.T) {
+	withDefaultAccountConfig(t, "gone", nil, "ai", "work")
+
+	d := NewNewDialog()
+	d.SetDefaultTool("claude")
+	d.SetSize(120, 50)
+	d.ShowInGroup("projects", "Projects", "/tmp", nil, "")
+
+	if got := d.GetClaudeAccount(); got != "" {
+		t.Fatalf("GetClaudeAccount() = %q, want inherit for a removed slot", got)
+	}
+	if view := stripAnsi(d.claudeOptions.View()); strings.Contains(view, "(default)") {
+		t.Fatalf("no pill may carry the default label for a removed slot:\n%s", view)
+	}
+}
+
+// Fork and non-Claude tools show no account row, default or not, and a
+// non-Claude session never gets the default.
+func TestNewDialogDefaultAccountOnlyForClaude(t *testing.T) {
+	withDefaultAccountConfig(t, "work", nil, "work")
+
+	d := NewNewDialog()
+	d.SetDefaultTool("gemini")
+	d.SetSize(120, 50)
+	d.ShowInGroup("projects", "Projects", "/tmp", nil, "")
+	if got := d.GetClaudeAccount(); got != "" {
+		t.Errorf("gemini session account = %q, want none", got)
+	}
+
+	fork := NewClaudeOptionsPanelForFork()
+	cfg, _ := session.LoadUserConfig()
+	fork.SetDefaults(cfg)
+	if fork.hasAccountRow() || strings.Contains(fork.View(), "(default)") {
+		t.Error("fork mode must not offer an account row")
+	}
 }

@@ -20,12 +20,12 @@ on:
   pull_request:
     paths:
       - 'internal/tmux/**'
-      - 'internal/session/instance.go'
+      - 'internal/session/instance*.go'
       - 'internal/session/userconfig.go'
       - 'internal/session/storage*.go'
-      - 'cmd/session_cmd.go'
-      - 'cmd/start_cmd.go'
-      - 'cmd/restart_cmd.go'
+      - 'cmd/agent-deck/session_cmd.go'
+      - 'cmd/agent-deck/session_lifecycle_cmd.go'
+      - 'cmd/agent-deck/session_restart_all.go'
       - 'scripts/verify-session-persistence.sh'
       - 'scripts/verify-session-persistence.d/**'
       - 'scripts/verify-session-persistence_test.go'
@@ -33,9 +33,25 @@ on:
       - 'CLAUDE.md'
       - '.github/workflows/session-persistence.yml'
   workflow_dispatch: {}
+  # Nightly backstop (post-tag CI queue): the PR trigger above stays
+  # path-filtered; this run covers changes that reach this code from
+  # outside those paths.
+  schedule: [{ cron: '10 3 * * *' }]
+
+# Every job here builds or launches the agent-deck binary. Since v1.16.7 a
+# TUI or daemon installs a newer release on its own and restarts in place;
+# a release landing mid-run must never hijack a test (issue #2251). The
+# binary also refuses under go test, CI=true and without a TTY, this is the
+# one switch that covers every spawn in this workflow.
+env:
+  AGENTDECK_SKIP_UPDATE_CHECK: "1"
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   tests:

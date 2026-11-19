@@ -47,7 +47,11 @@ func groupVerbCanonical(verb string) (canonical string, ok bool) {
 func handleGroup(profile string, args []string) {
 	if len(args) == 0 {
 		// Default to list
-		handleGroupList(profile, nil)
+		if coreRegistryEnabled() {
+			cliGroupList(profile, nil)
+		} else {
+			handleGroupList(profile, nil)
+		}
 		return
 	}
 
@@ -56,12 +60,16 @@ func handleGroup(profile string, args []string) {
 		fmt.Printf("Unknown group command: %s\n", args[0])
 		fmt.Println()
 		printGroupHelp()
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	switch canonical {
 	case "list":
-		handleGroupList(profile, args[1:])
+		if coreRegistryEnabled() {
+			cliGroupList(profile, args[1:])
+		} else {
+			handleGroupList(profile, args[1:])
+		}
 	case "show":
 		handleGroupShow(profile, args[1:])
 	case "create":
@@ -112,6 +120,59 @@ func printGroupHelp() {
 	fmt.Println("  agent-deck group reorder mobile --position 0")
 }
 
+// groupListRefreshStatus refreshes one session's status for the group
+// listings; a variable so tests can count the refreshes.
+var groupListRefreshStatus = func(inst *session.Instance) { _ = inst.UpdateStatus() }
+
+// refreshGroupTreeStatuses refreshes every session in the tree once. The
+// group listings count each group's whole subtree, so a session is counted
+// once per ancestor; refreshing it at each count cost one full status pass
+// per level (three for deck/ashesh/archive) on every `group list` and on
+// every remote-agent change probe.
+// GroupList is walked first for a stable order; Groups (what the counts
+// read) catches any group GroupList lacks.
+func refreshGroupTreeStatuses(groupTree *session.GroupTree) {
+	seen := make(map[*session.Instance]struct{})
+	refresh := func(g *session.Group) {
+		for _, sess := range g.Sessions {
+			// Archived sessions are not counted (groupListSessions), so
+			// their status is not worth a tmux round-trip.
+			if sess.IsArchived() {
+				continue
+			}
+			if _, ok := seen[sess]; !ok {
+				seen[sess] = struct{}{}
+				groupListRefreshStatus(sess)
+			}
+		}
+	}
+	for _, g := range groupTree.GroupList {
+		refresh(g)
+	}
+	for _, g := range groupTree.Groups {
+		refresh(g)
+	}
+}
+
+// groupListSessions returns the sessions `group list` counts for path: the
+// group's own and its subgroups' ("" for every group), leaving archived
+// sessions out. #3127 made archived sessions stay out of every status count
+// (`status`, the TUI header pill and group rows, the group preview, remote
+// rows); `group list` follows the same rule for its status counts,
+// session_count and total_sessions, so an old archived row that kept its
+// `error` status no longer shows up as an error here. The group itself is
+// still listed, like an empty group.
+func groupListSessions(groupTree *session.GroupTree, path string) []*session.Instance {
+	var out []*session.Instance
+	for p, g := range groupTree.Groups {
+		if path != "" && p != path && !strings.HasPrefix(p, path+"/") {
+			continue
+		}
+		out = append(out, session.FilterInstancesByArchive(g.Sessions, false)...)
+	}
+	return out
+}
+
 // buildGroupListJSON is the body of `group list --json`: the group tree with
 // recursive session and status counts, as the indented object the CLI
 // prints, trailing newline included. handleGroupList prints it and the
@@ -136,32 +197,31 @@ func buildGroupListJSON(groupTree *session.GroupTree) ([]byte, error) {
 		Children     []groupJSON      `json:"children,omitempty"`
 	}
 
+	refreshGroupTreeStatuses(groupTree)
+
 	// Build hierarchical structure (with recursive session counts - Issue #48)
 	buildGroupJSON := func(g *session.Group) groupJSON {
 		// Count status recursively for this group and all subgroups
+		// (archived sessions left out, see groupListSessions).
 		status := groupStatusJSON{}
-		for path, subGroup := range groupTree.Groups {
-			if path == g.Path || strings.HasPrefix(path, g.Path+"/") {
-				for _, sess := range subGroup.Sessions {
-					_ = sess.UpdateStatus() // Refresh status
-					switch sess.Status {
-					case session.StatusRunning:
-						status.Running++
-					case session.StatusWaiting:
-						status.Waiting++
-					case session.StatusIdle:
-						status.Idle++
-					case session.StatusError:
-						status.Error++
-					case session.StatusStopped:
-						status.Stopped++
-					}
-				}
+		sessions := groupListSessions(groupTree, g.Path)
+		for _, sess := range sessions {
+			switch sess.Status {
+			case session.StatusRunning:
+				status.Running++
+			case session.StatusWaiting:
+				status.Waiting++
+			case session.StatusIdle:
+				status.Idle++
+			case session.StatusError:
+				status.Error++
+			case session.StatusStopped:
+				status.Stopped++
 			}
 		}
 
 		// Use recursive session count
-		sessCount := groupTree.SessionCountForGroup(g.Path)
+		sessCount := len(sessions)
 		gj := groupJSON{
 			Name:         g.Name,
 			Path:         g.Path,
@@ -199,7 +259,7 @@ func buildGroupListJSON(groupTree *session.GroupTree) ([]byte, error) {
 
 	// Count totals
 	totalGroups := len(groupTree.Groups)
-	totalSessions := groupTree.SessionCount()
+	totalSessions := len(groupListSessions(groupTree, ""))
 
 	output, err := json.MarshalIndent(map[string]interface{}{
 		"groups":         groupsJSON,
@@ -214,7 +274,7 @@ func buildGroupListJSON(groupTree *session.GroupTree) ([]byte, error) {
 
 // handleGroupList lists all groups with session counts and status
 func handleGroupList(profile string, args []string) {
-	fs := flag.NewFlagSet("group list", flag.ExitOnError)
+	fs := flag.NewFlagSet("group list", flag.ContinueOnError)
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	quiet := fs.Bool("quiet", false, "Minimal output")
 	quietShort := fs.Bool("q", false, "Minimal output (short)")
@@ -228,8 +288,8 @@ func handleGroupList(profile string, args []string) {
 		fs.PrintDefaults()
 	}
 
-	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, normalizeArgs(fs, args)); err != nil {
+		exitCLI(1)
 	}
 
 	out := NewCLIOutput(*jsonOutput, *quiet || *quietShort)
@@ -238,13 +298,13 @@ func handleGroupList(profile string, args []string) {
 	storage, err := session.NewStorageWithProfile(profile)
 	if err != nil {
 		out.Error(fmt.Sprintf("failed to initialize storage: %v", err), ErrCodeNotFound)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	instances, groups, err := storage.LoadWithGroups()
 	if err != nil {
 		out.Error(fmt.Sprintf("failed to load sessions: %v", err), ErrCodeNotFound)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	// Warm tmux pane-title cache + load hook statuses once up-front so
@@ -260,7 +320,7 @@ func handleGroupList(profile string, args []string) {
 		output, err := buildGroupListJSON(groupTree)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: failed to format JSON: %v\n", err)
-			os.Exit(1)
+			exitCLI(1)
 		}
 		if !*quiet && !*quietShort {
 			fmt.Print(string(output))
@@ -278,6 +338,8 @@ func handleGroupList(profile string, args []string) {
 	sb.WriteString("Groups:\n\n")
 	sb.WriteString(fmt.Sprintf("%-20s %-10s %s\n", "NAME", "SESSIONS", "STATUS"))
 	sb.WriteString(strings.Repeat("-", 50) + "\n")
+
+	refreshGroupTreeStatuses(groupTree)
 
 	// Track which groups we've printed to handle hierarchy
 	printedPaths := make(map[string]bool)
@@ -317,24 +379,21 @@ func handleGroupList(profile string, args []string) {
 		}
 
 		// Count sessions and status for this group (including subgroups - Issue #48)
-		sessCount := groupTree.SessionCountForGroup(g.Path)
+		// Archived sessions are left out (groupListSessions).
+		sessions := groupListSessions(groupTree, g.Path)
+		sessCount := len(sessions)
 		statusStr := ""
 		if sessCount > 0 {
 			running, waiting, idle := 0, 0, 0
 			// Count status recursively for all sessions in this group and subgroups
-			for path, subGroup := range groupTree.Groups {
-				if path == g.Path || strings.HasPrefix(path, g.Path+"/") {
-					for _, sess := range subGroup.Sessions {
-						_ = sess.UpdateStatus()
-						switch sess.Status {
-						case session.StatusRunning:
-							running++
-						case session.StatusWaiting:
-							waiting++
-						case session.StatusIdle:
-							idle++
-						}
-					}
+			for _, sess := range sessions {
+				switch sess.Status {
+				case session.StatusRunning:
+					running++
+				case session.StatusWaiting:
+					waiting++
+				case session.StatusIdle:
+					idle++
 				}
 			}
 			var parts []string
@@ -356,7 +415,7 @@ func handleGroupList(profile string, args []string) {
 	}
 
 	totalGroups := len(groupTree.Groups)
-	totalSessions := groupTree.SessionCount()
+	totalSessions := len(groupListSessions(groupTree, ""))
 	sb.WriteString(fmt.Sprintf("\nTotal: %d groups, %d sessions\n", totalGroups, totalSessions))
 
 	out.Print(sb.String(), nil)
@@ -370,7 +429,7 @@ func handleGroupList(profile string, args []string) {
 // TOML parse error, or a missing env_file are all visible here instead of
 // silently degrading at launch.
 func handleGroupShow(profile string, args []string) {
-	fs := flag.NewFlagSet("group show", flag.ExitOnError)
+	fs := flag.NewFlagSet("group show", flag.ContinueOnError)
 	resolved := fs.Bool("resolved", false, "Resolve the effective claude config for this group (sources included)")
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	quiet := fs.Bool("quiet", false, "Minimal output")
@@ -390,10 +449,8 @@ func handleGroupShow(profile string, args []string) {
 		fmt.Println("  agent-deck group show work --resolved --json")
 	}
 
-	args = reorderGroupArgs(args)
-
-	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, normalizeArgs(fs, args)); err != nil {
+		exitCLI(1)
 	}
 
 	out := NewCLIOutput(*jsonOutput, *quiet || *quietShort)
@@ -402,19 +459,19 @@ func handleGroupShow(profile string, args []string) {
 	if name == "" {
 		out.Error("group name is required", ErrCodeNotFound)
 		fmt.Println("Usage: agent-deck group show <name> [--resolved] [--json]")
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	storage, err := session.NewStorageWithProfile(profile)
 	if err != nil {
 		out.Error(fmt.Sprintf("failed to initialize storage: %v", err), ErrCodeNotFound)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	instances, groups, err := storage.LoadWithGroups()
 	if err != nil {
 		out.Error(fmt.Sprintf("failed to load sessions: %v", err), ErrCodeNotFound)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	groupTree := session.NewGroupTreeWithGroups(instances, groups)
@@ -434,7 +491,7 @@ func handleGroupShow(profile string, args []string) {
 	}
 	if !exists {
 		out.Error(fmt.Sprintf("group '%s' not found", name), ErrCodeNotFound)
-		os.Exit(2)
+		exitCLI(2)
 	}
 
 	g := groupTree.Groups[groupPath]
@@ -576,7 +633,7 @@ func (r groupDefaultPathReport) addTo(jsonData map[string]interface{}) {
 
 // handleGroupCreate creates a new group
 func handleGroupCreate(profile string, args []string) {
-	fs := flag.NewFlagSet("group create", flag.ExitOnError)
+	fs := flag.NewFlagSet("group create", flag.ContinueOnError)
 	parent := fs.String("parent", "", "Create as subgroup under this parent")
 	defaultPath := fs.String("default-path", "", "Default working directory for new sessions in this group")
 	// v1.9.1: -1 sentinel means "flag not set; use the GroupTree default of 1 (serial)".
@@ -601,13 +658,8 @@ func handleGroupCreate(profile string, args []string) {
 		fmt.Println("  agent-deck group create wide --max-concurrent 4")
 	}
 
-	// Reorder args: move name to end so flags are parsed correctly
-	// Go's flag package stops parsing at first non-flag argument
-	// This allows: "group create ios --parent mobile" to work correctly
-	args = reorderGroupArgs(args)
-
-	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, normalizeArgs(fs, args)); err != nil {
+		exitCLI(1)
 	}
 
 	out := NewCLIOutput(*jsonOutput, *quiet || *quietShort)
@@ -616,20 +668,20 @@ func handleGroupCreate(profile string, args []string) {
 	if name == "" {
 		out.Error("group name is required", ErrCodeNotFound)
 		fmt.Println("Usage: agent-deck group create <name> [--parent <group>]")
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	// Load sessions and groups
 	storage, err := session.NewStorageWithProfile(profile)
 	if err != nil {
 		out.Error(fmt.Sprintf("failed to initialize storage: %v", err), ErrCodeNotFound)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	instances, groups, err := storage.LoadWithGroups()
 	if err != nil {
 		out.Error(fmt.Sprintf("failed to load sessions: %v", err), ErrCodeNotFound)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	// Build group tree
@@ -648,7 +700,7 @@ func handleGroupCreate(profile string, args []string) {
 		parentPath := normalizeGroupPath(*parent)
 		if _, exists := groupTree.Groups[parentPath]; !exists {
 			out.Error(fmt.Sprintf("parent group '%s' not found", *parent), ErrCodeNotFound)
-			os.Exit(2)
+			exitCLI(2)
 		}
 		newGroup = groupTree.CreateSubgroup(parentPath, name)
 		fullPath = newGroup.Path
@@ -679,7 +731,7 @@ func handleGroupCreate(profile string, args []string) {
 	// Save
 	if err := storage.SaveWithGroups(instances, groupTree); err != nil {
 		out.Error(fmt.Sprintf("failed to save: %v", err), ErrCodeNotFound)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	defaultPathReport := describeGroupDefaultPath(groupTree, fullPath)
@@ -701,7 +753,7 @@ func handleGroupCreate(profile string, args []string) {
 
 // handleGroupUpdate updates group metadata/settings
 func handleGroupUpdate(profile string, args []string) {
-	fs := flag.NewFlagSet("group update", flag.ExitOnError)
+	fs := flag.NewFlagSet("group update", flag.ContinueOnError)
 	defaultPath := fs.String("default-path", "", "Default working directory for new sessions in this group")
 	clearDefaultPath := fs.Bool("clear-default-path", false, "Clear group default working directory")
 	// v1.9.1: -1 sentinel means "flag not set; leave existing value alone".
@@ -725,10 +777,8 @@ func handleGroupUpdate(profile string, args []string) {
 		fmt.Println("  agent-deck group update mobile --max-concurrent 2")
 	}
 
-	args = reorderGroupArgs(args)
-
-	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, normalizeArgs(fs, args)); err != nil {
+		exitCLI(1)
 	}
 
 	out := NewCLIOutput(*jsonOutput, *quiet || *quietShort)
@@ -737,7 +787,7 @@ func handleGroupUpdate(profile string, args []string) {
 	if name == "" {
 		out.Error("group name is required", ErrCodeNotFound)
 		fmt.Println("Usage: agent-deck group update <name> [--default-path <path>|--clear-default-path|--max-concurrent N]")
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	// At least one mutation must be requested.
@@ -745,23 +795,23 @@ func handleGroupUpdate(profile string, args []string) {
 	maxFlagSet := *maxConcurrent >= 0
 	if !pathFlagSet && !maxFlagSet {
 		out.Error("specify at least one of --default-path, --clear-default-path, or --max-concurrent", ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	if *defaultPath != "" && *clearDefaultPath {
 		out.Error("--default-path and --clear-default-path are mutually exclusive", ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	storage, err := session.NewStorageWithProfile(profile)
 	if err != nil {
 		out.Error(fmt.Sprintf("failed to initialize storage: %v", err), ErrCodeNotFound)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	instances, groups, err := storage.LoadWithGroups()
 	if err != nil {
 		out.Error(fmt.Sprintf("failed to load sessions: %v", err), ErrCodeNotFound)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	groupTree := session.NewGroupTreeWithGroups(instances, groups)
@@ -779,7 +829,7 @@ func handleGroupUpdate(profile string, args []string) {
 	}
 	if !exists {
 		out.Error(fmt.Sprintf("group '%s' not found", name), ErrCodeNotFound)
-		os.Exit(2)
+		exitCLI(2)
 	}
 
 	if *clearDefaultPath {
@@ -796,7 +846,7 @@ func handleGroupUpdate(profile string, args []string) {
 
 	if err := storage.SaveWithGroups(instances, groupTree); err != nil {
 		out.Error(fmt.Sprintf("failed to save: %v", err), ErrCodeNotFound)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	defaultPathReport := describeGroupDefaultPath(groupTree, groupPath)
@@ -822,7 +872,7 @@ func handleGroupUpdate(profile string, args []string) {
 
 // handleGroupDelete deletes a group
 func handleGroupDelete(profile string, args []string) {
-	fs := flag.NewFlagSet("group delete", flag.ExitOnError)
+	fs := flag.NewFlagSet("group delete", flag.ContinueOnError)
 	force := fs.Bool("force", false, "Move sessions to parent and delete")
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	quiet := fs.Bool("quiet", false, "Minimal output")
@@ -841,8 +891,8 @@ func handleGroupDelete(profile string, args []string) {
 		fmt.Println("  agent-deck group delete work --force   # Move sessions to parent")
 	}
 
-	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, normalizeArgs(fs, args)); err != nil {
+		exitCLI(1)
 	}
 
 	out := NewCLIOutput(*jsonOutput, *quiet || *quietShort)
@@ -851,20 +901,20 @@ func handleGroupDelete(profile string, args []string) {
 	if name == "" {
 		out.Error("group name is required", ErrCodeNotFound)
 		fmt.Println("Usage: agent-deck group delete <name> [--force]")
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	// Load sessions and groups
 	storage, err := session.NewStorageWithProfile(profile)
 	if err != nil {
 		out.Error(fmt.Sprintf("failed to initialize storage: %v", err), ErrCodeNotFound)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	instances, groups, err := storage.LoadWithGroups()
 	if err != nil {
 		out.Error(fmt.Sprintf("failed to load sessions: %v", err), ErrCodeNotFound)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	// Build group tree
@@ -902,19 +952,19 @@ func handleGroupDelete(profile string, args []string) {
 			}
 			sort.Strings(paths)
 			out.Error(fmt.Sprintf("group '%s' is ambiguous: %s - use the full path", name, strings.Join(paths, ", ")), ErrCodeInvalidOperation)
-			os.Exit(2)
+			exitCLI(2)
 		}
 	}
 
 	if !exists {
 		out.Error(fmt.Sprintf("group '%s' not found", name), ErrCodeNotFound)
-		os.Exit(2)
+		exitCLI(2)
 	}
 
 	// Check if group is protected (default group)
 	if groupPath == session.DefaultGroupPath {
 		out.Error("cannot delete the default group", ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	// Count sessions in group and subgroups
@@ -928,7 +978,7 @@ func handleGroupDelete(profile string, args []string) {
 	// Check if group has sessions and --force not specified
 	if sessionCount > 0 && !*force {
 		out.Error(fmt.Sprintf("group '%s' has %d sessions. Use --force to move them to parent.", name, sessionCount), ErrCodeGroupNotEmpty)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	// Determine where sessions will be moved
@@ -954,7 +1004,7 @@ func handleGroupDelete(profile string, args []string) {
 	// Save
 	if err := storage.SaveWithGroups(groupTree.GetAllInstances(), groupTree); err != nil {
 		out.Error(fmt.Sprintf("failed to save: %v", err), ErrCodeNotFound)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	out.Success(fmt.Sprintf("Deleted group: %s", name), map[string]interface{}{
@@ -968,7 +1018,7 @@ func handleGroupDelete(profile string, args []string) {
 // handleGroupMove moves a session to a different group, or (with --to-profile)
 // migrates every session in a group to another profile's DB (issue #928).
 func handleGroupMove(profile string, args []string) {
-	fs := flag.NewFlagSet("group move", flag.ExitOnError)
+	fs := flag.NewFlagSet("group move", flag.ContinueOnError)
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	quiet := fs.Bool("quiet", false, "Minimal output")
 	quietShort := fs.Bool("q", false, "Minimal output (short)")
@@ -996,8 +1046,8 @@ func handleGroupMove(profile string, args []string) {
 		fmt.Println("  agent-deck group move work/api --to-profile march")
 	}
 
-	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, normalizeArgs(fs, args)); err != nil {
+		exitCLI(1)
 	}
 
 	out := NewCLIOutput(*jsonOutput, *quiet || *quietShort)
@@ -1007,12 +1057,12 @@ func handleGroupMove(profile string, args []string) {
 		if fs.NArg() < 1 {
 			out.Error("group move --to-profile requires <group>", ErrCodeInvalidOperation)
 			fs.Usage()
-			os.Exit(1)
+			exitCLI(1)
 		}
 		if fs.NArg() > 1 {
 			out.Error("--to-profile takes a single <group> argument", ErrCodeInvalidOperation)
 			fs.Usage()
-			os.Exit(1)
+			exitCLI(1)
 		}
 		handleGroupMoveToProfile(profile, *toProfile, fs.Arg(0), *force, out)
 		return
@@ -1024,26 +1074,26 @@ func handleGroupMove(profile string, args []string) {
 	if sessionID == "" {
 		out.Error("session identifier is required", ErrCodeNotFound)
 		fmt.Println("Usage: agent-deck group move <session-id> <group>")
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	if fs.NArg() < 2 {
 		out.Error("target group is required", ErrCodeNotFound)
 		fmt.Println("Usage: agent-deck group move <session-id> <group>")
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	// Load sessions and groups
 	storage, err := session.NewStorageWithProfile(profile)
 	if err != nil {
 		out.Error(fmt.Sprintf("failed to initialize storage: %v", err), ErrCodeNotFound)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	instances, groups, err := storage.LoadWithGroups()
 	if err != nil {
 		out.Error(fmt.Sprintf("failed to load sessions: %v", err), ErrCodeNotFound)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	// Find the session
@@ -1051,16 +1101,10 @@ func handleGroupMove(profile string, args []string) {
 	if inst == nil {
 		out.Error(errMsg, errCode)
 		if errCode == ErrCodeNotFound {
-			os.Exit(2)
+			exitCLI(2)
 		}
-		os.Exit(1)
+		exitCLI(1)
 		return // unreachable, satisfies staticcheck SA5011
-	}
-
-	// Normalize target group
-	// Handle special cases for moving to root/default group
-	if targetGroup == "root" || targetGroup == "" {
-		targetGroup = session.DefaultGroupPath
 	}
 
 	// Store original group for output
@@ -1076,34 +1120,7 @@ func handleGroupMove(profile string, args []string) {
 	cfg, _ := session.LoadUserConfig()
 	groupTree.DefaultMaxConcurrent = cfg.GroupDefaults.MaxConcurrent
 
-	// Try to match an existing group by exact name first, then case-insensitive
-	targetGroupPath := targetGroup
-	if targetGroup != session.DefaultGroupPath {
-		matched := false
-		for path := range groupTree.Groups {
-			if path == targetGroup {
-				targetGroupPath = path
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			// Case-insensitive match against existing groups
-			targetLower := strings.ToLower(targetGroup)
-			for path := range groupTree.Groups {
-				if strings.ToLower(path) == targetLower {
-					targetGroupPath = path
-					matched = true
-					break
-				}
-			}
-		}
-		if !matched {
-			// No existing group found - CreateGroup normalizes the path
-			created := groupTree.CreateGroup(targetGroupPath)
-			targetGroupPath = created.Path
-		}
-	}
+	targetGroupPath := groupTree.ResolveMoveTargetGroup(targetGroup)
 
 	// Move the session
 	groupTree.MoveSessionToGroup(inst, targetGroupPath)
@@ -1111,7 +1128,7 @@ func handleGroupMove(profile string, args []string) {
 	// Save
 	if err := storage.SaveWithGroups(groupTree.GetAllInstances(), groupTree); err != nil {
 		out.Error(fmt.Sprintf("failed to save: %v", err), ErrCodeNotFound)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	toGroup := targetGroupPath
@@ -1129,7 +1146,7 @@ func handleGroupMove(profile string, args []string) {
 
 // handleGroupReorder changes a group's position among its siblings
 func handleGroupReorder(profile string, args []string) {
-	fs := flag.NewFlagSet("group reorder", flag.ExitOnError)
+	fs := flag.NewFlagSet("group reorder", flag.ContinueOnError)
 	up := fs.Bool("up", false, "Move group up one position")
 	upShort := fs.Bool("u", false, "Move group up one position (short)")
 	down := fs.Bool("down", false, "Move group down one position")
@@ -1154,10 +1171,8 @@ func handleGroupReorder(profile string, args []string) {
 		fmt.Println("  agent-deck group reorder mobile --position 0")
 	}
 
-	args = reorderGroupArgs(args)
-
-	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, normalizeArgs(fs, args)); err != nil {
+		exitCLI(1)
 	}
 
 	out := NewCLIOutput(*jsonOutput, *quiet || *quietShort)
@@ -1166,7 +1181,7 @@ func handleGroupReorder(profile string, args []string) {
 	if name == "" {
 		out.Error("group name is required", ErrCodeNotFound)
 		fmt.Println("Usage: agent-deck group reorder <name> [--up|--down|--position N]")
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	moveUp := *up || *upShort
@@ -1175,7 +1190,7 @@ func handleGroupReorder(profile string, args []string) {
 	posShortSet := *positionShort >= 0
 	if posSet && posShortSet {
 		out.Error("specify only one of --position or -p", ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	pos := *position
 	if posShortSet {
@@ -1195,24 +1210,24 @@ func handleGroupReorder(profile string, args []string) {
 	}
 	if dirCount == 0 {
 		out.Error("specify one of --up, --down, or --position", ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	if dirCount > 1 {
 		out.Error("specify only one of --up, --down, or --position", ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	// Load storage
 	storage, err := session.NewStorageWithProfile(profile)
 	if err != nil {
 		out.Error(fmt.Sprintf("failed to initialize storage: %v", err), ErrCodeNotFound)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	instances, groups, err := storage.LoadWithGroups()
 	if err != nil {
 		out.Error(fmt.Sprintf("failed to load sessions: %v", err), ErrCodeNotFound)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	groupTree := session.NewGroupTreeWithGroups(instances, groups)
@@ -1231,7 +1246,7 @@ func handleGroupReorder(profile string, args []string) {
 	}
 	if !exists {
 		out.Error(fmt.Sprintf("group '%s' not found", name), ErrCodeNotFound)
-		os.Exit(2)
+		exitCLI(2)
 	}
 
 	// Compute current sibling position
@@ -1277,7 +1292,7 @@ func handleGroupReorder(profile string, args []string) {
 	// Save
 	if err := storage.SaveWithGroups(groupTree.GetAllInstances(), groupTree); err != nil {
 		out.Error(fmt.Sprintf("failed to save: %v", err), ErrCodeNotFound)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	out.Success(fmt.Sprintf("Reordered group '%s': position %d → %d", name, fromPos, toPos), map[string]interface{}{
@@ -1328,53 +1343,7 @@ func normalizeGroupPath(name string) string {
 
 // truncateGroupName shortens a group name for display
 func truncateGroupName(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	if max <= 3 {
-		return s[:max]
-	}
-	return s[:max-3] + "..."
-}
-
-// reorderGroupArgs reorders arguments so flags come before positional args
-// This fixes Go's flag package limitation where flags after positional args are ignored
-// e.g., "ios --parent mobile" becomes "--parent mobile ios"
-func reorderGroupArgs(args []string) []string {
-	if len(args) == 0 {
-		return args
-	}
-
-	// Known flags that take a value
-	valueFlags := map[string]bool{
-		"--parent":       true,
-		"--default-path": true,
-		"--position":     true,
-		"-p":             true,
-	}
-
-	var flags []string
-	var positional []string
-
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-
-		// Check if it's a flag
-		if strings.HasPrefix(arg, "-") {
-			flags = append(flags, arg)
-
-			// Check if this flag takes a value (and value is separate)
-			if !strings.Contains(arg, "=") && valueFlags[arg] && i+1 < len(args) {
-				i++
-				flags = append(flags, args[i])
-			}
-		} else {
-			positional = append(positional, arg)
-		}
-	}
-
-	// Return flags first, then positional args
-	return append(flags, positional...)
+	return truncateWidth(s, max)
 }
 
 // handleGroupChange implements issue #447: reparent an entire group (and its
@@ -1382,7 +1351,7 @@ func reorderGroupArgs(args []string) []string {
 // is omitted/empty. Reuses GroupTree.MoveGroupTo for the in-memory mutation
 // and persists via storage.SaveAll.
 func handleGroupChange(profile string, args []string) {
-	fs := flag.NewFlagSet("group change", flag.ExitOnError)
+	fs := flag.NewFlagSet("group change", flag.ContinueOnError)
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	quiet := fs.Bool("quiet", false, "Minimal output")
 	quietShort := fs.Bool("q", false, "Minimal output (short)")
@@ -1407,8 +1376,8 @@ func handleGroupChange(profile string, args []string) {
 		fmt.Println("  agent-deck group change work/project1 \"\"          # Move to root")
 	}
 
-	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, normalizeArgs(fs, args)); err != nil {
+		exitCLI(1)
 	}
 
 	out := NewCLIOutput(*jsonOutput, *quiet || *quietShort)
@@ -1417,7 +1386,7 @@ func handleGroupChange(profile string, args []string) {
 	if source == "" {
 		out.Error("source group path is required", ErrCodeNotFound)
 		fs.Usage()
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	dest := ""
@@ -1432,13 +1401,13 @@ func handleGroupChange(profile string, args []string) {
 	storage, err := session.NewStorageWithProfile(profile)
 	if err != nil {
 		out.Error(fmt.Sprintf("failed to initialize storage: %v", err), ErrCodeNotFound)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	instances, groups, err := storage.LoadWithGroups()
 	if err != nil {
 		out.Error(fmt.Sprintf("failed to load sessions: %v", err), ErrCodeNotFound)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	groupTree := session.NewGroupTreeWithGroups(instances, groups)
@@ -1457,7 +1426,7 @@ func handleGroupChange(profile string, args []string) {
 		}
 		if !matched {
 			out.Error(fmt.Sprintf("source group %q not found", source), ErrCodeNotFound)
-			os.Exit(2)
+			exitCLI(2)
 		}
 	}
 
@@ -1476,7 +1445,7 @@ func handleGroupChange(profile string, args []string) {
 			}
 			if !matched {
 				out.Error(fmt.Sprintf("destination group %q not found", dest), ErrCodeNotFound)
-				os.Exit(2)
+				exitCLI(2)
 			}
 		}
 	}
@@ -1484,7 +1453,7 @@ func handleGroupChange(profile string, args []string) {
 	if err := groupTree.MoveGroupTo(sourcePath, destPath); err != nil {
 		// Distinguish circular errors for a friendlier exit message.
 		out.Error(err.Error(), ErrCodeNotFound)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	// Compute the new path for output.
@@ -1500,7 +1469,7 @@ func handleGroupChange(profile string, args []string) {
 	// Persist.
 	if err := storage.SaveWithGroups(groupTree.GetAllInstances(), groupTree); err != nil {
 		out.Error(fmt.Sprintf("failed to save: %v", err), ErrCodeNotFound)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	out.Success(fmt.Sprintf("Moved group %q to %q", sourcePath, newPath), map[string]interface{}{
@@ -1531,7 +1500,7 @@ func handleGroupMoveToProfile(sourceProfile, targetProfile, groupPath string, fo
 			hint = " (stop the running session(s) first, or re-run with --force)"
 		}
 		out.Error(fmt.Sprintf("%v%s", err, hint), exitCode)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	out.Success(

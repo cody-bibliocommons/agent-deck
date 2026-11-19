@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/shellwords"
+	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
 // Registry is the unified, in-memory view of every tool agent-deck knows about:
@@ -86,7 +88,8 @@ func probeInstalled(command string) bool {
 
 // Init builds a Registry from the static built-ins plus the supplied custom
 // tools (typically config.Tools from LoadUserConfig). Custom entries whose name
-// shadows a built-in are dropped with a warning (precedence rule (a)).
+// shadows a built-in are dropped with a warning (precedence rule (a)), except
+// entries that only set detection patterns, which MergeToolPatterns applies.
 //
 // Init is the single explicit constructor — tests build registries directly via
 // Init(map[string]ToolDef{...}) rather than poking package globals. It builds an
@@ -115,7 +118,14 @@ func InitFiltered(custom map[string]ToolDef, showOnlyInstalled bool, hiddenTools
 		r.builtins[bt.Name] = bt
 	}
 	for name, def := range custom {
+		if name == "opencode2" {
+			registryLog.Warn("ignored custom tool: name shadows a built-in launcher", "name", name)
+			continue
+		}
 		if _, isBuiltin := r.builtins[name]; isBuiltin {
+			if patternOnlyOverride(name, def) {
+				continue
+			}
 			registryLog.Warn("ignored custom tool: name shadows a built-in",
 				"name", name,
 				"hint", "rename your custom tool and set compatible_with = \""+name+"\" instead")
@@ -135,6 +145,21 @@ func InitFiltered(custom map[string]ToolDef, showOnlyInstalled bool, hiddenTools
 		r.runInstalledProbe()
 	}
 	return r
+}
+
+// patternOnlyOverride reports whether a [tools.<builtin>] entry sets only the
+// detection pattern fields that MergeToolPatterns applies on top of the
+// built-in's own defaults. Such an entry is honored, not ignored, so it is not
+// reported as a shadow. A built-in without pattern defaults gets no merge and
+// still warns.
+func patternOnlyOverride(name string, def ToolDef) bool {
+	if tmux.DefaultRawPatterns(name) == nil {
+		return false
+	}
+	rest := def
+	rest.BusyPatterns, rest.PromptPatterns, rest.SpinnerChars = nil, nil, nil
+	rest.BusyPatternsExtra, rest.PromptPatternsExtra, rest.SpinnerCharsExtra = nil, nil, nil
+	return !reflect.DeepEqual(def, rest) && reflect.DeepEqual(rest, ToolDef{})
 }
 
 // runInstalledProbe resolves every registered tool's command against the host
@@ -187,6 +212,10 @@ func (r *Registry) runInstalledProbe() {
 			nonShellInstalled++
 		}
 	}
+	r.installed["opencode2"] = probeInstalled("opencode2")
+	if r.installed["opencode2"] {
+		nonShellInstalled++
+	}
 
 	r.fallback = nonShellInstalled == 0
 }
@@ -194,6 +223,7 @@ func (r *Registry) runInstalledProbe() {
 // IsBuiltin reports whether name is one of the canonical built-in tools.
 // Replaces isBuiltinToolName().
 func (r *Registry) IsBuiltin(name string) bool {
+	name = CanonicalToolName(name)
 	_, ok := r.builtins[name]
 	return ok
 }
@@ -225,6 +255,36 @@ func (r *Registry) Get(name string) *ToolDef {
 		return &ToolDef{Command: bt.Name, Icon: bt.Icon}
 	}
 	return nil
+}
+
+// Icon returns the display icon for name: a custom tool's configured icon
+// when set, otherwise the built-in icon, otherwise "" for names the registry
+// does not know. Callers treat "" as "use your own fallback".
+func (r *Registry) Icon(name string) string {
+	name = CanonicalToolName(name)
+	if def, ok := r.custom[name]; ok && def.Icon != "" {
+		return def.Icon
+	}
+	if bt, ok := r.builtins[name]; ok {
+		return bt.Icon
+	}
+	return ""
+}
+
+// Color returns the display color for name. For custom tools it is the
+// [tools.<name>] color value verbatim (a lipgloss color such as "#ff9e64");
+// for built-ins it is a theme palette slot name (see builtinTool.Color).
+// "" means the registry has no color for name and the caller should use its
+// default.
+func (r *Registry) Color(name string) string {
+	name = CanonicalToolName(name)
+	if def, ok := r.custom[name]; ok && def.Color != "" {
+		return def.Color
+	}
+	if bt, ok := r.builtins[name]; ok {
+		return bt.Color
+	}
+	return ""
 }
 
 // Match resolves a command string to a tool name. Replaces detectTool().
@@ -259,6 +319,15 @@ func (r *Registry) Match(cmd string) string {
 		// position gets basename treatment — argument paths such as
 		// "copilot --cwd /home/pi" must not flip detection.
 		for _, tok := range bt.detectTokens {
+			// executableOnly tools (muse) match solely on the executable
+			// slot: `echo muse` must not classify. All other tools keep
+			// the legacy whole-line token match.
+			if bt.executableOnly {
+				if exe != "" && exe == tok {
+					return name
+				}
+				continue
+			}
 			if slices.Contains(fields, tok) || exe == tok {
 				return name
 			}
@@ -309,6 +378,9 @@ func (r *Registry) IsVisible(name string) bool {
 		return true
 	}
 	if r.userHidden[name] {
+		return false
+	}
+	if name == "opencode2" && r.userHidden["opencode"] {
 		return false
 	}
 	if !r.filterInstalled || r.fallback {
@@ -416,6 +488,18 @@ func MatchTool(cmd string) string {
 	return currentRegistry().Match(cmd)
 }
 
+// ToolIconFor returns the process registry's icon for name ("" if unknown).
+// It is the seam internal/ui's ToolIcon() reads before its static fallback.
+func ToolIconFor(name string) string {
+	return currentRegistry().Icon(name)
+}
+
+// ToolColorFor returns the process registry's color for name ("" if unknown).
+// It is the seam internal/ui's ToolColor() reads before its static fallback.
+func ToolColorFor(name string) string {
+	return currentRegistry().Color(name)
+}
+
 // --- process-wide show_only_installed_tools accessors (issue #1259) ----------
 //
 // These back the new-session dialog call sites. They read the cached registry,
@@ -435,8 +519,13 @@ func FilterVisibleToolNames(names []string) []string {
 func VisibleToolNames() []string {
 	r := currentRegistry()
 	names := make([]string, 0, len(r.order)+len(r.custom))
-	for _, d := range r.Visible() {
-		names = append(names, d.Command)
+	for _, name := range r.order {
+		if r.IsVisible(name) {
+			names = append(names, name)
+		}
+		if name == "opencode" && r.IsVisible("opencode2") {
+			names = append(names, "opencode2")
+		}
 	}
 	for _, n := range r.CustomNames() {
 		if r.IsVisible(n) {
@@ -463,7 +552,7 @@ func ConfiguredHiddenToolNames() []string {
 }
 
 // pickerPresetOrder matches buildPresetCommands in internal/ui/newdialog.go.
-var pickerPresetOrder = []string{"", "claude", "gemini", "opencode", "codex", "pi", "copilot", "crush", "cursor", "hermes", "deepseek", "kiro-cli"}
+var pickerPresetOrder = []string{"", "claude", "gemini", "opencode", "opencode2", "codex", "pi", "copilot", "crush", "cursor", "hermes", "deepseek", "omp", "kiro-cli"}
 
 // PickerToolNames returns tool names for the new-session picker after applying
 // hidden_tools and show_only_installed_tools. The empty command "" is mapped
@@ -484,4 +573,106 @@ func PickerToolNames() []string {
 		out = append(out, name)
 	}
 	return out
+}
+
+// ToolInstalled reports whether a new-session tool can start on this machine:
+// the program its command runs resolves where a local pane would look
+// (paneCommandInstalled). It runs on every call whatever
+// show_only_installed_tools says, so the new-session dialog can mark missing
+// tools and pick the first installed agent as the default (onboarding).
+// A built-in is probed by its configured command ([claude].command and the
+// like, arguments allowed), then by its bare name. Claude also counts when its own local install exists
+// (~/.claude/local/claude, often reached only through a shell alias).
+// "" and "shell" are always installed.
+func ToolInstalled(name string) bool {
+	switch name {
+	case "", "shell":
+		return true
+	case "cursor":
+		return cursorCommandInstalled()
+	case "deepseek":
+		return DeepSeekInstalled(GetToolCommand("deepseek"))
+	}
+	r := currentRegistry()
+	if def, ok := r.custom[name]; ok {
+		return paneCommandInstalled(def.Command)
+	}
+	if cmd := strings.TrimSpace(GetToolCommand(name)); cmd != "" && cmd != name && paneCommandInstalled(cmd) {
+		return true
+	}
+	if paneCommandInstalled(name) {
+		return true
+	}
+	if name == "claude" {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			if _, err := statFn(filepath.Join(home, ".claude", "local", "claude")); err == nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// paneCommandInstalled reports whether the program a configured command runs
+// can be found the way a local pane finds it. The command is split into
+// shell words and the program is the first word after any assignments and
+// exec/env-style prefixes (shellwords.CommandWords), so
+// "/opt/bin/claude --verbose" probes /opt/bin/claude and "npx -y pkg" probes
+// npx. A leading ~/ is expanded. A program with a slash must exist as an
+// executable file; a bare name is looked up on the process PATH and then in
+// the user bin dirs the pane prepends (localSpawnPathDirs: ~/.local/bin,
+// ~/bin, Homebrew on macOS). A command this cannot judge without a shell
+// (unbalanced quotes, an expansion, a pipe or a relative path) counts as
+// installed, so nothing is flagged on a guess.
+func paneCommandInstalled(command string) bool {
+	cmd := strings.TrimSpace(command)
+	if cmd == "" {
+		return false
+	}
+	if strings.ContainsAny(cmd, "$`|&;<>()") {
+		return true
+	}
+	words, ok := shellwords.Split(cmd)
+	if !ok {
+		return true
+	}
+	words = shellwords.CommandWords(words)
+	if len(words) == 0 {
+		return true
+	}
+	prog := expandHomeCommand(words[0])
+	if strings.Contains(prog, "/") {
+		if !filepath.IsAbs(prog) {
+			return true
+		}
+		return executableFile(prog)
+	}
+	if _, err := lookPathFn(prog); err == nil {
+		return true
+	}
+	for _, dir := range localSpawnPathDirs() {
+		if executableFile(filepath.Join(dir, prog)) {
+			return true
+		}
+	}
+	return false
+}
+
+// executableFile reports whether path is a file someone may execute.
+func executableFile(path string) bool {
+	info, err := statFn(path)
+	return err == nil && !info.IsDir() && info.Mode().Perm()&0o111 != 0
+}
+
+// expandHomeCommand turns a leading "~/" into the home folder, so a
+// configured "~/bin/claude" is probed as the absolute path it is.
+func expandHomeCommand(cmd string) string {
+	if !strings.HasPrefix(cmd, "~/") {
+		return cmd
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return cmd
+	}
+	return filepath.Join(home, cmd[2:])
 }

@@ -1,0 +1,20 @@
+# Known-flaky Go tests for the go-test workflow's failure summary.
+#
+# One entry per line. Either a bare test name (TestFoo, matched against the
+# top-level test in any package) or "<relative package> <TestName>"
+# (internal/tui TestFoo) to scope it to one package. Lines starting with "#"
+# and blank lines are ignored.
+#
+# Listing a test here changes NOTHING about pass/fail: the job still fails
+# when the test fails. It only labels the row "known flake" in the job summary
+# so a retry is an informed decision rather than a blind re-push. Remove an
+# entry as soon as the flake is fixed.
+
+# #2800: TempDir cleanup "directory not empty" (a writer outlived the test).
+# Fixed in the same PR; remove both entries after 7 green days.
+internal/tuitest TestIdleTUICPUBudget
+internal/session TestEnsureClaudeConfigDirEnv_SetsHostSideEnv
+
+# #2893 sibling: failed once under load with no log kept; the #2893 fix (trust prompt
+# re-sample) does not touch its path. Remove after 7 green days or a captured failure.
+cmd/agent-deck TestSwitchSettle_FakeClaudePane_DecoyAboveLiveMenuUntouched

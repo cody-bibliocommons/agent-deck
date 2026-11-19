@@ -1,0 +1,24 @@
+Usage: agent-deck list [options]
+
+List all sessions.
+JSON includes transcript_path and native IDs when known; paths belong to the session host.
+ACCOUNT shows the quoted stored account slot, not a resolved account or login identity.
+JSON always includes the raw "account" string, including "" when no slot is stored.
+
+Options:
+  -all
+    	List sessions from all profiles
+  -include-superseded
+    	Include archived source rows retained for cross-harness recovery
+  -json
+    	Output as JSON
+  -no-archived
+    	Skip archived sessions (no status work or output for them); for pollers that only need live sessions
+  -stats
+    	
+
+Examples:
+  agent-deck list                    # List from default profile
+  agent-deck -p work list            # List from 'work' profile
+  agent-deck list --all              # List from all profiles
+  agent-deck list --json --no-archived  # Live listing without archived sessions

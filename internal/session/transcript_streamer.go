@@ -84,6 +84,12 @@ func (c StreamConfig) WithDefaults() StreamConfig {
 // ErrStreamTimeout is returned when IdleTimeout elapses with no progress.
 var ErrStreamTimeout = errors.New("stream idle timeout")
 
+// ErrStreamTurnInterrupted is returned by a turn-scoped stream when a later
+// human prompt appears before the requested turn reached end_turn: the turn
+// was interrupted, and streaming on would report the next turn's answer as
+// this one's (PR #2043 round 2). An error event is written first.
+var ErrStreamTurnInterrupted = errors.New("turn interrupted before end_turn")
+
 // claudeRecordHeader mirrors the record envelope at the top of each JSONL
 // line. We reparse message subfields after confirming type.
 type claudeRecordHeader struct {
@@ -91,6 +97,14 @@ type claudeRecordHeader struct {
 	UUID      string          `json:"uuid"`
 	Timestamp string          `json:"timestamp"`
 	Message   json.RawMessage `json:"message"`
+}
+
+func (h claudeRecordHeader) messageID() string {
+	var msg struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal(h.Message, &msg)
+	return msg.ID
 }
 
 type claudeMessageEnvelope struct {
@@ -108,6 +122,17 @@ type claudeMessageEnvelope struct {
 // Returns nil on natural end_turn stop, ctx.Err on cancel, or
 // ErrStreamTimeout on idle timeout (with an error event already written).
 func StreamTranscript(ctx context.Context, path, sessionID string, sentAt time.Time, w io.Writer, cfg StreamConfig) error {
+	return streamTranscript(ctx, path, sessionID, sentAt, 0, false, w, cfg)
+}
+
+// StreamTranscriptForTurn streams only records after the durable user record
+// identified by id. This is the turn-safe entry point for session send
+// --stream; unlike StreamTranscript it has no timestamp freshness heuristic.
+func StreamTranscriptForTurn(ctx context.Context, id TurnIdentity, sessionID string, w io.Writer, cfg StreamConfig) error {
+	return streamTranscript(ctx, id.Path, sessionID, time.Time{}, id.StartOffset, true, w, cfg)
+}
+
+func streamTranscript(ctx context.Context, path, sessionID string, sentAt time.Time, initialOffset int64, turnScoped bool, w io.Writer, cfg StreamConfig) error {
 	cfg = cfg.WithDefaults()
 
 	enc := newEventEncoder(w)
@@ -122,10 +147,11 @@ func StreamTranscript(ctx context.Context, path, sessionID string, sentAt time.T
 	}
 
 	st := newStreamerState(sentAt, cfg, enc)
+	st.turnScoped = turnScoped
 
 	// Tail loop: re-open on missing-file (Claude may not have flushed
 	// yet for a fresh session) but never block if the file exists.
-	var offset int64
+	offset := initialOffset
 	lastProgress := time.Now()
 	ticker := time.NewTicker(cfg.PollInterval)
 	defer ticker.Stop()
@@ -219,11 +245,23 @@ type streamerState struct {
 	textMsgID  string
 	textTS     string
 	toolsSince int // tool events emitted since the last text flush
+
+	// turnScoped streams end at the requested turn's boundary in both
+	// directions: a later human prompt before end_turn is an interruption,
+	// never the continuation of this turn.
+	turnScoped bool
+
+	stop       turnStop
+	stopReason string
 }
 
 func newStreamerState(sentAt time.Time, cfg StreamConfig, enc *eventEncoder) *streamerState {
+	sentAtSkew := time.Time{}
+	if !sentAt.IsZero() {
+		sentAtSkew = sentAt.Add(-250 * time.Millisecond)
+	}
 	return &streamerState{
-		sentAtSkew: sentAt.Add(-250 * time.Millisecond),
+		sentAtSkew: sentAtSkew,
 		cfg:        cfg,
 		enc:        enc,
 		seen:       make(map[string]struct{}),
@@ -245,8 +283,13 @@ func (s *streamerState) consumeFile(path string, offset int64) (int64, bool, boo
 		return offset, false, false, "", err
 	}
 	// Truncation detection: if the file shrank below our offset, reset
-	// to 0 and replay — rare, but we must not seek past EOF.
+	// to 0 and replay — rare, but we must not seek past EOF. A turn-scoped
+	// stream cannot replay: offset 0 precedes the send, so the records it
+	// would emit belong to earlier turns. Refuse instead.
 	if fi.Size() < offset {
+		if s.turnScoped {
+			return offset, false, false, "", fmt.Errorf("%w: stream started at offset %d, transcript is %d bytes", ErrTranscriptTruncated, offset, fi.Size())
+		}
 		offset = 0
 	}
 	if offset > 0 {
@@ -285,25 +328,46 @@ func (s *streamerState) consumeFile(path string, offset int64) (int64, bool, boo
 			continue
 		}
 
+		if s.stop.endedBefore(hdr.Type == "assistant", hdr.messageID()) {
+			return offset, progressed, true, s.stopReason, nil
+		}
+
 		switch hdr.Type {
 		case "assistant":
-			st, reason := s.handleAssistant(hdr)
-			if st {
-				stopped = true
-				stopReason = reason
-				return offset, progressed, stopped, stopReason, nil
-			}
+			s.handleAssistant(hdr)
 		case "user":
+			if s.turnScoped && s.isHumanPrompt(line) {
+				s.flushText("")
+				return offset, progressed, false, "", ErrStreamTurnInterrupted
+			}
 			s.handleUser(hdr)
 		}
 	}
 	if err := sc.Err(); err != nil {
 		return offset, progressed, false, "", err
 	}
-	return offset, progressed, false, "", nil
+	if s.stop.endedAtEOF() {
+		stopped = true
+		stopReason = s.stopReason
+	}
+	return offset, progressed, stopped, stopReason, nil
+}
+
+// isHumanPrompt reports whether a raw user record is a submitted prompt (as
+// opposed to a tool_result record, which belongs to the running turn).
+func (s *streamerState) isHumanPrompt(line []byte) bool {
+	var rec turnRecord
+	if json.Unmarshal(line, &rec) != nil {
+		return false
+	}
+	_, human := humanPrompt(rec)
+	return human
 }
 
 func (s *streamerState) isFresh(ts string) bool {
+	if s.sentAtSkew.IsZero() {
+		return true
+	}
 	if ts == "" {
 		return true // no timestamp = assume fresh
 	}
@@ -318,19 +382,20 @@ func (s *streamerState) isFresh(ts string) bool {
 }
 
 // handleAssistant processes an assistant record, emits tool_use events,
-// buffers text, and signals stop when stop_reason == "end_turn".
-// Returns (stopped, reason).
-func (s *streamerState) handleAssistant(hdr claudeRecordHeader) (bool, string) {
+// buffers text, and records a stop when stop_reason == "end_turn"; s.stop
+// decides when that stop ends the stream.
+func (s *streamerState) handleAssistant(hdr claudeRecordHeader) {
 	if len(hdr.Message) == 0 {
-		return false, ""
+		return
 	}
 	var msg claudeMessageEnvelope
 	if err := json.Unmarshal(hdr.Message, &msg); err != nil {
-		return false, ""
+		return
 	}
 	if msg.Role != "assistant" {
-		return false, ""
+		return
 	}
+	hasText := false
 
 	// Extract blocks: content can be string OR array of typed blocks.
 	var blocks []map[string]json.RawMessage
@@ -339,6 +404,7 @@ func (s *streamerState) handleAssistant(hdr claudeRecordHeader) (bool, string) {
 		var s2 string
 		if err := json.Unmarshal(msg.Content, &s2); err == nil {
 			s.appendText(msg.ID, hdr.Timestamp, s2)
+			hasText = hasText || s2 != ""
 		}
 	} else {
 		for _, blk := range blocks {
@@ -349,6 +415,7 @@ func (s *streamerState) handleAssistant(hdr claudeRecordHeader) (bool, string) {
 				var txt string
 				_ = json.Unmarshal(blk["text"], &txt)
 				s.appendText(msg.ID, hdr.Timestamp, txt)
+				hasText = hasText || txt != ""
 			case "tool_use":
 				// Flush pending text before tool_use so consumer
 				// sees "reasoning then tool call" ordering.
@@ -377,17 +444,12 @@ func (s *streamerState) handleAssistant(hdr claudeRecordHeader) (bool, string) {
 		}
 	}
 
-	// Natural stop: end_turn.
-	if msg.StopReason != nil {
-		switch *msg.StopReason {
-		case "end_turn", "stop_sequence", "max_tokens":
-			return true, *msg.StopReason
-		case "tool_use":
-			// Assistant paused on tool_use; the tool_result will
-			// arrive in a later user record. Don't stop.
-		}
+	// Natural stop: end_turn. tool_use pauses for a tool_result in a
+	// later user record and the turn continues.
+	if msg.StopReason != nil && turnEnded(*msg.StopReason) {
+		s.stop.observe(msg.ID, hasText)
+		s.stopReason = *msg.StopReason
 	}
-	return false, ""
 }
 
 // handleUser processes a user record; only tool_result blocks are emitted.

@@ -10,6 +10,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/asheshgoplani/agent-deck/internal/assistant"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
@@ -25,7 +26,7 @@ func buildWebServer(profile string, args []string, menuData web.MenuDataLoader, 
 	options, err := parseWebCommandOptions(args)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
-			os.Exit(0)
+			exitCLI(0)
 		}
 		return nil, err
 	}
@@ -34,6 +35,7 @@ func buildWebServer(profile string, args []string, menuData web.MenuDataLoader, 
 
 type webCommandOptions struct {
 	listenAddr       string
+	allowedHosts     stringValues
 	readOnly         bool
 	token            string
 	tokenFile        string
@@ -44,10 +46,19 @@ type webCommandOptions struct {
 	noTUI            bool
 }
 
+type stringValues []string
+
+func (v *stringValues) String() string { return strings.Join(*v, ", ") }
+func (v *stringValues) Set(s string) error {
+	*v = append(*v, s)
+	return nil
+}
+
 func parseWebCommandOptions(args []string) (webCommandOptions, error) {
 	var options webCommandOptions
 	fs := flag.NewFlagSet("web", flag.ContinueOnError)
 	fs.StringVar(&options.listenAddr, "listen", "127.0.0.1:8420", "Listen address for web server")
+	fs.Var(&options.allowedHosts, "allowed-host", "Additional exact HTTP Host (repeatable; optional :port)")
 	fs.BoolVar(&options.readOnly, "read-only", false, "Run in read-only mode (input disabled)")
 	fs.StringVar(&options.token, "token", "", "Bearer token for API/WS access")
 	fs.StringVar(&options.tokenFile, "token-file", "", "Read bearer token for API/WS access from a 0600 file (keeps the secret out of the process argv)")
@@ -85,6 +96,7 @@ func parseWebCommandOptions(args []string) (webCommandOptions, error) {
 		fmt.Println("configured — an unauthenticated server keeps those routes unavailable.")
 	}
 
+	routeFlagHelp(fs, args)
 	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		return webCommandOptions{}, err
 	}
@@ -143,8 +155,13 @@ func buildWebServerFromOptions(profile string, options webCommandOptions, menuDa
 	}
 
 	confirmLinkOpen := session.GetWebConfirmLinkOpen()
+	fileLinkRoots, refusedRoots := session.GetWebFileLinkRootsChecked()
+	for _, r := range refusedRoots {
+		fmt.Fprintf(os.Stderr, "Warning: [web] file_link_roots entry %q ignored: %s\n", r.Entry, r.Reason)
+	}
 	server := web.NewServer(web.Config{
 		ListenAddr:          options.listenAddr,
+		AllowedHosts:        append(session.GetWebAllowedHosts(), options.allowedHosts...),
 		Profile:             effectiveProfile,
 		ReadOnly:            options.readOnly,
 		WebMutations:        resolveMutationsEnabled(options.readOnly),
@@ -152,6 +169,7 @@ func buildWebServerFromOptions(profile string, options webCommandOptions, menuDa
 		InsecureBind:        options.insecureBind,
 		TrustedDomains:      session.GetWebTrustedDomains(),
 		ConfirmLinkOpen:     &confirmLinkOpen,
+		FileLinkRoots:       fileLinkRoots,
 		MenuData:            menuData,
 		PushVAPIDPublicKey:  resolvedPushPublic,
 		PushVAPIDPrivateKey: resolvedPushPrivate,
@@ -174,6 +192,16 @@ func buildWebServerFromOptions(profile string, options webCommandOptions, menuDa
 	// endpoint-by-endpoint regression matrix.
 	if resolvedToken != "" {
 		server.SetMCPManager(web.NewDefaultMCPManager())
+	}
+	// Assistant routes (/mcp, /api/assistant/v1/) always demand an
+	// assistant token of their own, so they are wired with or without an
+	// owner token. The owner form (/connect) uses the owner auth.
+	if store, err := connectStore(); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: assistant connections disabled: %v\n", err)
+	} else if self, err := os.Executable(); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: assistant connections disabled: locating agent-deck binary: %v\n", err)
+	} else {
+		server.SetAssistantService(assistant.NewService(store, assistant.BinaryExecutor{Path: self}, Version), connectBinaryPath())
 	}
 
 	return server, nil

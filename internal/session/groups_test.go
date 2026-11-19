@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -2355,16 +2356,18 @@ func TestFlatten_OrphanSubSessionsDeterministic(t *testing.T) {
 	}
 }
 
-// When orphaned sub-sessions share the same Order, the sort must still be
-// deterministic: without an ID tie-break, SliceStable would preserve the
-// randomized map-iteration order of subSessionsByParent and the rows could
-// drift between renders. They must emit in ID order.
+// When orphaned sub-sessions share the same Order, their rows must still be
+// deterministic. They used to be collected from the randomized
+// subSessionsByParent map and appended after every other top-level row, so
+// they needed an explicit tie-break. Since #2995 they are drawn in place, as
+// top-level rows at their group.Sessions position, so they emit in the
+// group's (stable-sorted) session order, the same order MoveSessionUp/Down
+// work on.
 func TestFlatten_OrphanSubSessionsDeterministic_TiedOrder(t *testing.T) {
 	t.Cleanup(func() { SetGroupSortMode("creation") })
 	SetGroupSortMode("creation")
 
-	// All orphans share Order 0 and live in distinct parent buckets, so the only
-	// stable discriminator is ID.
+	// All orphans share Order 0 and live in distinct parent buckets.
 	mk := func(id, parent string) *Instance {
 		return &Instance{ID: id, Title: id, GroupPath: "g", Order: 0, ParentSessionID: parent}
 	}
@@ -2386,10 +2389,13 @@ func TestFlatten_OrphanSubSessionsDeterministic_TiedOrder(t *testing.T) {
 		return got
 	}
 
-	want := []string{"s0", "s1", "s2"} // ID order, independent of input/map order
+	var want []string
+	for _, s := range tree.Groups["g"].Sessions {
+		want = append(want, s.ID)
+	}
 	for i := 0; i < 50; i++ {
 		if got := collect(); !equalStrings(got, want) {
-			t.Fatalf("tied-Order orphans not deterministic: iter %d got %v, want %v", i, got, want)
+			t.Fatalf("tied-Order orphans not deterministic: iter %d got %v, want group order %v", i, got, want)
 		}
 	}
 }
@@ -2609,4 +2615,184 @@ func TestDemoteSession_FirstActiveAboveArchivedIsNoOp(t *testing.T) {
 	if a1.ParentSessionID != "" {
 		t.Errorf("a1.ParentSessionID after no-op demote = %q, want %q", a1.ParentSessionID, "")
 	}
+}
+
+func sessionIDs(group *Group) []string {
+	ids := make([]string, 0, len(group.Sessions))
+	for _, s := range group.Sessions {
+		ids = append(ids, s.ID)
+	}
+	return ids
+}
+
+func assertGroupOrder(t *testing.T, group *Group, want []string) {
+	t.Helper()
+	got := sessionIDs(group)
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("slice order = %v, want %v", got, want)
+	}
+	for i, s := range group.Sessions {
+		if s.Order != i {
+			t.Errorf("Order of %q = %d, want %d", s.ID, s.Order, i)
+		}
+	}
+}
+
+// TestSetSessionOrder_MovesToIndexAndRenumbers is the launch-appended case:
+// every row at Order 0, the newest one last by rowid. Moving it to index 0
+// must put it first and turn the ties into explicit 0..n-1 values.
+func TestSetSessionOrder_MovesToIndexAndRenumbers(t *testing.T) {
+	instances := []*Instance{
+		{ID: "a", GroupPath: "g"},
+		{ID: "b", GroupPath: "g"},
+		{ID: "c", GroupPath: "g"},
+		{ID: "d", GroupPath: "g"},
+	}
+	tree := NewGroupTree(instances)
+	tree.SetSessionOrder(instances[3], 0)
+	assertGroupOrder(t, tree.Groups["g"], []string{"d", "a", "b", "c"})
+}
+
+func TestSetSessionOrder_MiddleIndex(t *testing.T) {
+	instances := []*Instance{
+		{ID: "a", GroupPath: "g"},
+		{ID: "b", GroupPath: "g"},
+		{ID: "c", GroupPath: "g"},
+		{ID: "d", GroupPath: "g"},
+	}
+	tree := NewGroupTree(instances)
+	tree.SetSessionOrder(instances[0], 2)
+	assertGroupOrder(t, tree.Groups["g"], []string{"b", "c", "a", "d"})
+}
+
+func TestSetSessionOrder_ClampsToEnd(t *testing.T) {
+	instances := []*Instance{
+		{ID: "a", GroupPath: "g"},
+		{ID: "b", GroupPath: "g"},
+		{ID: "c", GroupPath: "g"},
+		{ID: "d", GroupPath: "g"},
+	}
+	tree := NewGroupTree(instances)
+	tree.SetSessionOrder(instances[0], 99)
+	assertGroupOrder(t, tree.Groups["g"], []string{"b", "c", "d", "a"})
+}
+
+func TestSetSessionOrder_UnknownGroupNoOp(t *testing.T) {
+	instances := []*Instance{
+		{ID: "a", GroupPath: "g", Order: 0},
+		{ID: "b", GroupPath: "g", Order: 0},
+	}
+	tree := NewGroupTree(instances)
+	stray := &Instance{ID: "x", GroupPath: "elsewhere"}
+	tree.SetSessionOrder(stray, 0)
+	if got := sessionIDs(tree.Groups["g"]); strings.Join(got, ",") != "a,b" {
+		t.Fatalf("slice order changed to %v", got)
+	}
+	for _, s := range instances {
+		if s.Order != 0 {
+			t.Errorf("Order of %q = %d, want 0 (untouched)", s.ID, s.Order)
+		}
+	}
+}
+
+func TestSessionPosition_ReflectsSortedSlice(t *testing.T) {
+	instances := []*Instance{
+		{ID: "a", GroupPath: "g", Order: 0},
+		{ID: "b", GroupPath: "g", Order: 0},
+		{ID: "c", GroupPath: "g", Order: 3},
+		{ID: "d", GroupPath: "g", Order: 1},
+	}
+	tree := NewGroupTree(instances)
+	want := map[string]int{"a": 0, "b": 1, "d": 2, "c": 3}
+	for _, inst := range instances {
+		if got := tree.SessionPosition(inst); got != want[inst.ID] {
+			t.Errorf("SessionPosition(%q) = %d, want %d", inst.ID, got, want[inst.ID])
+		}
+	}
+	if got := tree.SessionPosition(&Instance{ID: "x", GroupPath: "g"}); got != -1 {
+		t.Errorf("SessionPosition(unknown) = %d, want -1", got)
+	}
+}
+
+func TestSetSessionOrder_SubSessionKeepsParent(t *testing.T) {
+	instances := []*Instance{
+		{ID: "p", GroupPath: "g"},
+		{ID: "q", GroupPath: "g"},
+		{ID: "p1", GroupPath: "g", ParentSessionID: "p"},
+		{ID: "p2", GroupPath: "g", ParentSessionID: "p"},
+	}
+	tree := NewGroupTree(instances)
+	tree.SetSessionOrder(instances[3], 0)
+	assertGroupOrder(t, tree.Groups["g"], []string{"p2", "p", "q", "p1"})
+	if instances[3].ParentSessionID != "p" {
+		t.Fatalf("parent cleared: %q", instances[3].ParentSessionID)
+	}
+	var rendered []string
+	for _, item := range tree.Flatten() {
+		if item.Type == ItemTypeSession {
+			rendered = append(rendered, item.Session.ID)
+		}
+	}
+	if got := strings.Join(rendered, ","); got != "p,p2,p1,q" {
+		t.Fatalf("rendered order = %s, want p,p2,p1,q", got)
+	}
+}
+
+// TestFlattenWithParentFolds (#2631): a folded parent keeps its own row and
+// omits its sub-sessions, while orphan sub-sessions (parent in another group)
+// and plain Flatten behavior stay untouched.
+func TestFlattenWithParentFolds(t *testing.T) {
+	instances := []*Instance{
+		{ID: "p1", Title: "parent-1", GroupPath: "group-a"},
+		{ID: "c1", Title: "child-1", GroupPath: "group-a", ParentSessionID: "p1"},
+		{ID: "c2", Title: "child-2", GroupPath: "group-a", ParentSessionID: "p1"},
+		// The orphan comes after "plain" in the slice: since #2995 an orphan
+		// is drawn in place among the top-level rows, not appended last.
+		{ID: "s1", Title: "plain", GroupPath: "group-b"},
+		{ID: "o1", Title: "orphan", GroupPath: "group-b", ParentSessionID: "elsewhere"},
+	}
+
+	tree := NewGroupTree(instances)
+
+	titles := func(items []Item) string {
+		parts := make([]string, 0, len(items))
+		for _, it := range items {
+			if it.Type == ItemTypeSession {
+				parts = append(parts, it.Session.Title)
+			}
+		}
+		return strings.Join(parts, ",")
+	}
+
+	// Baseline: no folds — historical Flatten order.
+	plain := tree.Flatten()
+	if got := titles(plain); got != "parent-1,child-1,child-2,plain,orphan" {
+		t.Fatalf("Flatten() = %s, want parent-1,child-1,child-2,plain,orphan", got)
+	}
+
+	// Fold p1's child list: parent stays, children gone.
+	folded := tree.FlattenWithParentFolds(map[string]bool{"p1": true})
+	if got := titles(folded); got != "parent-1,plain,orphan" {
+		t.Fatalf("FlattenWithParentFolds = %s, want parent-1,plain,orphan", got)
+	}
+	// The folded parent's row must carry IsLastInGroup: it is visually the
+	// last row of its group when nothing renders under it.
+	for _, it := range folded {
+		if it.Type == ItemTypeSession && it.Session.ID == "p1" && !it.IsLastInGroup {
+			t.Fatal("folded parent should be IsLastInGroup in group-a")
+		}
+	}
+
+	// Fold of a nonexistent parent is a no-op.
+	if got := titles(tree.FlattenWithParentFolds(map[string]bool{"nope": true})); got != "parent-1,child-1,child-2,plain,orphan" {
+		t.Fatalf("fold of unknown parent = %s, want parent-1,child-1,child-2,plain,orphan", got)
+	}
+
+	// The group header itself is never affected by parent folds.
+	for _, it := range folded {
+		if it.Type == ItemTypeGroup && it.Group != nil && it.Group.Path == "group-a" {
+			return
+		}
+	}
+	t.Fatal("group-a header missing from folded output")
 }

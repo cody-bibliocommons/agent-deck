@@ -1,18 +1,26 @@
 package main
 
 import (
+	"flag"
+	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/asheshgoplani/agent-deck/internal/testutil"
+	"github.com/asheshgoplani/agent-deck/tests/eval/harness"
 )
 
 // TestMain ensures all cmd tests use the _test profile to prevent
 // accidental modification of production data.
 // CRITICAL: This was missing and caused test data to overwrite production sessions!
 func TestMain(m *testing.M) {
+	// The ask tests re-run this test binary as the CLI with a fake vault
+	// (askHelperMain); it never runs the test suite.
+	askHelperMain()
 	os.Exit(runTestMain(m))
 }
 
@@ -32,13 +40,34 @@ func runTestMain(m *testing.M) int {
 	// real home, so data-safety is preserved by NOT re-isolating.
 	isHelperProcess := os.Getenv("AGENT_DECK_TASK6_HELPER_PROCESS") != ""
 
+	widenTestParallelism()
+
 	if !isHelperProcess {
+		// Pin the Go build and module caches before HOME moves: a test that
+		// runs `go build` itself (eval harness sandbox, goldens) would
+		// otherwise find an empty $HOME/.cache/go-build under the isolated
+		// HOME and recompile the whole module, about a minute per CI shard.
+		testutil.PinGoCaches()
+		// Build shared CLI fixture before HOME/XDG isolation so Go caches never
+		// become read-only debris inside a per-test directory.
+		if err := ensureChannelsCLIBinary(); err != nil {
+			fmt.Fprintf(os.Stderr, "prepare CLI fixture: %v\n", err)
+			return 1
+		}
 		// Isolate HOME+XDG so agent-deck path resolution lands in a temp dir,
 		// never the real ~/.agent-deck (2026-06-04 data-loss incident, S5).
 		// Must run before anything resolves a path. See internal/testutil/homeenv.go.
 		cleanupHome := testutil.IsolateHome()
 		defer cleanupHome()
+		cleanupServiceManagers, err := stubServiceManagers()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "stub service managers: %v\n", err)
+			return 1
+		}
+		defer cleanupServiceManagers()
 	}
+	os.Unsetenv("AGENTDECK_INSTANCE_ID")
+	os.Unsetenv("AGENT_DECK_SESSION_ID")
 
 	// Git hooks export GIT_DIR/GIT_WORK_TREE; clear them so test subprocess git
 	// commands operate on their temp repos instead of the real repository.
@@ -60,6 +89,14 @@ func runTestMain(m *testing.M) int {
 
 	// Run tests
 	code := m.Run()
+	// The subprocess tests share one agent-deck build in an
+	// agent-deck-eval-bin-* temp dir (~15 MB) that must outlive every test,
+	// so t.Cleanup cannot own it. Remove it here or it leaks on every run.
+	harness.RemoveBuildArtifacts()
+	if err := cleanupGoldensBinary(); err != nil {
+		fmt.Fprintf(os.Stderr, "cleanup goldens binary: %v\n", err)
+		code = 1
+	}
 
 	// Cleanup: Kill any orphaned test sessions after tests complete
 	// This prevents RAM waste from lingering test sessions
@@ -101,5 +138,27 @@ func cleanupTestSessions() {
 		if strings.Contains(sess, "Test-Skip-Regen") {
 			_ = exec.Command("tmux", "kill-session", "-t", sess).Run()
 		}
+	}
+}
+
+// widenTestParallelism gives the package's parallel tests two slots per CPU
+// when the run did not pass -parallel itself (#2797). Every test here that
+// calls t.Parallel (parallelSubprocessTest) spends its time waiting on child
+// processes, daemons and timers rather than on CPU, so with go test's default
+// of one slot per CPU the parallel phase queued behind those waits: about 90 s
+// of a 320 s package run with the CPUs mostly idle. An explicit -parallel
+// always wins.
+func widenTestParallelism() {
+	if !flag.Parsed() {
+		flag.Parse()
+	}
+	explicit := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "test.parallel" {
+			explicit = true
+		}
+	})
+	if !explicit {
+		_ = flag.Set("test.parallel", strconv.Itoa(2*runtime.GOMAXPROCS(0)))
 	}
 }

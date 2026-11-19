@@ -61,15 +61,18 @@ func TestNewDialog_SetSize_syncsPathInputWidth(t *testing.T) {
 	d := NewNewDialog()
 
 	d.SetSize(120, 40)
-	// Preferred outer width 84 → text fields 84 − 12 = 72.
-	if got := d.pathInput.Width; got != 72 {
-		t.Fatalf("wide terminal: pathInput.Width = %d, want 72", got)
+	// Preferred outer width 84 → text fields 84 − 12 = 72; Path carries its
+	// label on the same line (ASK-211), 7 columns more than the old indent,
+	// and one cell for the field bar's cursor cell (round 2).
+	if got := d.pathInput.Width; got != 64 {
+		t.Fatalf("wide terminal: pathInput.Width = %d, want 64", got)
 	}
 
 	d.SetSize(55, 40)
-	// Outer shrinks to terminal−10 (45), above min 44 → inputs 45 − 12 = 33.
-	if got := d.pathInput.Width; got != 33 {
-		t.Fatalf("narrow terminal: pathInput.Width = %d, want 33", got)
+	// Outer shrinks to terminal−10 (45), above min 44 → inputs 45 − 12 = 33,
+	// less the inline label and the cursor cell: 25.
+	if got := d.pathInput.Width; got != 25 {
+		t.Fatalf("narrow terminal: pathInput.Width = %d, want 25", got)
 	}
 }
 
@@ -89,7 +92,7 @@ func TestNewDialog_ModelInputForCodex(t *testing.T) {
 	if !strings.Contains(view, "Model ID") {
 		t.Fatal("codex new-session dialog should render a model input")
 	}
-	if !strings.Contains(view, "gpt-5.6-sol") || !strings.Contains(view, "gpt-5.5") {
+	if !strings.Contains(view, "gpt-6-sol") || !strings.Contains(view, "gpt-5.5") {
 		t.Fatalf("codex model hints should include current ChatGPT versions: %q", view)
 	}
 
@@ -99,8 +102,8 @@ func TestNewDialog_ModelInputForCodex(t *testing.T) {
 	}
 }
 
-func TestKnownModelIDsForTool_CodexStartsWithGPT56Tiers(t *testing.T) {
-	want := []string{"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"}
+func TestKnownModelIDsForTool_CodexStartsWithGPT6Tiers(t *testing.T) {
+	want := []string{"gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"}
 	got := knownModelIDsForTool("codex")
 	if len(got) < len(want) || !reflect.DeepEqual(got[:len(want)], want) {
 		t.Fatalf("Codex model catalog prefix = %v, want %v", got, want)
@@ -123,7 +126,7 @@ func TestNewDialog_ModelInputForClaude(t *testing.T) {
 	if !strings.Contains(view, "Model ID") {
 		t.Fatal("claude new-session dialog should render a model input")
 	}
-	if !strings.Contains(view, "claude-opus-5") || !strings.Contains(view, "claude-sonnet-5") {
+	if !strings.Contains(view, "claude-opus-5-5") || !strings.Contains(view, "claude-sonnet-5") {
 		t.Fatalf("claude model hints should include current Claude versions: %q", view)
 	}
 
@@ -144,12 +147,12 @@ func TestNewDialog_ModelSuggestions_FilterAndSelectClaude(t *testing.T) {
 	d.modelInput.SetValue("opus")
 	d.filterModelSuggestions()
 
-	if len(d.modelSuggestions) == 0 || d.modelSuggestions[0] != "claude-opus-5" {
-		t.Fatalf("filtered model suggestions = %v, want claude-opus-5 first", d.modelSuggestions)
+	if len(d.modelSuggestions) == 0 || d.modelSuggestions[0] != "claude-opus-5-5" {
+		t.Fatalf("filtered model suggestions = %v, want claude-opus-5-5 first", d.modelSuggestions)
 	}
-	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeySpace}) // Space opens the list; Enter advances (newdialog_flow_test.go)
 	if !d.IsModelSuggestionsActive() {
-		t.Fatal("enter on model input should activate the model suggestions dropdown")
+		t.Fatal("space on model input should activate the model suggestions dropdown")
 	}
 	if view := d.View(); !strings.Contains(view, "Type custom model ID") || !strings.Contains(view, "claude-opus-5") {
 		t.Fatalf("model dropdown should show custom entry and known model IDs after enter: %q", view)
@@ -160,8 +163,8 @@ func TestNewDialog_ModelSuggestions_FilterAndSelectClaude(t *testing.T) {
 	}
 	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyEnter})
 
-	if got := d.GetLaunchModelID(); got != "claude-opus-5" {
-		t.Fatalf("GetLaunchModelID() = %q, want claude-opus-5", got)
+	if got := d.GetLaunchModelID(); got != "claude-opus-5-5" {
+		t.Fatalf("GetLaunchModelID() = %q, want claude-opus-5-5", got)
 	}
 	// Accepting a model advances focus off the model field. The exact next
 	// target depends on the focus order rebuildFocusTargets produces — Path
@@ -172,12 +175,11 @@ func TestNewDialog_ModelSuggestions_FilterAndSelectClaude(t *testing.T) {
 	}
 }
 
-// TestPreselectDefaultModel covers the catalog-membership gate in
-// preselectDefaultModel: a [claude] default_model is honored only when the ID
-// is in knownModelIDsForTool. An ID missing from the catalog is discarded
-// silently — no error, no log — so the session launches with no --model flag
-// at all. That is how a valid `default_model = "claude-opus-5"` became inert
-// while the catalog still stopped at 4.8.
+// TestPreselectDefaultModel covers preselectDefaultModel. The model catalog
+// is a suggestion source, not an allowlist (#2388): a configured
+// [claude] default_model is always prefilled, even when this build's catalog
+// does not know it (a model newer than the build, or an alias). Dropping it
+// silently used to launch the session on the tool default instead.
 func TestPreselectDefaultModel(t *testing.T) {
 	withModel := func(id string) *session.UserConfig {
 		cfg := &session.UserConfig{}
@@ -192,9 +194,10 @@ func TestPreselectDefaultModel(t *testing.T) {
 		want   string
 	}{
 		{"in catalog is honored", withModel("claude-opus-5"), "claude", "claude-opus-5"},
+		{"newest Opus is honored", withModel("claude-opus-5-5"), "claude", "claude-opus-5-5"},
 		{"older in-catalog ID still honored", withModel("claude-opus-4-8"), "claude", "claude-opus-4-8"},
-		{"unknown ID degrades to unset", withModel("claude-opus-9"), "claude", ""},
-		{"bare alias is not a catalog ID", withModel("opus"), "claude", ""},
+		{"unknown ID passes through", withModel("claude-opus-9"), "claude", "claude-opus-9"},
+		{"bare alias passes through", withModel("opus"), "claude", "opus"},
 		{"surrounding whitespace tolerated", withModel("  claude-sonnet-5  "), "claude", "claude-sonnet-5"},
 		{"empty default is unset", withModel(""), "claude", ""},
 		{"nil config is safe", nil, "claude", ""},
@@ -223,9 +226,9 @@ func TestNewDialog_ModelSuggestions_FilterAndSelectCodex(t *testing.T) {
 	if len(d.modelSuggestions) != 3 || d.modelSuggestions[0] != "gpt-5.6-sol" {
 		t.Fatalf("filtered model suggestions = %v, want three GPT-5.6 tiers with Sol first", d.modelSuggestions)
 	}
-	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeySpace}) // Space opens the list; Enter advances (newdialog_flow_test.go)
 	if !d.IsModelSuggestionsActive() {
-		t.Fatal("enter on model input should activate the model suggestions dropdown")
+		t.Fatal("space on model input should activate the model suggestions dropdown")
 	}
 	if view := d.View(); !strings.Contains(view, "Type custom model ID") || !strings.Contains(view, "gpt-5.6-terra") || !strings.Contains(view, "gpt-5.6-luna") {
 		t.Fatalf("model dropdown should show custom entry and known model IDs after enter: %q", view)
@@ -322,24 +325,25 @@ func TestNewDialog_ModelDropdown_TabAndShiftTabMoveFocus(t *testing.T) {
 	d.focusIndex = d.indexOf(focusModel)
 	d.updateFocus()
 
+	// ASK-211: Path sits between Agent and the model row.
 	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
-	if d.currentTarget() != focusCommand {
-		t.Fatalf("currentTarget after shift+tab from model field = %v, want focusCommand", d.currentTarget())
+	if d.currentTarget() != focusPath {
+		t.Fatalf("currentTarget after shift+tab from model field = %v, want focusPath", d.currentTarget())
 	}
 
 	d.focusIndex = d.indexOf(focusModel)
 	d.updateFocus()
-	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeySpace}) // Space opens the list; Enter advances (newdialog_flow_test.go)
 	if !d.IsModelSuggestionsActive() {
-		t.Fatal("enter on model input should activate model suggestions")
+		t.Fatal("space on model input should activate model suggestions")
 	}
 
 	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
 	if d.IsModelSuggestionsActive() {
 		t.Fatal("shift+tab should close the model dropdown")
 	}
-	if d.currentTarget() != focusCommand {
-		t.Fatalf("currentTarget after shift+tab from model dropdown = %v, want focusCommand", d.currentTarget())
+	if d.currentTarget() != focusPath {
+		t.Fatalf("currentTarget after shift+tab from model dropdown = %v, want focusPath", d.currentTarget())
 	}
 
 	for d.currentTarget() != focusName {
@@ -351,7 +355,7 @@ func TestNewDialog_ModelDropdown_TabAndShiftTabMoveFocus(t *testing.T) {
 
 	d.focusIndex = d.indexOf(focusModel)
 	d.updateFocus()
-	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeySpace}) // Space opens the list; Enter advances (newdialog_flow_test.go)
 	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyTab})
 	if d.IsModelSuggestionsActive() {
 		t.Fatal("tab should close the model dropdown")
@@ -373,6 +377,12 @@ func TestNewDialog_TabFromLastFieldCyclesToTop(t *testing.T) {
 	}
 	d.updateFocus()
 
+	// The Create button follows the (single-row) codex options panel; Tab from
+	// it wraps to the top of the form.
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if d.currentTarget() != focusCreate {
+		t.Fatalf("currentTarget after tab from options = %v, want focusCreate", d.currentTarget())
+	}
 	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyTab})
 	if d.currentTarget() != focusName {
 		t.Fatalf("currentTarget after tab from last field = %v, want focusName", d.currentTarget())
@@ -433,8 +443,9 @@ func TestDisplayCommandPreset(t *testing.T) {
 func TestDialogPresetCommands(t *testing.T) {
 	d := NewNewDialog()
 
-	// Should have shell (empty), claude, gemini, opencode, codex, pi, copilot, crush, cursor, hermes, deepseek
-	expectedCommands := []string{"", "claude", "gemini", "opencode", "codex", "pi", "copilot", "crush", "cursor", "hermes", "deepseek", "kiro-cli"}
+	// Should have shell (empty), claude, gemini, opencode, opencode2, codex, pi, copilot, crush, muse, cursor, hermes, deepseek, omp, kiro-cli.
+	// opencode2 is a launcher alias; persisted tool identity remains opencode.
+	expectedCommands := []string{"", "claude", "gemini", "opencode", "opencode2", "codex", "pi", "copilot", "crush", "muse", "cursor", "hermes", "deepseek", "omp", "kiro-cli"}
 
 	if len(d.presetCommands) != len(expectedCommands) {
 		t.Errorf("Expected %d preset commands, got %d", len(expectedCommands), len(d.presetCommands))
@@ -1313,7 +1324,8 @@ func TestNewDialog_ShortcutsBlockedDuringTextInput(t *testing.T) {
 // type name -> Enter (advances to Tool) -> (tool already right) -> Ctrl+S.
 func TestNewDialog_FocusOrder_HotPathNameToolPath(t *testing.T) {
 	d := NewNewDialog()
-	d.Show() // default: shell selected (no model field), multi-repo off.
+	d.Show()              // default: shell selected (no model field), multi-repo off.
+	d.toggleMoreOptions() // ASK-211: the folded rows, opened
 
 	if len(d.focusTargets) < 3 {
 		t.Fatalf("focusTargets too short: %v", d.focusTargets)
@@ -1339,7 +1351,8 @@ func TestNewDialog_FocusOrder_HotPathNameToolPath(t *testing.T) {
 	}
 }
 
-// With a reasoning-capable tool, Model and Reasoning sit between Tool and Path.
+// ASK-211: Name, Agent and Path come first (one line each, Path visible at
+// 80x24); Model and Reasoning follow Path.
 func TestNewDialog_FocusOrder_ModelAndReasoningBetweenToolAndPath(t *testing.T) {
 	d := NewNewDialog()
 	d.SetDefaultTool("claude")
@@ -1355,8 +1368,8 @@ func TestNewDialog_FocusOrder_ModelAndReasoningBetweenToolAndPath(t *testing.T) 
 	if reasoningIdx < 0 {
 		t.Fatal("focusReasoningEffort should be present for Claude")
 	}
-	if !(cmdIdx < modelIdx && modelIdx < reasoningIdx && reasoningIdx < pathIdx) {
-		t.Fatalf("want Tool(%d) < Model(%d) < Reasoning(%d) < Path(%d)", cmdIdx, modelIdx, reasoningIdx, pathIdx)
+	if !(cmdIdx < pathIdx && pathIdx < modelIdx && modelIdx < reasoningIdx) {
+		t.Fatalf("want Tool(%d) < Path(%d) < Model(%d) < Reasoning(%d)", cmdIdx, pathIdx, modelIdx, reasoningIdx)
 	}
 }
 
@@ -1423,6 +1436,7 @@ func TestNewDialog_View_ShowsWorktreeCheckbox(t *testing.T) {
 	dialog := NewNewDialog()
 	dialog.SetSize(80, 40)
 	dialog.Show()
+	dialog.toggleMoreOptions()                       // ASK-211: behind "More options"
 	dialog.focusIndex = dialog.indexOf(focusCommand) // Command field
 
 	view := dialog.View()
@@ -1461,6 +1475,7 @@ func TestNewDialog_View_HidesBranchInputWhenDisabled(t *testing.T) {
 	dialog := NewNewDialog()
 	dialog.SetSize(80, 40)
 	dialog.Show()
+	dialog.toggleMoreOptions() // ASK-211: behind "More options"
 	dialog.worktreeEnabled = false
 
 	view := dialog.View()
@@ -1554,6 +1569,7 @@ func TestNewDialog_WorktreeCheckbox_SpaceToggle(t *testing.T) {
 	dialog.sandboxEnabled = false
 	dialog.inheritedSettings = nil
 	dialog.rebuildFocusTargets()
+	dialog.toggleMoreOptions()                        // ASK-211: behind "More options"
 	dialog.focusIndex = dialog.indexOf(focusWorktree) // Worktree checkbox
 
 	// Space toggles worktree on.
@@ -1581,6 +1597,7 @@ func TestNewDialog_SandboxCheckbox_SpaceToggle(t *testing.T) {
 	dialog := NewNewDialog()
 	dialog.Show()
 	dialog.sandboxEnabled = false                    // Ensure known initial state.
+	dialog.toggleMoreOptions()                       // ASK-211: behind "More options"
 	dialog.focusIndex = dialog.indexOf(focusSandbox) // Sandbox checkbox
 
 	// Space toggles sandbox on.
@@ -1604,6 +1621,7 @@ func TestNewDialog_CheckboxesFocusIndependently(t *testing.T) {
 	dialog.SetSize(80, 40)
 	dialog.Show()
 
+	dialog.toggleMoreOptions() // ASK-211: behind "More options"
 	// Focus on worktree checkbox — only it should highlight.
 	dialog.focusIndex = dialog.indexOf(focusWorktree)
 	view := dialog.View()
@@ -1742,14 +1760,18 @@ func TestNewDialog_AutoBranch_NameEditedToUnsanitizable_ClearsStaleBranch(t *tes
 	}
 }
 
+// With Name and Path both empty there is no name to derive a branch from.
+// (#2913: with a path, an empty name's branch comes from the derived name;
+// see TestNewSession2913_WorktreeWithEmptyNameFillsBranch.)
 func TestNewDialog_ToggleWorktree_EmptyName_NoBranch(t *testing.T) {
 	d := NewNewDialog()
-	// Name is empty
+	// Name and Path are empty
+	d.pathInput.SetValue("")
 
 	d.ToggleWorktree()
 
 	if d.branchInput.Value() != "" {
-		t.Errorf("branch should be empty when name is empty, got %q", d.branchInput.Value())
+		t.Errorf("branch should be empty when name and path are empty, got %q", d.branchInput.Value())
 	}
 }
 
@@ -2713,10 +2735,11 @@ func TestNewDialog_CtrlSInertWhileDropdownActive(t *testing.T) {
 	d.Show()
 	d.SetPathSuggestions([]string{"/tmp/a", "/tmp/b"})
 
-	// Open the path suggestions dropdown.
+	// Open the path suggestions dropdown (Space on the soft-selected pre-fill;
+	// Enter on an existing directory advances instead).
 	d.focusIndex = d.indexOf(focusPath)
 	d.updateFocus()
-	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyEnter}) // focusPath Enter opens dropdown
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeySpace})
 	if !d.IsSuggestionsActive() {
 		t.Fatal("path dropdown should be active after Enter on Path")
 	}
@@ -2860,18 +2883,23 @@ func TestNewDialog_TabFromNameStillAdvances(t *testing.T) {
 	}
 }
 
-// --- Default behavior (UX top-3 #1: Enter-advances is now the DEFAULT) ---
+// --- Enter-advances walk (default from UX top-3 #1 until ASK-110; now opt-in) ---
 
-// DEFAULT (Enter-advances ON): Enter on the Name field is handled locally and
-// advances focus instead of submitting — typing a name + Enter no longer
-// silently creates a session with all defaults. This is the behavior flip.
-func TestNewDialog_DefaultEnterOnNameAdvances(t *testing.T) {
+// The default is Enter-creates since ASK-110 (no config →
+// newSessionEnterAdvancesFromConfig returns false); pinned here so the flip is
+// load-bearing.
+func TestNewDialog_DefaultEnterCreates(t *testing.T) {
 	d := NewNewDialog()
-	// enterAdvances now defaults to true (no config → newSessionEnterAdvancesFromConfig
-	// returns true). Assert it explicitly so the new default is load-bearing here.
-	if !d.enterAdvances {
-		t.Fatal("enterAdvances default = false, want true (Enter-advances is now the default)")
+	if d.enterAdvances {
+		t.Fatal("enterAdvances default = true, want false (Enter creates by default since ASK-110)")
 	}
+}
+
+// OPT-IN (Enter-advances ON): Enter on the Name field is handled locally and
+// advances focus instead of submitting.
+func TestNewDialog_OptInEnterOnNameAdvances(t *testing.T) {
+	d := NewNewDialog()
+	d.enterAdvances = true // simulate [ui].new_session_enter_advances = true
 	d.SetSize(100, 50)
 	d.Show()
 
@@ -2880,12 +2908,12 @@ func TestNewDialog_DefaultEnterOnNameAdvances(t *testing.T) {
 	}
 	// shouldHandleEnterLocally must be true on Name so the dialog advances focus.
 	if !d.shouldHandleEnterLocally() {
-		t.Fatal("default mode: shouldHandleEnterLocally on Name = false, want true (Enter must advance, not submit)")
+		t.Fatal("opt-in mode: shouldHandleEnterLocally on Name = false, want true (Enter must advance, not submit)")
 	}
 	before := d.currentTarget()
 	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	if d.currentTarget() == before {
-		t.Fatalf("default mode: Enter on Name did not advance focus (still %v)", before)
+		t.Fatalf("opt-in mode: Enter on Name did not advance focus (still %v)", before)
 	}
 }
 
@@ -2910,12 +2938,10 @@ func TestNewDialog_OptOutEnterOnNameSubmits(t *testing.T) {
 	}
 }
 
-// DEFAULT (Enter-advances ON): Enter on the Branch field advances focus.
-func TestNewDialog_DefaultEnterOnBranchAdvances(t *testing.T) {
+// OPT-IN (Enter-advances ON): Enter on the Branch field advances focus.
+func TestNewDialog_OptInEnterOnBranchAdvances(t *testing.T) {
 	d := NewNewDialog()
-	if !d.enterAdvances {
-		t.Fatal("enterAdvances default = false, want true")
-	}
+	d.enterAdvances = true // simulate [ui].new_session_enter_advances = true
 	d.SetSize(100, 50)
 	d.Show()
 	d.nameInput.SetValue("demo")
@@ -2929,12 +2955,12 @@ func TestNewDialog_DefaultEnterOnBranchAdvances(t *testing.T) {
 	d.updateFocus()
 
 	if !d.shouldHandleEnterLocally() {
-		t.Fatal("default mode: shouldHandleEnterLocally on Branch = false, want true (Enter must advance)")
+		t.Fatal("opt-in mode: shouldHandleEnterLocally on Branch = false, want true (Enter must advance)")
 	}
 	before := d.currentTarget()
 	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	if d.currentTarget() == before {
-		t.Fatalf("default mode: Enter on Branch did not advance focus (still %v)", before)
+		t.Fatalf("opt-in mode: Enter on Branch did not advance focus (still %v)", before)
 	}
 }
 

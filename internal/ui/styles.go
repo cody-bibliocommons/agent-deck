@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -23,6 +24,9 @@ var darkColors = struct {
 	Bg, Surface, Border, Text, TextDim  lipgloss.Color
 	Accent, Purple, Cyan, Green, Yellow lipgloss.Color
 	Orange, Red, Comment                lipgloss.Color
+	// Brand mark dots (running, waiting, idle) for a dark terminal: the
+	// brand kit's values, with its fixed 256- and 16-colour fallbacks.
+	BrandRunning, BrandWaiting, BrandIdle lipgloss.CompleteColor
 }{
 	Bg:      lipgloss.Color("#1a1b26"),
 	Surface: lipgloss.Color("#24283b"),
@@ -37,6 +41,10 @@ var darkColors = struct {
 	Orange:  lipgloss.Color("#ff9e64"),
 	Red:     lipgloss.Color("#f7768e"),
 	Comment: lipgloss.Color("#787fa0"),
+
+	BrandRunning: lipgloss.CompleteColor{TrueColor: "#5CC98F", ANSI256: "78", ANSI: "2"},
+	BrandWaiting: lipgloss.CompleteColor{TrueColor: "#E8B464", ANSI256: "179", ANSI: "3"},
+	BrandIdle:    lipgloss.CompleteColor{TrueColor: "#959DBD", ANSI256: "103", ANSI: "8"},
 }
 
 // Light Theme - Tokyo Night Light variant
@@ -44,6 +52,8 @@ var lightColors = struct {
 	Bg, Surface, Border, Text, TextDim  lipgloss.Color
 	Accent, Purple, Cyan, Green, Yellow lipgloss.Color
 	Orange, Red, Comment                lipgloss.Color
+	// Brand mark dots for a light terminal (darker, readable on white).
+	BrandRunning, BrandWaiting, BrandIdle lipgloss.CompleteColor
 }{
 	Bg:      lipgloss.Color("#d5d6db"),
 	Surface: lipgloss.Color("#e9e9ec"),
@@ -58,6 +68,10 @@ var lightColors = struct {
 	Orange:  lipgloss.Color("#965027"),
 	Red:     lipgloss.Color("#8c4351"),
 	Comment: lipgloss.Color("#6a6d7c"),
+
+	BrandRunning: lipgloss.CompleteColor{TrueColor: "#485E30", ANSI256: "64", ANSI: "2"},
+	BrandWaiting: lipgloss.CompleteColor{TrueColor: "#855710", ANSI256: "94", ANSI: "3"},
+	BrandIdle:    lipgloss.CompleteColor{TrueColor: "#5E6170", ANSI256: "60", ANSI: "0"},
 }
 
 // Active color variables (set by InitTheme)
@@ -75,6 +89,11 @@ var (
 	ColorOrange  lipgloss.Color
 	ColorRed     lipgloss.Color
 	ColorComment lipgloss.Color
+
+	// Brand mark dot colours (see RenderBrandMark).
+	ColorBrandRunning lipgloss.CompleteColor
+	ColorBrandWaiting lipgloss.CompleteColor
+	ColorBrandIdle    lipgloss.CompleteColor
 )
 
 // themeMu protects global color/style variables during live theme switches.
@@ -101,6 +120,9 @@ func InitTheme(theme string) {
 		ColorOrange = lightColors.Orange
 		ColorRed = lightColors.Red
 		ColorComment = lightColors.Comment
+		ColorBrandRunning = lightColors.BrandRunning
+		ColorBrandWaiting = lightColors.BrandWaiting
+		ColorBrandIdle = lightColors.BrandIdle
 	} else {
 		currentTheme = ThemeDark
 		ColorBg = darkColors.Bg
@@ -116,6 +138,9 @@ func InitTheme(theme string) {
 		ColorOrange = darkColors.Orange
 		ColorRed = darkColors.Red
 		ColorComment = darkColors.Comment
+		ColorBrandRunning = darkColors.BrandRunning
+		ColorBrandWaiting = darkColors.BrandWaiting
+		ColorBrandIdle = darkColors.BrandIdle
 	}
 	// Reinitialize styles with new colors
 	initStyles()
@@ -191,6 +216,7 @@ const (
 	IconOpenCode = "🌐"
 	IconCodex    = "💻"
 	IconPi       = "π"
+	IconOMP      = "⌥"
 	IconShell    = "🐚"
 )
 
@@ -283,9 +309,6 @@ var (
 	ColorWarning  lipgloss.Color
 	ColorPrimary  lipgloss.Color
 )
-
-// LogoBorderStyle for the grid lines
-var LogoBorderStyle lipgloss.Style
 
 // LogoFrames kept for backward compatibility (empty state default)
 var LogoFrames = [][]string{
@@ -525,12 +548,14 @@ func initStyles() {
 		"hermes":   lipgloss.NewStyle().Foreground(ColorYellow),
 		"deepseek": lipgloss.NewStyle().Foreground(ColorCyan),
 		"pi":       lipgloss.NewStyle().Foreground(ColorAccent),
+		"omp":      lipgloss.NewStyle().Foreground(ColorAccent),
 		"aider":    lipgloss.NewStyle().Foreground(ColorRed),
 		"cursor":   lipgloss.NewStyle().Foreground(ColorAccent),
 		"shell":    lipgloss.NewStyle().Foreground(ColorText),
 		"opencode": lipgloss.NewStyle().Foreground(ColorText),
 		"crush":    lipgloss.NewStyle().Foreground(ColorPurple),
 		"kiro-cli": lipgloss.NewStyle().Foreground(ColorGreen),
+		"muse":     lipgloss.NewStyle().Foreground(ColorGreen),
 	}
 
 	// DefaultToolStyle
@@ -552,8 +577,6 @@ func initStyles() {
 	ColorWarning = ColorYellow
 	ColorPrimary = ColorAccent
 
-	// LogoBorderStyle
-	LogoBorderStyle = lipgloss.NewStyle().Foreground(ColorBorder)
 }
 
 // Helper Functions
@@ -589,12 +612,15 @@ func StatusIndicator(status string) string {
 	}
 }
 
-// ToolIcon returns the icon for a given tool
-// Checks user config for custom tools first, then falls back to built-ins
+// ToolIcon returns the icon for a given tool.
+// The tool registry (built-ins plus [tools.<name>] custom entries) is the
+// source of truth; the switch below is the fallback for names the registry
+// does not know (issue #2136).
 func ToolIcon(tool string) string {
-	// Use session.GetToolIcon which handles custom + built-in
-	// Import would be circular, so we duplicate the logic here
-	// Custom icons are handled by the session layer's GetToolDef
+	tool = session.CanonicalToolName(tool)
+	if icon := session.ToolIconFor(tool); icon != "" {
+		return icon
+	}
 	switch tool {
 	case "claude":
 		return IconClaude
@@ -608,6 +634,8 @@ func ToolIcon(tool string) string {
 		return "🐙"
 	case "crush":
 		return "💘"
+	case "muse":
+		return "🔮"
 	case "cursor":
 		return "📝"
 	case "hermes":
@@ -618,6 +646,8 @@ func ToolIcon(tool string) string {
 		return "👻"
 	case "pi":
 		return IconPi
+	case "omp":
+		return IconOMP
 	case "shell":
 		return IconShell
 	default:
@@ -627,7 +657,16 @@ func ToolIcon(tool string) string {
 
 // ToolColor returns the brand color for a given tool
 // Claude=orange (Anthropic), Gemini=purple (Google AI), Codex=cyan, Pi=accent, Aider=red
+//
+// The tool registry is the source of truth: built-ins carry a palette slot
+// name that is resolved against the active theme here, and custom tools may
+// set color = "<lipgloss value>" in config. The switch below is the fallback
+// for names the registry does not know (issue #2136).
 func ToolColor(tool string) lipgloss.Color {
+	tool = session.CanonicalToolName(tool)
+	if c, ok := paletteColor(session.ToolColorFor(tool)); ok {
+		return c
+	}
 	switch tool {
 	case "claude":
 		return ColorOrange // Anthropic's orange
@@ -639,6 +678,8 @@ func ToolColor(tool string) lipgloss.Color {
 		return ColorAccent // Blue for GitHub Copilot
 	case "crush":
 		return ColorPurple // Pink/magenta for Charm Crush
+	case "muse":
+		return ColorGreen // Green for Muse Code
 	case "cursor":
 		return ColorAccent // Blue for Cursor
 	case "hermes":
@@ -649,6 +690,8 @@ func ToolColor(tool string) lipgloss.Color {
 		return ColorGreen // Green for AWS Kiro CLI
 	case "pi":
 		return ColorAccent
+	case "omp":
+		return ColorAccent
 	case "aider":
 		return ColorRed // Red for Aider
 	default:
@@ -656,85 +699,89 @@ func ToolColor(tool string) lipgloss.Color {
 	}
 }
 
-// GetToolStyle returns cached style for tool or default.
+// paletteColor resolves a registry color value to a lipgloss color. Palette
+// slot names map to the active theme's variables so live theme switches keep
+// working; any other non-empty value is passed to lipgloss verbatim (custom
+// tool hex or ANSI colors). "" reports false so callers use their fallback.
+func paletteColor(value string) (lipgloss.Color, bool) {
+	switch value {
+	case "":
+		return "", false
+	case "orange":
+		return ColorOrange, true
+	case "purple":
+		return ColorPurple, true
+	case "cyan":
+		return ColorCyan, true
+	case "accent":
+		return ColorAccent, true
+	case "yellow":
+		return ColorYellow, true
+	case "red":
+		return ColorRed, true
+	case "green":
+		return ColorGreen, true
+	default:
+		return lipgloss.Color(value), true
+	}
+}
+
+// GetToolStyle returns the style for tool: the registry's color (built-in
+// palette slot or custom [tools.<name>].color) if one resolves, else the
+// cached built-in style, else DefaultToolStyle. This is the function every
+// row/preview render call site actually uses, so it must consult the
+// registry the same way ToolColor() does rather than only the hardcoded
+// ToolStyleCache (issue #2136 — ToolColor() alone was never wired in here).
 // Read-locked to protect against concurrent map access during live theme switches.
 func GetToolStyle(tool string) lipgloss.Style {
 	themeMu.RLock()
 	defer themeMu.RUnlock()
+	if c, ok := paletteColor(session.ToolColorFor(tool)); ok {
+		return lipgloss.NewStyle().Foreground(c)
+	}
 	if style, ok := ToolStyleCache[tool]; ok {
 		return style
 	}
 	return DefaultToolStyle
 }
 
-// RenderLogoIndicator renders a single indicator with appropriate color
-func RenderLogoIndicator(indicator string) string {
-	var color lipgloss.Color
-	switch indicator {
-	case "●":
-		color = ColorGreen // Running
-	case "◐":
-		color = ColorYellow // Waiting
-	case "○":
-		color = ColorTextDim // Idle
-	default:
-		color = ColorTextDim
-	}
-	return lipgloss.NewStyle().Foreground(color).Bold(true).Render(indicator)
+// BrandMarkText is the agent-deck mark in its plain form: running and
+// waiting as filled dots, idle as a hollow ring. Three cells wide.
+const BrandMarkText = "●●○"
+
+// brandMarkWidth is the cells the mark plus its one-space gap take in front
+// of a name ("●●○ Agent Deck").
+const brandMarkWidth = 4
+
+// RenderBrandMark renders the agent-deck mark in the brand colours of the
+// active theme (dark or light). The colour profile picks truecolor, the
+// 256-colour or the 16-colour value; with no colour it is BrandMarkText.
+// No background and no bold, so the terminal's own background shows.
+func RenderBrandMark() string {
+	return renderBrandMarkLit(true, true, true)
 }
 
-// getLogoIndicators returns 3 indicators based on actual session status counts
-// Priority: Running > Waiting > Idle
-// Shows up to 3 indicators reflecting the real state
-func getLogoIndicators(running, waiting, idle int) []string {
-	indicators := make([]string, 0, 3)
-
-	// Add running indicators (green ●)
-	for i := 0; i < running && len(indicators) < 3; i++ {
-		indicators = append(indicators, "●")
+// renderBrandMarkLit renders the mark with only the lit dots in their brand
+// colour; an unlit dot keeps its glyph in the comment colour (the splash
+// screens light the dots in turn while they wait).
+func renderBrandMarkLit(running, waiting, idle bool) string {
+	dot := func(lit bool, c lipgloss.TerminalColor, glyph string) string {
+		if !lit {
+			c = ColorComment
+		}
+		return lipgloss.NewStyle().Foreground(c).Render(glyph)
 	}
-
-	// Add waiting indicators (yellow ◐)
-	for i := 0; i < waiting && len(indicators) < 3; i++ {
-		indicators = append(indicators, "◐")
-	}
-
-	// Fill remaining with idle (gray ○)
-	for len(indicators) < 3 {
-		indicators = append(indicators, "○")
-	}
-
-	return indicators
+	return dot(running, ColorBrandRunning, "●") +
+		dot(waiting, ColorBrandWaiting, "●") +
+		dot(idle, ColorBrandIdle, "○")
 }
 
-// RenderLogoCompact renders the compact inline logo for the header
-// Shows REAL status: running=●, waiting=◐, idle=○
-// Format: ⟨ ● │ ◐ │ ○ ⟩  (using angle brackets for modern look)
-func RenderLogoCompact(running, waiting, idle int) string {
-	indicators := getLogoIndicators(running, waiting, idle)
-	bracketStyle := lipgloss.NewStyle().Foreground(ColorAccent).Bold(true)
-	return bracketStyle.Render("⟨") +
-		" " + RenderLogoIndicator(indicators[0]) +
-		LogoBorderStyle.Render(" │ ") +
-		RenderLogoIndicator(indicators[1]) +
-		LogoBorderStyle.Render(" │ ") +
-		RenderLogoIndicator(indicators[2]) + " " +
-		bracketStyle.Render("⟩")
-}
-
-// RenderLogoLarge renders the large logo for empty state
-// Shows REAL status: running=●, waiting=◐, idle=○
-// Format:
-//
-//	┌──┬──┬──┐
-//	│● │◐ │○ │
-//	└──┴──┴──┘
-func RenderLogoLarge(running, waiting, idle int) string {
-	indicators := getLogoIndicators(running, waiting, idle)
-	top := LogoBorderStyle.Render("┌──┬──┬──┐")
-	mid := LogoBorderStyle.Render("│") + RenderLogoIndicator(indicators[0]) + LogoBorderStyle.Render(" │") +
-		RenderLogoIndicator(indicators[1]) + LogoBorderStyle.Render(" │") +
-		RenderLogoIndicator(indicators[2]) + LogoBorderStyle.Render(" │")
-	bot := LogoBorderStyle.Render("└──┴──┴──┘")
-	return top + "\n" + mid + "\n" + bot
+// withBrandMark puts the mark in front of an already-rendered name when the
+// result fits in avail cells; otherwise it returns the name unchanged, so a
+// narrow box keeps its words and gives up the mark first.
+func withBrandMark(name string, avail int) string {
+	if lipgloss.Width(name)+brandMarkWidth > avail {
+		return name
+	}
+	return RenderBrandMark() + " " + name
 }

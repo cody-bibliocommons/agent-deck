@@ -7,7 +7,7 @@ Think of it as the foreman on a jobsite: you send instructions to the foreman, t
 
 ## Quickstart (local, two minutes)
 
-No Telegram, Slack, or Discord required.
+No Telegram, Slack, Discord, or Mattermost required.
 The conductor runs as a normal agent-deck session you can interact with from the TUI or CLI.
 
 ### 1. Create the conductor
@@ -59,10 +59,10 @@ It watches for sessions in `waiting` or `error`, auto-responds when its policy m
 
 Under the hood, a conductor is:
 
-- A `claude` (or `codex`) process pinned inside a named tmux session managed by agent-deck.
+- A `claude` (or `codex`, `hermes`, `pi`) process pinned inside a named tmux session managed by agent-deck.
 - A directory at `~/.local/share/agent-deck/conductor/<name>/` that holds its instructions, policy, learnings, state, and task log.
 - An agent-deck session record (`agent-deck list` will show it) with `is_conductor: true`.
-- Optionally, one or more remote channels attached (Telegram, Slack, Discord) so you can talk to it from your phone.
+- Optionally, one or more remote channels attached (Telegram, Slack, Discord, Mattermost) so you can talk to it from your phone.
 - Optionally, a heartbeat daemon that pings the conductor on a schedule.
 
 ![Fleet topology: user phone or TUI, conductor, child sessions, with watchers on the side](assets/fleet-topology.svg)
@@ -113,8 +113,11 @@ Format is freeform markdown; each entry is timestamped.
 
 ```bash
 # Create
-agent-deck conductor setup <name> [--description "..."] [--agent claude|codex] \
+agent-deck conductor setup <name> [--description "..."] [--agent claude|codex|hermes|pi] \
     [--heartbeat|--no-heartbeat] [--instructions-md path] [--policy-md path]
+# Re-running setup without --agent keeps the conductor's current agent.
+# Switching agents with --agent deletes the old agent's instructions file only
+# if it is untouched; an edited one is kept as <file>.bak-<timestamp>.
 
 # Observe
 agent-deck conductor list
@@ -133,6 +136,14 @@ agent-deck conductor teardown <name>              # stop, keep files
 agent-deck conductor teardown <name> --remove     # stop and delete dir
 agent-deck conductor teardown --all --remove      # nuke every conductor on this host
 ```
+
+`session output` is safe to feed back into an agent by default: it strips ANSI
+terminal escapes and caps content at approximately 25,000 tokens. Long output
+keeps both its beginning and end and finishes with the path of the full output
+retained on disk. Use `--max-tokens N` to set a smaller positive budget;
+`--pane` follows the same rules. Compatibility/transport modes (`--json`,
+`-q`/`--quiet`, and `--copy`) preserve the complete source; in particular,
+remote pane previews fetched with `--pane --json` retain raw ANSI styling.
 
 The `--remove` flag is destructive: it deletes `~/.local/share/agent-deck/conductor/<name>/`.
 Your `LEARNINGS.md` and `task-log.md` go with it.
@@ -182,6 +193,7 @@ They are optional — the conductor works fully without them.
 - [Telegram](telegram.md) — easiest to set up, one bot per conductor, message from your phone
 - [Slack](slack.md) — channel-based control with slash commands and threaded replies
 - [Discord](discord.md) — server-based control with permission scopes
+- [Mattermost](mattermost.md) (experimental) — a bot account you talk to in a DM or a channel
 
 ![Channels topology — one bot per conductor](assets/channels-topology.svg)
 
@@ -225,7 +237,8 @@ NEED: {question or decision point}
 ```
 
 when it is blocked and wants to escalate.
-If a remote channel is attached, `NEED:` lines are forwarded to your chat; `[STATUS]` lines log to the task log and are only surfaced if you ask.
+If a remote channel is attached, the reply is routed by tier: `NEED:` / `[urgent]` lines are forwarded to your chat at once (retired after 3 unanswered cycles), `[info]` lines are batched into a digest, and `[STATUS]` / `AUTO:` lines stay local (task log) and are only surfaced if you ask.
+Outside a heartbeat the conductor reaches you with `agent-deck conductor notify --tier urgent|info "<one line>"`.
 
 The heartbeat prevents a failure mode where a conductor appears healthy (tmux alive, Claude alive) but has silently drifted: it thinks it is waiting on you, you think it is waiting on a worker, nothing moves for hours.
 

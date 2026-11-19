@@ -1,0 +1,24 @@
+    ╭──────────────────────────────────────────────────────────────────────╮
+    │                                                                      │
+    │                                                                      │
+    │    New Session                                                       │
+    │                                                                      │
+    │      in group: alpha                                                 │
+    │                                                                      │
+    │    ▶ Name:  > opencode-idle-2                                        │
+    │                                                                      │
+    │      Agent:   claude     shell     gemini     opencode               │
+    │               opencode2     codex     pi     copilot     crush       │
+    │               muse     cursor agent     hermes     deepseek          │
+    │               omp                                                    │
+    │               ←→ change   grey = not installed                       │
+    │                                                                      │
+    │      Path:  > ~/project/work/opencode-idle                           │
+    │                                                                      │
+    │      Model ID:                                                       │
+    │      > tool default (↓ to browse)                                    │
+    │      ↓ more fields                                                   │
+    │    Tab next │ ↑↓ navigate │ Enter create │ Esc cancel                │
+    │                                                                      │
+    │                                                                      │
+    ╰──────────────────────────────────────────────────────────────────────╯

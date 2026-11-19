@@ -25,6 +25,9 @@ const (
 	CompHTTP    = "http"
 	CompWeb     = "web"
 	CompWatcher = "watcher"
+	CompUpdate  = "update"
+	CompRecall  = "recall"
+	CompAsk     = "ask"
 )
 
 // Config holds logging configuration.

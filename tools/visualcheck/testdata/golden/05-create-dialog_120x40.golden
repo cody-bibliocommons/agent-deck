@@ -1,0 +1,40 @@
+                 ╭────────────────────────────────────────────────────────────────────────────────────╮
+                 │                                                                                    │
+                 │                                                                                    │
+                 │    New Session                                                                     │
+                 │                                                                                    │
+                 │      in group: alpha                                                               │
+                 │                                                                                    │
+                 │    ▶ Name:  > opencode-idle-2                                                      │
+                 │                                                                                    │
+                 │      Agent:   claude     shell     gemini     opencode     opencode2               │
+                 │               codex     pi     copilot     crush     muse     cursor agent         │
+                 │               hermes     deepseek     omp                                          │
+                 │               ←→ change   grey = not installed                                     │
+                 │                                                                                    │
+                 │      Path:  > ~/project/work/opencode-idle                                         │
+                 │                                                                                    │
+                 │      Model ID:                                                                     │
+                 │      > tool default (↓ to browse)                                                  │
+                 │      Examples: claude-opus-5-5, claude-sonnet-5, claude-haiku-4-5                  │
+                 │                                                                                    │
+                 │      Reasoning effort: Tool default                                                │
+                 │                                                                                    │
+                 │      Where: this machine                                                           │
+                 │                                                                                    │
+                 │      ▸ More options: worktree, Docker sandbox, multi-repo                          │
+                 │                                                                                    │
+                 │    ─ Claude Options ─                                                              │
+                 │      Session: (•) New  ( ) Continue  ( ) Resume                                    │
+                 │      [x] Skip permissions                                                          │
+                 │      [ ] Auto mode                                                                 │
+                 │      [ ] Chrome mode                                                               │
+                 │      [ ] Teammate mode                                                             │
+                 │        Extra args: > e.g. --agent reviewer                                         │
+                 │        Start query: > initial prompt (not split on spaces)                         │
+                 │                                                                                    │
+                 │      ↓ more fields                                                                 │
+                 │    Tab next │ ↑↓ navigate │ Enter create │ Esc cancel                              │
+                 │                                                                                    │
+                 │                                                                                    │
+                 ╰────────────────────────────────────────────────────────────────────────────────────╯

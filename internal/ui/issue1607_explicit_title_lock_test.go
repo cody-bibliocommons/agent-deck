@@ -15,6 +15,7 @@ import (
 // title reconciliation that originally replaced the title with a worktree
 // folder basename.
 func TestIssue1607_CreateSessionTitleLock(t *testing.T) {
+	skipIfNoTmuxBinaryUI(t)
 	tests := []struct {
 		name       string
 		title      string
@@ -60,6 +61,7 @@ func createIssue1607Session(t *testing.T, title string, autoName bool) *session.
 	msg := h.createSessionInGroupWithWorktreeAndOptions(
 		title,
 		t.TempDir(),
+		"",
 		"sleep 30",
 		"test",
 		"", "", "",

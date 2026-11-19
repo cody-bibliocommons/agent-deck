@@ -70,8 +70,12 @@ func TestIssue1595CaptureVisiblePaneDedicatedSocket(t *testing.T) {
 
 func TestIssue1595CopyPaneHelpAndFooter(t *testing.T) {
 	overlay := NewHelpOverlay()
-	overlay.SetSize(120, 80)
-	overlay.Show()
+	// 100: tall enough to reach COPY & TEXT SELECTION without scrolling. The
+	// help overlay now counts each wrapped visual row individually rather
+	// than collapsing a wrapped row into one entry, so the content measures
+	// taller and needs more height to fit on a single page.
+	overlay.SetSize(120, 100)
+	overlay.ShowAll() // ASK-211: ? opens on 5 keys; these keys are in the full list
 	help := tmux.StripANSI(overlay.View())
 	if !strings.Contains(help, "V") || !strings.Contains(help, "Copy visible terminal text, including links") {
 		t.Fatalf("help does not advertise visible-pane copy:\n%s", help)
@@ -84,7 +88,7 @@ func TestIssue1595CopyPaneHelpAndFooter(t *testing.T) {
 			_ = home.storage.Close()
 		}
 	})
-	home.width = 120
+	home.width = 200
 	home.height = 40
 	home.flatItems = []session.Item{{
 		Type:    session.ItemTypeSession,

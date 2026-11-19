@@ -4,6 +4,14 @@
 #   1. Absolute thresholds (`.lighthouserc.json` ci.assert.assertions) — coarse
 #      upper bound. Hard gates: total-byte-weight, resource-summary:script:size,
 #      cumulative-layout-shift. Soft warnings: FCP, LCP, TBT, Speed Index.
+#      Recalibration log (keep ~5% headroom over the measured main value):
+#        #1666  349580 -> 368000  main at ~350.6KB (terminal keymap, SSE status)
+#        v1.16.11  368000 -> 387000  main 362978 -> 368687 B (+1.6%): group
+#               selection + stats panel, pane registry, iOS viewport insets,
+#               SSE outage recovery; spread over 25 web commits, no single asset.
+#        v1.16.24  387000 -> 410000  main 384209 B, +~7.5 KB for the fleet board
+#               opt-in kanban + restored runtime tiles and annotation hints
+#               (#2447); headroom was 2.8 KB (0.7%), restore ~5%.
 #   2. Delta gate (`tests/lighthouse/compare-deltas.mjs`) — block any single PR
 #      that grows `total-byte-weight` or `script:size` by more than
 #      MAX_*_DELTA_PCT (default 5%) vs the base ref. This is the answer to the
@@ -51,10 +59,11 @@ jobs:
   lighthouse:
     name: Performance Budget
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       MAX_BYTE_WEIGHT_DELTA_PCT: 5
       MAX_SCRIPT_SIZE_DELTA_PCT: 5
-      GOTOOLCHAIN: go1.25.13
+      GOTOOLCHAIN: go1.26.11
     steps:
       - name: Checkout PR head
         uses: actions/checkout@v7
@@ -107,7 +116,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version: '1.25.13'
+          go-version: '1.26.11'
 
       - name: Set up Node.js
         uses: actions/setup-node@v7
@@ -195,7 +204,7 @@ jobs:
 
       - name: Upload Lighthouse results
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: lighthouse-results-${{ github.run_id }}
           retention-days: 14

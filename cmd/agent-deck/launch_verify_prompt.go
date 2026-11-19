@@ -1,12 +1,41 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/send"
+	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
+)
+
+// promptConsumeOutcome classifies what a poll of the pane found. It exists
+// because "the composer looks empty" (the pre-#2079 definition of consumed)
+// is necessary but not sufficient: issue #2079 is exactly a slow-mounting
+// composer that swallows the leading bytes of a paste while every
+// downstream signal — including a cleared composer after Enter — reads
+// identically to a clean delivery. promptConsumed must therefore also
+// confirm the "[Pasted text #N +M lines]" marker's declared M against the
+// message's real line count before it is safe to call this a success.
+type promptConsumeOutcome int
+
+const (
+	// promptNotConsumed: the composer still shows unsent/foreign content, or
+	// never rendered at all. Caller may retry.
+	promptNotConsumed promptConsumeOutcome = iota
+	// promptConsumed: composer is clear and, for a multi-line message, its
+	// paste marker declares at least as many lines as the message has.
+	promptConsumed
+	// promptTruncated: composer is clear, but the paste marker declares
+	// FEWER lines than the message has — the framed paste landed short and
+	// only the tail (or a truncated fragment) was submitted.
+	promptTruncated
+	// promptUnknown: composer is clear but no paste marker was ever
+	// observed for a message that expects one. Delivery integrity cannot be
+	// confirmed either way, so this must never be reported as success.
+	promptUnknown
 )
 
 // verifyPromptConsumedAfterLaunch observes whether claude actually consumed
@@ -34,14 +63,36 @@ func verifyPromptConsumedAfterLaunch(
 	maxWait, pollInterval time.Duration,
 	warn io.Writer,
 ) {
-	verifyPromptConsumedAfterLaunchAttributed(target, message, false, maxWait, pollInterval, warn)
+	verifyPromptConsumedAfterLaunchAttributed(target, "claude", message, false, maxWait, pollInterval, warn)
+}
+
+// launchPromptSendOptions is the sendRetryOptions of the `launch -m …
+// --no-wait` initial send. Its pre-send provenance comes from one capture
+// taken before typing (send.ProbeComposerBeforeSend), the probe the waited
+// launch path runs too: a composer free of a paste marker, and whether a
+// Claude prompt suggestion is shown, so the submit confirms our typed text
+// replaced it before pressing Enter. The same capture says whether the
+// composer was empty (send.ProbeComposer), the provenance that lets a send
+// that typed and could not submit report its leftover as verified.
+func launchPromptSendOptions(target sendRetryTarget, tool string) sendRetryOptions {
+	probe := send.ProbeComposer(target.CapturePaneFresh, session.UsesClaudeDeliveryVerify(tool))
+	return sendRetryOptions{
+		maxRetries:                  8,
+		checkDelay:                  150 * time.Millisecond,
+		tool:                        tool,
+		composerPasteFreeBeforeSend: probe.PasteMarkerFree,
+		suggestionShownBeforeSend:   probe.SuggestionShown,
+		composerEmptyBeforeSend:     probe.ComposerEmpty,
+		composerBody:                probe.FullBody,
+	}
 }
 
 // verifyPromptConsumedAfterLaunchAttributed is verifyPromptConsumedAfterLaunch
 // with the #1777 provenance made explicit. ownPasteMarker carries the caller's
 // pre-send observation that the composer held no "[Pasted text …]" marker
-// (composerPasteFree, captured before the initial send): a marker seen now can
-// then only be the collapsed rendering of our own prompt.
+// (launchPromptSendOptions, captured before the initial send): a marker seen
+// now can then only be the collapsed rendering of our own prompt. tool gates
+// the Claude prompt-suggestion rule of the retry, as on every other submit.
 //
 // This matters because the transport frames every multi-line body as a
 // bracketed paste (issue #1855), so Claude collapsing the launch prompt behind
@@ -52,12 +103,20 @@ func verifyPromptConsumedAfterLaunch(
 // leave every multi-line prompt sitting unsubmitted.
 func verifyPromptConsumedAfterLaunchAttributed(
 	target sendRetryTarget,
+	tool string,
 	message string,
 	ownPasteMarker bool,
 	maxWait, pollInterval time.Duration,
 	warn io.Writer,
 ) {
-	if pollPromptConsumed(target, message, maxWait, pollInterval) {
+	switch pollPromptConsumed(target, message, maxWait, pollInterval) {
+	case promptConsumed:
+		return
+	case promptTruncated:
+		warnTruncated(warn)
+		return
+	case promptUnknown:
+		warnUnknown(warn)
 		return
 	}
 	// The retry types the message and presses Enter, so it submits whatever
@@ -80,9 +139,47 @@ func verifyPromptConsumedAfterLaunchAttributed(
 		// prompt behind the marker and submit both.
 		_ = target.SendEnter()
 	} else {
-		_ = target.SendKeysAndEnter(message)
+		// Typing replaces a prompt suggestion; with one shown, Enter follows
+		// only once the composer holds our message instead of it. The
+		// capture above is the composer-empty provenance: if the submit is
+		// refused after typing, the warning says what the input box holds.
+		// Nothing is ever deleted.
+		probe := send.ProbeComposer(func() (string, error) {
+			if !capture.OK {
+				return "", fmt.Errorf("capture before the launch prompt retry: %w", capture.Err)
+			}
+			return capture.Raw, nil
+		}, session.UsesClaudeDeliveryVerify(tool))
+		_, err := send.TypeAndSubmitReport(target, message, 0, probe.SuggestionShown, probe.ComposerEmpty, probe.FullBody)
+		// The retry's own verdict says what it left in the input box, so
+		// it is reported here, not polled.
+		var notSubmitted *send.NotSubmittedError
+		if errors.As(err, &notSubmitted) {
+			if warn != nil {
+				fmt.Fprintf(warn, "warning: launch prompt may not have been consumed by claude after retry: the retry was not submitted (%v); %s\n", notSubmitted.Cause, notSubmitted.Observed.Describe())
+			}
+			return
+		}
+		if err != nil {
+			residue := send.ObserveComposer(target, message, "", probe.FullBody, tmux.StripANSI, probe.ComposerEmpty)
+			if residue.State == send.ComposerLeft {
+				residue.Verified = false
+				residue.Reason = "the retry failed after typing may have begun"
+			}
+			if warn != nil {
+				fmt.Fprintf(warn, "warning: launch prompt may not have been consumed by claude after retry: the retry failed to send (%v); %s\n", err, residue.Describe())
+			}
+			return
+		}
 	}
-	if pollPromptConsumed(target, message, maxWait, pollInterval) {
+	switch pollPromptConsumed(target, message, maxWait, pollInterval) {
+	case promptConsumed:
+		return
+	case promptTruncated:
+		warnTruncated(warn)
+		return
+	case promptUnknown:
+		warnUnknown(warn)
 		return
 	}
 	if warn != nil {
@@ -90,11 +187,40 @@ func verifyPromptConsumedAfterLaunchAttributed(
 	}
 }
 
-// pollPromptConsumed returns true once the pane shows a rendered composer
-// that is genuinely empty — i.e., Enter was accepted and nothing (ours or
-// foreign) is sitting in the input line. Returns false on timeout. Capture
-// errors are treated as "not yet consumed" so we keep polling until the
-// budget expires.
+// warnTruncated reports issue #2079's truncated-paste outcome: the composer
+// cleared (Enter was accepted) but the paste marker it collapsed behind
+// declares fewer line breaks than the message actually has, so a fragment —
+// not the whole prompt — was submitted. Must never be reported as success.
+func warnTruncated(warn io.Writer) {
+	if warn != nil {
+		fmt.Fprintln(warn, "warning: prompt truncated in transit: the composer's paste marker declares fewer line breaks than the launch prompt has; a fragment, not the whole prompt, was submitted")
+	}
+}
+
+// warnUnknown reports that delivery integrity could not be confirmed either
+// way: the composer cleared, but no paste marker was ever observed for a
+// message that expects one. Must never be reported as success.
+func warnUnknown(warn io.Writer) {
+	if warn != nil {
+		fmt.Fprintln(warn, "warning: launch prompt delivery unknown: composer appears clear but no paste marker was visible to confirm the message arrived intact")
+	}
+}
+
+// pollPromptConsumed polls the pane for up to maxWait and classifies what it
+// finds as a promptConsumeOutcome. "Consumed" starts from the same base
+// signal as before #2079 — a rendered composer that is genuinely empty, i.e.
+// Enter was accepted and nothing (ours or foreign) is sitting in the input
+// line — but that alone is not sufficient to call it a success (issue
+// #2079): the launch --no-wait path's initial send-keys + Enter can race a
+// slow-mounting composer that swallows the leading bytes of a paste, and a
+// truncated fragment being submitted reads identically to a clean delivery
+// on every signal this function used to check. So once the base "consumed"
+// shape is observed for a multi-line message, the count declared on Claude's
+// "[Pasted text #N +M lines]" collapse marker (present anywhere in the pane —
+// the transcript still shows it after submission) is checked against the
+// message's hard line-break count (send.CheckPasteMarker: M counts line
+// breaks, not lines, and never display rows) before promptConsumed is
+// returned.
 //
 // Consumed must NOT be inferred merely from "our message isn't in the
 // composer" (#1777): a materialized autosuggestion or an unrelated draft
@@ -104,20 +230,44 @@ func verifyPromptConsumedAfterLaunchAttributed(
 // then never fire because the caller believes delivery already succeeded.
 // ComposerHasDraft reports true for ANY visible draft, ours or foreign, so
 // only a truly empty (or suggestion/placeholder) composer counts as consumed.
-func pollPromptConsumed(target sendRetryTarget, message string, maxWait, pollInterval time.Duration) bool {
+//
+// Returns promptTruncated the moment a marker declares fewer line breaks than
+// expected — that signal is final, not a render-lag artifact, so there is no
+// reason to keep polling. A consumed-looking pane with no marker at all is
+// held as a candidate (render lag: the marker may not have painted yet) and
+// only classified promptUnknown if the budget expires without one ever
+// appearing; a pane that never even reaches the consumed shape times out as
+// promptNotConsumed, unchanged from before #2079.
+func pollPromptConsumed(target sendRetryTarget, message string, maxWait, pollInterval time.Duration) promptConsumeOutcome {
 	if pollInterval <= 0 {
 		pollInterval = 100 * time.Millisecond
 	}
+	expectedBreaks := send.ExpectedPasteMarkerLineBreaks(message)
 	deadline := time.Now().Add(maxWait)
+	sawConsumedWithoutMarker := false
 	for {
 		if raw, err := target.CapturePaneFresh(); err == nil {
 			content := tmux.StripANSI(raw)
 			if send.HasCurrentComposerPrompt(content) && !send.ComposerHasDraft(raw, tmux.StripANSI) {
-				return true
+				if expectedBreaks == 0 {
+					return promptConsumed
+				}
+				verdict, _ := send.CheckPasteMarker(content, expectedBreaks)
+				switch verdict {
+				case send.PasteMarkerAbsent:
+					sawConsumedWithoutMarker = true
+				case send.PasteMarkerTruncated:
+					return promptTruncated
+				default:
+					return promptConsumed
+				}
 			}
 		}
 		if !time.Now().Before(deadline) {
-			return false
+			if sawConsumedWithoutMarker {
+				return promptUnknown
+			}
+			return promptNotConsumed
 		}
 		remaining := time.Until(deadline)
 		sleep := pollInterval

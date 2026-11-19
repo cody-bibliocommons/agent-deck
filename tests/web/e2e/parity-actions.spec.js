@@ -12,13 +12,16 @@
 // with the matrix).
 
 import { test, expect } from '@playwright/test'
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { loadMatrix, inferMissingProbe } from '../helpers/parity-matrix.js'
 
 const MATRIX = loadMatrix()
 
 // Pinned row counts. If the matrix grows or shrinks, these MUST be updated
 // in the same PR — the failure is the point.
-const EXPECTED_ACTION_ROWS = 51
+const EXPECTED_ACTION_ROWS = 57
 // Probeable = MISSING rows that inferMissingProbe() maps to a URL. Decremented
 // as endpoints land and their matrix rows flip MISSING → Present:
 //   15 (PR-A #804) → 9 (#1124 skills+MCP, 6 closed) → 7 (#1129 Close + Undo
@@ -27,8 +30,9 @@ const EXPECTED_ACTION_ROWS = 51
 // #1129 flipped the close/undelete rows but missed this decrement (9→7), so the
 // pin was stuck 2 high and the suite went red on every later PR. Re-baselined to
 // the true count: Restart fresh, Rename session, Move session to group, Edit
-// notes inline, Mark session unread.
-const EXPECTED_PROBEABLE_MISSING = 5
+// notes inline, Mark session unread. → 4 (#2368 POST /sessions/{id}/move,
+// "Move session to group" closed).
+const EXPECTED_PROBEABLE_MISSING = 4
 
 test.describe.configure({ mode: 'serial' })
 
@@ -71,7 +75,12 @@ test.describe('parity: matrix structural invariants', () => {
   })
 
   test('every implemented action row has a parseable METHOD path', () => {
-    const broken = MATRIX.actions.filter((a) => !a.isMissing && !a.method)
+    // Rows that are genuinely implemented but need no server round-trip
+    // (pure client state, e.g. sidebar selection) document that with a
+    // leading "N/A" in the Web Endpoint column instead of a METHOD path.
+    const broken = MATRIX.actions.filter(
+      (a) => !a.isMissing && !a.method && !/^N\/A\b/i.test(a.webEndpoint),
+    )
     expect(broken, `unparseable matrix rows: ${broken.map((b) => b.action).join(', ')}`).toEqual([])
   })
 })
@@ -79,6 +88,42 @@ test.describe('parity: matrix structural invariants', () => {
 test.describe('parity: session lifecycle', () => {
   test.beforeEach(async ({ request }) => {
     await resetFixture(request)
+  })
+
+  test('complete working directory - GET returns matching directories only', async ({ request }) => {
+    const dir = mkdtempSync(join(tmpdir(), 'parity-paths-'))
+    try {
+      for (const name of ['AirConnect', 'SpotConnect', '.hidden']) {
+        mkdirSync(join(dir, name))
+      }
+      writeFileSync(join(dir, 'Air-file'), 'fixture')
+
+      const res = await request.get('/api/path-suggestions', { params: { prefix: dir + '/Air' } })
+      expect(res.status()).toBe(200)
+      expect(await res.json()).toEqual({ suggestions: [join(dir, 'AirConnect')] })
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('preview missing directories - matches TUI confirmation without creating folders', async ({ request }) => {
+    const root = mkdtempSync(join(tmpdir(), 'parity-directory-'))
+    const parent = join(root, 'parent')
+    const projectPath = join(parent, 'project')
+    try {
+      const before = await snapshot(request)
+      const res = await request.get('/api/session-directory', { params: { path: projectPath } })
+      expect(res.status()).toBe(200)
+      expect(await res.json()).toEqual({ path: projectPath, missing: [parent, projectPath] })
+      expect(existsSync(parent)).toBe(false)
+      expect(existsSync(projectPath)).toBe(false)
+      const after = await snapshot(request)
+      expect(after.items).toEqual(before.items)
+      expect(after.totalSessions).toBe(before.totalSessions)
+      expect(after.totalGroups).toBe(before.totalGroups)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
   })
 
   test('create session — web POST mirrors TUI New action', async ({ request }) => {

@@ -401,6 +401,52 @@ func TestIsCodexCompatible_CustomToolCommands(t *testing.T) {
 	}
 }
 
+func TestIsDevinCompatible_CustomToolCommands(t *testing.T) {
+	tmpDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpDir)
+	defer os.Setenv("HOME", originalHome)
+	isolateConfigHomeXDG(t)
+
+	agentDeckDir := filepath.Join(tmpDir, ".agent-deck")
+	if err := os.MkdirAll(agentDeckDir, 0o700); err != nil {
+		t.Fatalf("mkdir %s: %v", agentDeckDir, err)
+	}
+
+	cfg := &UserConfig{
+		Tools: map[string]ToolDef{
+			"my_devin_wrapper": {
+				Command:        "devin-wrapper",
+				CompatibleWith: "devin",
+			},
+			"my_devin_exact": {
+				Command: "DEVIN_TOKEN=abc devin --profile work",
+			},
+			"other": {
+				Command: "devin-wrapper",
+			},
+		},
+	}
+
+	if err := SaveUserConfig(cfg); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+	ClearUserConfigCache()
+
+	if !IsDevinCompatible("devin") {
+		t.Fatal("built-in devin should be Devin-compatible")
+	}
+	if !IsDevinCompatible("my_devin_wrapper") {
+		t.Fatal("custom tool with compatible_with=devin should be Devin-compatible")
+	}
+	if !IsDevinCompatible("my_devin_exact") {
+		t.Fatal("custom tool with env-prefixed devin command should be Devin-compatible")
+	}
+	if IsDevinCompatible("other") {
+		t.Fatal("wrapper without compatible_with should not be Devin-compatible")
+	}
+}
+
 func TestCreateExampleConfigDocumentsCompatibleWith(t *testing.T) {
 	tmpDir := t.TempDir()
 	originalHome := os.Getenv("HOME")
@@ -2317,6 +2363,7 @@ func TestSaveUserConfig_OmitsZeroValueFields(t *testing.T) {
 		"[crush]",
 		"[hermes]",
 		"[global_search]",
+		"[recall]",
 		"[logs]",
 		"[mcp_pool]",
 		"[conductor]",
@@ -2667,5 +2714,24 @@ func TestSaveUserConfig_OmitsUnsetGroupSort(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), `group_sort = "actionable"`) {
 		t.Errorf("config.toml must contain a set group_sort; got:\n%s", raw)
+	}
+}
+
+// #2153: the Keychain seed for sandboxes is opt-in and off by default.
+func TestDockerSettings_SeedCredentialsFromKeychain(t *testing.T) {
+	var cfg UserConfig
+	if _, err := toml.Decode("[docker]\nauto_cleanup = true\n", &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Docker.SeedCredentialsFromKeychain {
+		t.Error("seed_credentials_from_keychain must default to false")
+	}
+
+	cfg = UserConfig{}
+	if _, err := toml.Decode("[docker]\nseed_credentials_from_keychain = true\n", &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Docker.SeedCredentialsFromKeychain {
+		t.Error("seed_credentials_from_keychain = true must be honoured")
 	}
 }

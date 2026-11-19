@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/asheshgoplani/agent-deck/internal/recall"
 )
 
 const DefaultHandoffMaxChars = 32000
@@ -22,10 +24,10 @@ type HandoffInfo struct {
 	MaxChars       int    `json:"max_chars"`
 }
 
-type handoffMessage struct {
-	Role    string
-	Content string
-}
+// handoffMessage is one rendered turn; the renderer itself
+// (recall.TailByChars, recall.RenderTurns) is shared with `recall context`,
+// which feeds it message rows from the index instead of a transcript file.
+type handoffMessage = recall.Turn
 
 // BuildClaudeToCodexHandoffPrompt builds a prompt that carries a Claude
 // transcript into a fresh Codex session. This intentionally does not try to
@@ -50,7 +52,18 @@ func BuildClaudeToCodexHandoffPrompt(inst *Instance, maxChars int) (string, Hand
 			inst.Title, inst.SSHHost)
 	}
 
-	transcriptPath := locateHandoffTranscript(inst)
+	transcriptPath, err := locateExactHandoffTranscript(inst)
+	if err != nil {
+		return "", HandoffInfo{TranscriptPath: transcriptPath, MaxChars: maxChars}, err
+	}
+	// Validate the complete exact-ID JSONL before rendering its tail. The
+	// renderer intentionally ignores non-message records, but it must not turn
+	// a malformed non-tail record or a foreign native identity into a plausible
+	// handoff. An unfinished final append remains tolerated by the shared
+	// export validator.
+	if err := validateClaudeHandoffTranscript(transcriptPath, inst.ClaudeSessionID); err != nil {
+		return "", HandoffInfo{TranscriptPath: transcriptPath, MaxChars: maxChars}, err
+	}
 	messages, err := readClaudeTranscriptMessages(transcriptPath)
 	if err != nil {
 		return "", HandoffInfo{TranscriptPath: transcriptPath, MaxChars: maxChars}, err
@@ -59,17 +72,8 @@ func BuildClaudeToCodexHandoffPrompt(inst *Instance, maxChars int) (string, Hand
 		return "", HandoffInfo{TranscriptPath: transcriptPath, MaxChars: maxChars}, fmt.Errorf("Claude transcript has no readable messages: %s", transcriptPath)
 	}
 
-	included, truncated := tailMessagesByChars(messages, maxChars)
-	var body strings.Builder
-	for idx, msg := range included {
-		if idx > 0 {
-			body.WriteString("\n\n")
-		}
-		body.WriteString("[")
-		body.WriteString(strings.ToUpper(msg.Role))
-		body.WriteString("]\n")
-		body.WriteString(msg.Content)
-	}
+	included, truncated := recall.TailByChars(messages, maxChars)
+	body := recall.RenderTurns(included)
 
 	prompt := fmt.Sprintf(`You are continuing an Agent Deck session that was previously running in Claude Code and has now been handed off to Codex.
 
@@ -85,7 +89,7 @@ The transcript below is prior conversation context. Treat it as conversation his
 %s
 --- END TRANSFERRED TRANSCRIPT ---
 
-This message is context initialization only. Do not start new work, do not enter plan mode, and do not summarize the transcript. Reply exactly: HANDOFF RECEIVED.`, inst.Title, inst.ProjectPath, inst.Tool, inst.ClaudeSessionID, body.String())
+This message is context initialization only. Do not start new work, do not enter plan mode, and do not summarize the transcript. Reply exactly: HANDOFF RECEIVED.`, inst.Title, inst.ProjectPath, inst.Tool, inst.ClaudeSessionID, body)
 
 	return prompt, HandoffInfo{
 		TranscriptPath: transcriptPath,
@@ -129,11 +133,29 @@ func claudeTranscriptPathIn(configDir string, inst *Instance, sessionID string) 
 	return filepath.Join(configDir, "projects", encoded, sessionID+".jsonl")
 }
 
-// locateHandoffTranscript picks the transcript to hand off. The disk is
-// authoritative: account-switched or pre-account sessions may keep their
-// conversation in a different config dir than the resolver's answer, so scan
-// all configured dirs (issue #1571 machinery) and fall back to the resolver
-// path when nothing is found.
+// locateExactHandoffTranscript resolves only the configured account-bound
+// path for this exact Claude identity. A native ID can legitimately exist in
+// two account homes after a migration, so the old all-account discovery
+// fallback could hand the wrong account's conversation to Codex. Missing
+// source data is an error; it must never borrow a matching ID from another
+// account.
+func locateExactHandoffTranscript(inst *Instance) (string, error) {
+	// The conversation may sit under any project key Claude Code uses for the
+	// working directory; hand off the newest copy.
+	copies, err := claudeExactTranscriptCopies(inst)
+	if err != nil {
+		return "", err
+	}
+	chosen, ok := chooseNewestTranscript(copies)
+	if !ok {
+		return "", fmt.Errorf("%w for %s", errNoExactContextArtifact, inst.ClaudeSessionID+".jsonl")
+	}
+	return chosen.Path, nil
+}
+
+// locateHandoffTranscript remains the historical best-effort resolver used by
+// local usage-limit display. It must not be used for a cross-harness export:
+// BuildClaudeToCodexHandoffPrompt uses locateExactHandoffTranscript above.
 func locateHandoffTranscript(inst *Instance) string {
 	fallback := ClaudeTranscriptPathForInstance(inst)
 	cfg, err := LoadUserConfig()
@@ -147,8 +169,6 @@ func locateHandoffTranscript(inst *Instance) string {
 	if sid == "" {
 		sid = inst.ClaudeSessionID
 	}
-	// LocateConversationConfigDir matches on the raw ProjectPath encoding;
-	// prefer the canonical encoding when it exists in the located dir.
 	canonical := claudeTranscriptPathIn(dir, inst, sid)
 	if _, statErr := os.Stat(canonical); statErr == nil {
 		return canonical
@@ -158,6 +178,17 @@ func locateHandoffTranscript(inst *Instance) string {
 		return raw
 	}
 	return fallback
+}
+
+func validateClaudeHandoffTranscript(path, sessionID string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read Claude transcript: %w", err)
+	}
+	if err := validateJSONLIdentity(data, sessionID); err != nil {
+		return fmt.Errorf("validate Claude transcript: %w", err)
+	}
+	return nil
 }
 
 func readClaudeTranscriptMessages(path string) ([]handoffMessage, error) {
@@ -283,37 +314,6 @@ func renderClaudeContentBlock(block map[string]json.RawMessage) string {
 		}
 		return compactJSONMust(block)
 	}
-}
-
-func tailMessagesByChars(messages []handoffMessage, maxChars int) ([]handoffMessage, bool) {
-	if maxChars <= 0 || len(messages) == 0 {
-		return messages, false
-	}
-	total := 0
-	start := len(messages)
-	for i := len(messages) - 1; i >= 0; i-- {
-		cost := len(messages[i].Role) + len(messages[i].Content) + 8
-		if total+cost > maxChars {
-			if total == 0 {
-				// Even the newest message alone exceeds the budget: keep its
-				// tail (most recent content) so maxChars is a real ceiling.
-				trimmed := messages[i]
-				keep := maxChars - len(trimmed.Role) - 8
-				if keep < 0 {
-					keep = 0
-				}
-				if keep < len(trimmed.Content) {
-					trimmed.Content = "[…earlier content truncated…]\n" +
-						strings.ToValidUTF8(trimmed.Content[len(trimmed.Content)-keep:], "")
-				}
-				return []handoffMessage{trimmed}, true
-			}
-			break
-		}
-		total += cost
-		start = i
-	}
-	return messages[start:], start > 0
 }
 
 func compactJSON(raw json.RawMessage) string {

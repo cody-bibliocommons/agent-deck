@@ -13,10 +13,25 @@ import (
 //
 // Treating these as operator drafts would make every automated send hold and
 // Ctrl+C an actually-empty composer (issue #1409).
+//
+// While a turn runs with input queued behind it, Claude shows its own hint in
+// the empty composer instead:
+//
+//	❯ Press up to edit queued messages
+//
+// That is Claude's acknowledgement of earlier queued input, not a draft;
+// reading it as one refused every further send to a busy target (ASK-95).
 func IsComposerPlaceholder(text string) bool {
 	t := strings.TrimSpace(text)
+	if strings.EqualFold(t, ClaudeQueuedHint) {
+		return true
+	}
 	return strings.HasPrefix(t, `Try "`) && strings.HasSuffix(t, `"`)
 }
+
+// ClaudeQueuedHint is the composer placeholder Claude Code renders while it
+// holds input behind the running turn.
+const ClaudeQueuedHint = "Press up to edit queued messages"
 
 // ComposerDraft returns the normalized operator draft sitting in the visible
 // composer, and whether a composer is visible at all.
@@ -51,6 +66,17 @@ func ComposerDraft(raw string, strip func(string) string) (draft string, compose
 	return body, true
 }
 
+// ComposerShowsQueuedHint reports whether the visible composer shows Claude's
+// queued-messages hint: it holds no draft, but input is waiting behind the
+// turn. Same raw/strip contract as ComposerDraft.
+func ComposerShowsQueuedHint(raw string, strip func(string) string) bool {
+	if strip == nil {
+		strip = func(s string) string { return s }
+	}
+	body, ok := CurrentComposerPrompt(strip(raw))
+	return ok && strings.EqualFold(NormalizePromptText(body), ClaudeQueuedHint)
+}
+
 // ComposerHasDraft reports whether the visible composer holds operator input.
 // This is the shared "is the composer busy?" check automated senders must run
 // before injecting keystrokes into the pane (issue #1409). Same raw/strip
@@ -65,44 +91,49 @@ func ComposerHasDraft(raw string, strip func(string) string) bool {
 // *tmux.Session satisfies it.
 type ComposerGuardTarget interface {
 	CapturePaneFresh() (string, error)
-	SendCtrlC() error
 }
 
 // ComposerGuardOptions tunes GuardComposerDraft. All bounds are mandatory so
 // the guard can never hold a delivery indefinitely.
 type ComposerGuardOptions struct {
 	// HoldWait is the maximum time to wait for an operator draft to clear on
-	// its own (operator submits or erases it) before falling back to
-	// save-clear-restore.
+	// its own (operator submits or erases it) before refusing delivery.
 	HoldWait time.Duration
 	// PollInterval is the capture cadence during the hold phase.
 	// Defaults to 250ms when <= 0.
 	PollInterval time.Duration
-	// ClearWait is the maximum time to wait, per Ctrl+C attempt, for the
-	// composer to actually clear.
+	// ClearWait is retained for caller compatibility. The guard never clears
+	// operator input, so this value is ignored.
 	ClearWait time.Duration
 	// Strip is applied to raw captured pane content before composer
 	// introspection (pass tmux.StripANSI). nil means identity.
 	Strip func(string) string
+	// Draft reads the operator draft out of a raw capture for the target's
+	// TUI, with ComposerDraft's contract. nil means ComposerDraft (Claude);
+	// Codex targets pass CodexComposerDraft (issue #2536).
+	Draft ComposerDraftReader
+	// FullBody, when non-nil, reads the composer's whole body; it decides
+	// ComposerGuardResult.ComposerEmpty (a draft reader may stop at the
+	// first paragraph). nil means ComposerEmpty follows Draft.
+	FullBody ComposerFullBodyReader
 }
+
+// ComposerDraftReader extracts the operator draft from a raw (ANSI-bearing)
+// pane capture and reports whether a composer is visible at all.
+type ComposerDraftReader func(raw string, strip func(string) string) (draft string, composerVisible bool)
 
 // ComposerGuardResult reports what the guard did.
 type ComposerGuardResult struct {
 	// Held is the total wall-clock time the guard spent before returning.
 	Held time.Duration
-	// SavedDraft is the operator draft that was cleared to make way for the
-	// automated send. Empty when the composer was empty or cleared on its
-	// own. Callers must restore it (type it back, without Enter) after the
-	// automated delivery is confirmed.
-	SavedDraft string
-	// DraftCleared is true when the guard issued Ctrl+C and confirmed the
-	// composer emptied.
+	// Refused means the composer remains occupied or could not be captured.
+	// Callers must return without typing or pressing Enter.
+	Refused bool
+	// Legacy delivery metadata remains zero: operator input is preserved in
+	// place, never saved, cleared, or restored by automated delivery.
+	SavedDraft   string
 	DraftCleared bool
-	// ClearFailed is true when Ctrl+C attempts were exhausted and the
-	// composer still held the draft. The caller proceeds with the send
-	// regardless (delivery must not be dropped), accepting the residual
-	// merge risk for this pathological case.
-	ClearFailed bool
+	ClearFailed  bool
 	// ComposerPasteMarkerFree is true when the guard's LAST successful
 	// capture showed a composer holding no "[Pasted text …]" marker. It is
 	// the pre-send provenance evidence the attribution gate needs to tell
@@ -113,10 +144,21 @@ type ComposerGuardResult struct {
 	// marker still present), which fails safe — the gate then withholds the
 	// Enter nudge.
 	ComposerPasteMarkerFree bool
+	// SuggestionShown is true when the guard's last successful capture
+	// showed a Claude prompt suggestion in the (empty) composer. The caller
+	// types its message over it and must confirm, before pressing Enter,
+	// that the composer now holds that message rather than the suggestion
+	// (TypedComposerCheck).
+	SuggestionShown bool
+	// ComposerEmpty is true when the guard's last successful capture showed
+	// a VISIBLE composer holding no draft (a prompt suggestion or Claude's
+	// placeholder counts as empty), read through ComposerGuardOptions.FullBody
+	// when set. It is the provenance ObserveComposer needs before it may
+	// call a leftover verified (text in the input box after the send that
+	// matches what we typed is then ours), and it expires the leftover
+	// record. False for an unscopable pane.
+	ComposerEmpty bool
 }
-
-// maxComposerClearAttempts bounds Ctrl+C attempts during save-clear.
-const maxComposerClearAttempts = 2
 
 // saveReconfirmDelay is the settle time before the save-step re-capture. A
 // suggestion sampled in the sub-frame where its text is painted but the dim
@@ -139,33 +181,26 @@ const saveReconfirmDelay = 50 * time.Millisecond
 // foreign marker that renders later be misattributed as ours (#1778 review
 // finding 2). Mirror ComposerHoldsPasteMarker's choice here so the two
 // producers of this evidence never disagree.
-func composerProvenanceFree(raw string, strip func(string) string) bool {
-	draft, visible := ComposerDraft(raw, strip)
+func composerProvenanceFree(raw string, strip func(string) string, read ComposerDraftReader) bool {
+	draft, visible := read(raw, strip)
 	if visible {
 		return draft == ""
 	}
 	return !ComposerHoldsPasteMarker(raw, strip)
 }
 
-// GuardComposerDraft implements the composer-collision guard for automated
-// sends (issue #1409): an automated SendKeysAndEnter against a composer that
-// already holds half-typed operator input would merge with it and submit the
-// merged prompt. The guard:
-//
-//  1. Holds (bounded by HoldWait) while the composer shows a non-empty
-//     operator draft, polling for it to clear on its own.
-//  2. If the draft is still present at the bound, saves it, clears the
-//     composer with Ctrl+C (Claude clears the current input on a single
-//     Ctrl+C; same primitive the full-resend recovery path already uses)
-//     and confirms the clear, bounded by ClearWait per attempt.
-//
-// The guard never blocks delivery indefinitely and never errors: on capture
-// failures or a composer that refuses to clear it returns and lets the caller
-// proceed, because watchers/conductors depend on the send going through.
+// GuardComposerDraft holds an automated send while operator input occupies
+// the composer. At the bound it rechecks once for an autosuggestion redraw,
+// then refuses delivery without changing the draft. Capture failure also
+// refuses delivery. It never sends an interrupt or other keystroke.
 func GuardComposerDraft(t ComposerGuardTarget, opts ComposerGuardOptions) ComposerGuardResult {
 	strip := opts.Strip
 	if strip == nil {
 		strip = func(s string) string { return s }
+	}
+	read := opts.Draft
+	if read == nil {
+		read = ComposerDraft
 	}
 	poll := opts.PollInterval
 	if poll <= 0 {
@@ -178,11 +213,11 @@ func GuardComposerDraft(t ComposerGuardTarget, opts ComposerGuardOptions) Compos
 	for {
 		raw, err := t.CapturePaneFresh()
 		if err != nil {
-			// Pane not introspectable: never block delivery on it.
-			return ComposerGuardResult{Held: time.Since(start)}
+			// An unreadable pane cannot authorize input.
+			return ComposerGuardResult{Held: time.Since(start), Refused: true}
 		}
-		if composerProvenanceFree(raw, strip) {
-			return ComposerGuardResult{Held: time.Since(start), ComposerPasteMarkerFree: true}
+		if composerProvenanceFree(raw, strip, read) {
+			return clearComposerResult(start, raw, strip, read, opts.FullBody)
 		}
 		if !time.Now().Before(deadline) {
 			break
@@ -196,75 +231,28 @@ func GuardComposerDraft(t ComposerGuardTarget, opts ComposerGuardOptions) Compos
 		}
 	}
 
-	// Hold bound reached with the operator draft still present. Before
-	// committing to save-clear-restore, re-capture and re-classify: a single
-	// mid-render sample can show suggestion text whose dim/grey SGR has not
-	// landed yet, and saving it would later RESTORE the suggestion as real,
-	// normal-coloured composer text that a bare Enter could submit (issue
-	// #1777). Only content that classifies as an operator draft on a second,
-	// settled capture is ever saved. On a capture failure nothing is saved —
-	// the guard must not attribute content it cannot re-read.
+	// A redraw can paint suggestion text before its dim attributes arrive.
+	// Reclassify one settled frame without modifying the composer.
 	time.Sleep(saveReconfirmDelay)
 	raw, err := t.CapturePaneFresh()
-	if err != nil {
-		return ComposerGuardResult{Held: time.Since(start)}
+	if err == nil && composerProvenanceFree(raw, strip, read) {
+		return clearComposerResult(start, raw, strip, read, opts.FullBody)
 	}
-	if composerProvenanceFree(raw, strip) {
-		return ComposerGuardResult{Held: time.Since(start), ComposerPasteMarkerFree: true}
-	}
-	draft, visible := ComposerDraft(raw, strip)
-	if !visible {
-		// No introspectable composer, yet the pane still shows a foreign
-		// paste-marker pattern: provenance cannot be established and there
-		// is no composer to clear. Fail safe without a blind Ctrl+C (#1778
-		// review finding 1) rather than falling through into the save-clear
-		// flow with an empty draft.
-		return ComposerGuardResult{Held: time.Since(start)}
-	}
+	return ComposerGuardResult{Held: time.Since(start), Refused: true}
+}
 
-	// Save the confirmed operator draft and clear the composer so the
-	// automated message cannot merge with it.
-	res := ComposerGuardResult{SavedDraft: draft}
-	clearPoll := poll
-	if clearPoll > 100*time.Millisecond {
-		clearPoll = 100 * time.Millisecond
+// clearComposerResult is GuardComposerDraft's go-ahead for the capture raw.
+func clearComposerResult(start time.Time, raw string, strip func(string) string, read ComposerDraftReader, full ComposerFullBodyReader) ComposerGuardResult {
+	draft, visible := read(raw, strip)
+	empty := visible && draft == ""
+	if full != nil {
+		body, ok := full(raw, strip)
+		empty = ok && FullBodyEmpty(body)
 	}
-	for attempt := 0; attempt < maxComposerClearAttempts; attempt++ {
-		if err := t.SendCtrlC(); err != nil {
-			break
-		}
-		clearDeadline := time.Now().Add(opts.ClearWait)
-		for {
-			raw, err := t.CapturePaneFresh()
-			// Require a POSITIVELY visible, empty composer before granting
-			// ComposerPasteMarkerFree: a capture that comes back !visible
-			// (transiently unreadable pane, dialog, etc.) is not evidence the
-			// clear succeeded, so it must not be folded into "cleared" (#1778
-			// review finding 2 — ComposerHasDraft is false for !visible too,
-			// which previously let this branch grant provenance it never
-			// established).
-			clearedDraft, clearedVisible := ComposerDraft(raw, strip)
-			if err == nil && clearedVisible && clearedDraft == "" {
-				res.DraftCleared = true
-				// The composer is confirmed empty right before the send, so
-				// any paste marker appearing afterwards is our own (#1777).
-				res.ComposerPasteMarkerFree = true
-				res.Held = time.Since(start)
-				return res
-			}
-			if !time.Now().Before(clearDeadline) {
-				break
-			}
-			sleepFor := clearPoll
-			if remaining := time.Until(clearDeadline); remaining < sleepFor {
-				sleepFor = remaining
-			}
-			if sleepFor > 0 {
-				time.Sleep(sleepFor)
-			}
-		}
+	return ComposerGuardResult{
+		Held:                    time.Since(start),
+		ComposerPasteMarkerFree: true,
+		SuggestionShown:         ComposerBodyIsSuggestion(raw),
+		ComposerEmpty:           empty,
 	}
-	res.ClearFailed = true
-	res.Held = time.Since(start)
-	return res
 }

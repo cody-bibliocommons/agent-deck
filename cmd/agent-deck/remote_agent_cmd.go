@@ -12,13 +12,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
+	"github.com/asheshgoplani/agent-deck/internal/update"
 )
 
 // `agent-deck remote-agent` is the remote end of a persistent channel
@@ -141,8 +142,16 @@ const (
 	// of writes collapses into one probe after the last of them, and a
 	// probe can never start again the moment it ends.
 	remoteAgentProbeQuiet = 2 * time.Second
+	// remoteAgentActivityEvery is the least time between two probes for
+	// stamp moves that left the listed rows unchanged (see
+	// remoteAgentConfig.Fingerprint). Such writes come with agent activity,
+	// whose live status only tmux knows, so they are still probed, slower.
+	remoteAgentActivityEvery = 10 * time.Second
 	// remoteAgentPingEvery is how often {"event":"ping"} is pushed.
 	remoteAgentPingEvery = 20 * time.Second
+	// remoteAgentProfileEvery is how often an agent started without -p
+	// checks that the host would still pick the profile it serves.
+	remoteAgentProfileEvery = 5 * time.Second
 	// remoteAgentIdleAfter is how long stdin may stay silent before the
 	// agent decides its peer is gone and exits; the local side pings well
 	// within it.
@@ -163,6 +172,9 @@ const (
 	// remoteAgentWriteStall is how long a producer may wait for room in a
 	// full outbound queue before the peer counts as gone.
 	remoteAgentWriteStall = 30 * time.Second
+	// remoteAgentDrainWait bounds how long a recycling agent waits for the
+	// requests it already accepted before it exits.
+	remoteAgentDrainWait = 30 * time.Second
 )
 
 // remoteAgentConfig wires serveRemoteAgent. Zero durations and counts take
@@ -174,23 +186,51 @@ type remoteAgentConfig struct {
 	WatchPath  string
 	WatchEvery time.Duration
 	ProbeQuiet time.Duration
-	Capture    func(context.Context, string) (string, error)
-	PaneEvery  time.Duration
-	PingEvery  time.Duration
-	IdleAfter  time.Duration
+	// Fingerprint, when set, cheaply identifies the state the listings are
+	// built from (the instances and groups rows). A stamp move that leaves
+	// it unchanged was a write to a table the listings do not read (a
+	// Claude status line, a cost event): it is probed no sooner than
+	// ActivityEvery after the last probe instead of after ProbeQuiet.
+	Fingerprint   func() (string, error)
+	ActivityEvery time.Duration
+	Capture       func(context.Context, string) (string, error)
+	PaneEvery     time.Duration
+	PingEvery     time.Duration
+	IdleAfter     time.Duration
 	// WriteStall bounds how long a write may wait for a full outbound queue.
 	WriteStall time.Duration
 	// MaxConcurrent caps subprocesses; MaxPushBytes caps pushed listings.
 	MaxConcurrent int
 	MaxPushBytes  int
+	// BinaryWatch, when set, makes the agent exit cleanly once a newer
+	// agent-deck is on disk and no request is in flight. The agent never
+	// re-execs: the JSON-lines handshake would not survive it. The
+	// controller (internal/session/remote_channel.go) sees EOF, marks the
+	// channel down and redials on its next request, which starts the new
+	// build; pane watches are re-asked after a reconnect. Idle and
+	// Restart on the watcher are set by serveRemoteAgent.
+	BinaryWatch *update.Watcher
+	// ProfileMoved, when set, reports whether the host would now pick
+	// another profile than the one the agent serves (default_profile
+	// changed under an agent started without -p). The agent then exits the
+	// same way as for a newer binary, so the controller redials into an
+	// agent that serves the new profile. It is checked every ProfileEvery.
+	ProfileMoved func() bool
+	ProfileEvery time.Duration
 }
 
 func (c remoteAgentConfig) withDefaults() remoteAgentConfig {
 	if c.ProbeQuiet <= 0 {
 		c.ProbeQuiet = remoteAgentProbeQuiet
 	}
+	if c.ActivityEvery <= 0 {
+		c.ActivityEvery = remoteAgentActivityEvery
+	}
 	if c.PingEvery <= 0 {
 		c.PingEvery = remoteAgentPingEvery
+	}
+	if c.ProfileEvery <= 0 {
+		c.ProfileEvery = remoteAgentProfileEvery
 	}
 	if c.IdleAfter <= 0 {
 		c.IdleAfter = remoteAgentIdleAfter
@@ -207,12 +247,6 @@ func (c remoteAgentConfig) withDefaults() remoteAgentConfig {
 	return c
 }
 
-// remoteAgentDeniedVerbs are never run through the channel: they need a
-// terminal, or must not be reachable from a remote TUI at all.
-var remoteAgentDeniedVerbs = map[string]bool{
-	"remote-agent": true, "web": true, "uninstall": true, "update": true,
-}
-
 func handleRemoteAgent(profile string, args []string) {
 	for _, a := range args {
 		if a == "--help" || a == "-h" {
@@ -224,18 +258,36 @@ func handleRemoteAgent(profile string, args []string) {
 			fmt.Println("{\"id\":N,\"unwatch\":true} stops it. {\"id\":N,\"cancel\":true} kills request N;")
 			fmt.Println("{\"id\":N,\"ping\":true} keeps the channel alive. The agent pushes {\"event\":\"ping\"} itself")
 			fmt.Println("and exits when stdout fails or stdin stays silent for 10 minutes.")
+			fmt.Println()
+			fmt.Println("Without -p it serves the profile every other command on this host would use:")
+			fmt.Println("AGENTDECK_PROFILE, then a profile inferred from CLAUDE_CONFIG_DIR if that profile")
+			fmt.Println("exists, then default_profile. The TUI leaves -p out for a remote whose profile is")
+			fmt.Println("unset or \"default\".")
 			return
 		}
 	}
+	// Resolve the profile once, for the change feed's state DB, the probe,
+	// the pane capturer and every request alike. The TUI leaves -p out for a
+	// remote whose profile is "" or "default", and GetDBPathForProfile reads
+	// "" as the default profile, while the probe resolves AGENTDECK_PROFILE
+	// and default_profile: the feed then watched a state DB the agent did not
+	// serve and pushed no change.
+	explicit := profile != ""
+	resolved, err := session.ResolveProfileForStorage(profile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "remote-agent: %v\n", err)
+		exitCLI(1)
+	}
+	profile = resolved
 	dbPath, err := session.GetDBPathForProfile(profile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "remote-agent: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	self, err := os.Executable()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "remote-agent: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	// The in-process probe refreshes statuses through tmux like `list` does,
 	// and `list` fixes up PATH for tmux before it starts.
@@ -245,12 +297,12 @@ func handleRemoteAgent(profile string, args []string) {
 	// must never be registered here.
 	if statedb.GetGlobal() != nil {
 		fmt.Fprintln(os.Stderr, "remote-agent: a global state DB is registered; the probe would write last-activity rows")
-		os.Exit(1)
+		exitCLI(1)
 	}
-	probe, closeProbe, err := newRemoteAgentProbe(profile)
+	probe, fingerprint, closeProbe, err := newRemoteAgentProbe(profile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "remote-agent: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	defer closeProbe()
 	runner := func(ctx context.Context, reqArgs []string) (string, string, int) {
@@ -272,40 +324,85 @@ func handleRemoteAgent(profile string, args []string) {
 		}
 		return out.String(), errb.String(), code
 	}
-	serveRemoteAgent(context.Background(), os.Stdin, os.Stdout, remoteAgentConfig{
-		Run:        runner,
-		Probe:      probe,
-		WatchPath:  dbPath,
-		WatchEvery: remoteAgentStampEvery,
-		Capture:    remoteAgentPaneCapturer(profile),
-		PaneEvery:  remoteAgentPaneEvery,
-	})
+	cfg := remoteAgentConfig{
+		Run:         runner,
+		Probe:       probe,
+		Fingerprint: fingerprint,
+		WatchPath:   dbPath,
+		WatchEvery:  remoteAgentStampEvery,
+		Capture:     remoteAgentPaneCapturer(profile),
+		PaneEvery:   remoteAgentPaneEvery,
+		BinaryWatch: newRemoteAgentBinaryWatch(self),
+	}
+	if !explicit {
+		// The resolution is pinned for the life of the agent, so a host
+		// that changes default_profile gets a reconnect, not an agent that
+		// keeps serving the old profile until the channel drops. A
+		// config.json caught mid-rewrite is an error, not a move.
+		cfg.ProfileMoved = func() bool {
+			now, err := session.ResolveProfileForStorageQuiet("")
+			return err == nil && now != profile
+		}
+	}
+	serveRemoteAgent(context.Background(), os.Stdin, os.Stdout, cfg)
+}
+
+// newRemoteAgentBinaryWatch returns the recycle-on-upgrade watcher for the
+// agent, or nil when [updates].auto_restart is off on this host or update
+// checks are disabled by environment.
+func newRemoteAgentBinaryWatch(self string) *update.Watcher {
+	if !headlessAutoRestartEnabled() {
+		return nil
+	}
+	return &update.Watcher{
+		Exe:            self,
+		RunningVersion: Version,
+		Log:            logging.ForComponent(logging.CompSession),
+	}
 }
 
 // newRemoteAgentProbe opens the profile's storage once and returns a probe
 // that loads it, refreshes statuses, and formats both listings exactly as
-// the CLI would, plus the close for the storage handle. Like `list --json`
-// it warms the tmux and hook-status caches once per probe, then formats
-// both listings from that one load. The handle stays open for the life of
-// the agent, so unlike a `list` subprocess no probe checkpoints the WAL.
+// the CLI would, the change feed's fingerprint, and the close for the
+// storage handle. Like `list --json` the probe warms the tmux and
+// hook-status caches once per probe, then formats both listings from that
+// one load. The handle stays open for the life of the agent, so unlike a
+// `list` subprocess no probe checkpoints the WAL.
 //
-// The probe is read-only. UpdateStatus flushes last-activity evidence
+// The fingerprint is a hash of the instances and groups rows, the only
+// tables the listings load. It reads the rows without decoding them into
+// sessions, refreshing a status or touching tmux, so it costs a small
+// fraction of a probe.
+//
+// Both are read-only. UpdateStatus flushes last-activity evidence
 // through statedb.GetGlobal(), which a `list` subprocess registers at
 // startup and this process never does (handleRemoteAgent checks), so the
 // flush is a no-op here and a probe never moves the stamp the watcher
 // compares. TestRemoteAgent_InProcessProbeMatchesCLI pins this.
-func newRemoteAgentProbe(profile string) (remoteAgentProbeFunc, func(), error) {
+func newRemoteAgentProbe(profile string) (remoteAgentProbeFunc, func() (string, error), func(), error) {
 	storage, err := session.NewStorageWithProfile(profile)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
+	}
+	fingerprint := func() (string, error) {
+		snap, err := storage.GetDB().LoadRegistrySnapshot()
+		if err != nil {
+			return "", err
+		}
+		h := sha256.New()
+		if err := json.NewEncoder(h).Encode(snap); err != nil {
+			return "", err
+		}
+		return hex.EncodeToString(h.Sum(nil)), nil
 	}
 	probe := func() (string, string, error) {
 		instances, groups, err := storage.LoadWithGroups()
 		if err != nil {
 			return "", "", err
 		}
-		session.RefreshInstancesForCLIStatus(instances)
-		l, err := buildListJSON(storage.Profile(), instances)
+		refresh, cached := session.CLIStatusCandidates(instances)
+		session.RefreshInstancesForCLIStatus(refresh)
+		l, err := buildListJSON(storage.Profile(), instances, cached)
 		if err != nil {
 			return "", "", err
 		}
@@ -315,7 +412,7 @@ func newRemoteAgentProbe(profile string) (remoteAgentProbeFunc, func(), error) {
 		}
 		return string(l), string(g), nil
 	}
-	return probe, func() { _ = storage.Close() }, nil
+	return probe, fingerprint, func() { _ = storage.Close() }, nil
 }
 
 // remoteAgentPaneCapturer returns a capture func that reads the watched
@@ -508,6 +605,55 @@ func serveRemoteAgent(ctx context.Context, in io.Reader, out io.Writer, cfg remo
 
 	requests := newRemoteAgentRequests(cfg.Run, cfg.MaxConcurrent, cfg.WatchPath)
 
+	// Recycle on upgrade or on a moved profile: either only closes recycle
+	// (once, whichever comes first); the loop below stops reading, drains
+	// accepted requests and exits so the controller redials into an agent
+	// with the new build or the new profile.
+	recycle := make(chan struct{})
+	var (
+		recycleOnce sync.Once
+		recycleWhy  string
+	)
+	startRecycle := func(why string) {
+		recycleOnce.Do(func() {
+			recycleWhy = why
+			close(recycle)
+		})
+	}
+	if w := cfg.BinaryWatch; w != nil {
+		w.Idle = func() bool { return requests.inFlight() == 0 }
+		w.Restart = func(string) error {
+			startRecycle(fmt.Sprintf("binary upgraded (running v%s)", Version))
+			return nil
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w.Run(ctx)
+		}()
+	}
+	if cfg.ProfileMoved != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			t := time.NewTicker(cfg.ProfileEvery)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-recycle:
+					return
+				case <-t.C:
+				}
+				if cfg.ProfileMoved() {
+					startRecycle("the host now selects another profile")
+					return
+				}
+			}
+		}()
+	}
+
 	// stdin is read on its own goroutine so the loop can also leave on a
 	// dead stdout or an idle deadline while a read is blocked.
 	lines := make(chan string)
@@ -525,6 +671,7 @@ func serveRemoteAgent(ctx context.Context, in io.Reader, out io.Writer, cfg remo
 	}()
 	idle := time.NewTimer(cfg.IdleAfter)
 	defer idle.Stop()
+	draining := false
 loop:
 	for {
 		var (
@@ -536,6 +683,10 @@ loop:
 			break loop
 		case <-idle.C:
 			fmt.Fprintf(os.Stderr, "remote-agent: no input for %s, exiting\n", cfg.IdleAfter)
+			break loop
+		case <-recycle:
+			fmt.Fprintf(os.Stderr, "remote-agent: %s; exiting so the controller reconnects\n", recycleWhy)
+			draining = true
 			break loop
 		case raw, ok = <-lines:
 			if !ok {
@@ -597,6 +748,11 @@ loop:
 			}
 		}(req, f)
 	}
+	if draining {
+		// A request that slipped in between the idle check and the recycle
+		// still gets its reply; only then is the context cancelled.
+		requests.drain(remoteAgentDrainWait)
+	}
 	cancel()
 	setWatch("", 0)
 	wg.Wait()
@@ -611,13 +767,21 @@ loop:
 // probe, and a write landing while a probe runs (which that probe may or
 // may not have seen) is probed again rather than taken as seen. The probe
 // is read-only, so a stamp that moved during it was moved by someone else.
+// With a Fingerprint, a stamp move that left the instances and groups rows
+// unchanged (a status line or cost event write, several a second on a busy
+// host) is probed at most every ActivityEvery instead of every ProbeQuiet.
 func watchRemoteState(ctx context.Context, cfg remoteAgentConfig, write func(remoteAgentReply)) {
 	last := remoteAgentStamp(cfg.WatchPath)
 	// Seed with the current content so the first stamp change is judged
 	// against what the TUI already fetched at startup.
+	lastFP := ""
+	if cfg.Fingerprint != nil {
+		lastFP, _ = cfg.Fingerprint()
+	}
 	l0, g0, _ := cfg.Probe()
 	lastHash := remoteAgentContentHash(l0, g0)
 	lastProbeEnd := time.Now()
+	lastFullProbeEnd := lastProbeEnd
 	pending := false
 	t := time.NewTicker(cfg.WatchEvery)
 	defer t.Stop()
@@ -633,13 +797,29 @@ func watchRemoteState(ctx context.Context, cfg remoteAgentConfig, write func(rem
 		if !pending || time.Since(lastProbeEnd) < cfg.ProbeQuiet {
 			continue
 		}
-		pending = false
 		before := last
+		if cfg.Fingerprint != nil {
+			// A stamp move that left the listed rows as they were is probed
+			// at the activity interval, not the quiet one. pending stays set,
+			// so the probe still comes once that interval is up; the
+			// fingerprint is checked again at most every ProbeQuiet.
+			fp, err := cfg.Fingerprint()
+			if err == nil && fp == lastFP && lastFP != "" && time.Since(lastFullProbeEnd) < cfg.ActivityEvery {
+				lastProbeEnd = time.Now()
+				continue
+			}
+			if err != nil {
+				fp = ""
+			}
+			lastFP = fp
+		}
+		pending = false
 		stamp := remoteAgentStampNanos(cfg.WatchPath)
 		started := time.Now()
 		l, g, err := cfg.Probe()
 		elapsed := time.Since(started).Milliseconds()
 		lastProbeEnd = time.Now()
+		lastFullProbeEnd = lastProbeEnd
 		if ctx.Err() != nil {
 			return
 		}
@@ -805,8 +985,27 @@ func (r *remoteAgentRequests) execute(ctx context.Context, f *remoteAgentFlight,
 		return
 	}
 	defer func() { <-r.sem }()
+	if ctx.Err() != nil {
+		f.stderr, f.code = "cancelled while queued", 1
+		return
+	}
 	f.stdout, f.stderr, f.code = r.exec(ctx, args)
 	f.stamp = remoteAgentStampNanos(r.stampPath)
+}
+
+// inFlight is the number of requests registered and not yet answered.
+func (r *remoteAgentRequests) inFlight() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.byID)
+}
+
+// drain waits until no request is in flight or timeout has passed.
+func (r *remoteAgentRequests) drain(timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for r.inFlight() > 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // cancel drops request id: its subprocess is killed once no other request
@@ -885,7 +1084,7 @@ func tailLines(s string, n int) string {
 // remoteAgentArgsAllowed admits only a known CLI verb that is not on the
 // deny list, with arguments that cannot break the line protocol.
 func remoteAgentArgsAllowed(args []string) bool {
-	if len(args) == 0 || remoteAgentDeniedVerbs[args[0]] || !commandRegistry[args[0]] {
+	if len(args) == 0 || session.RemoteAgentDeniesVerb(args[0]) || !commandRegistry[args[0]] {
 		return false
 	}
 	for _, a := range args {
@@ -897,14 +1096,68 @@ func remoteAgentArgsAllowed(args []string) bool {
 }
 
 // remoteAgentContentHash hashes what the TUI would see, ignoring the
-// last_activity timestamps that a status refresh rewrites on every listing.
+// last_activity_at timestamps that a status refresh rewrites on every listing
+// and a viewer's activity time, which moves with every keystroke in a shared
+// session (a viewer joining or leaving still counts as a change).
+//
+// It runs on every probe, and on a busy host a probe runs every couple of
+// seconds, so the scrub is a linear scan rather than a regexp: two
+// backtracking ReplaceAllString passes over a 146-session listing were a
+// sixth of an idle agent's CPU. remoteAgentScrubStringField removes exactly
+// what `"<key>":\s*"[^"]*",?` matched (TestRemoteAgentContentHash_MatchesRegexpScrub).
 func remoteAgentContentHash(listJSON, groupJSON string) string {
-	scrub := remoteAgentActivityField.ReplaceAllString(listJSON, "")
-	sum := sha256.Sum256([]byte(scrub + "\x00" + groupJSON))
-	return hex.EncodeToString(sum[:8])
+	scrub := remoteAgentScrubStringField(listJSON, "last_activity_at")
+	scrub = remoteAgentScrubStringField(scrub, "activity")
+	h := sha256.New()
+	_, _ = io.WriteString(h, scrub)
+	_, _ = io.WriteString(h, "\x00")
+	_, _ = io.WriteString(h, groupJSON)
+	var sum [sha256.Size]byte
+	return hex.EncodeToString(h.Sum(sum[:0])[:8])
 }
 
-var remoteAgentActivityField = regexp.MustCompile(`"last_activity_at":\s*"[^"]*",?`)
+// remoteAgentScrubStringField drops every `"<key>": "<value>",` (the comma
+// optional, any JSON whitespace after the colon, the value ending at its
+// first quote) from s, leftmost first, the way the regexp
+// `"<key>":\s*"[^"]*",?` replaced with "" did. s comes back as is when the
+// key does not occur.
+func remoteAgentScrubStringField(s, key string) string {
+	pat := `"` + key + `":`
+	i := strings.Index(s, pat)
+	if i < 0 {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	from := 0
+	for i >= 0 {
+		start := from + i
+		k := start + len(pat)
+		for k < len(s) && (s[k] == ' ' || s[k] == '\t' || s[k] == '\n' || s[k] == '\f' || s[k] == '\r') {
+			k++
+		}
+		matched := false
+		if k < len(s) && s[k] == '"' {
+			if q := strings.IndexByte(s[k+1:], '"'); q >= 0 {
+				end := k + 1 + q + 1
+				if end < len(s) && s[end] == ',' {
+					end++
+				}
+				b.WriteString(s[from:start])
+				from = end
+				matched = true
+			}
+		}
+		if !matched {
+			// No match here; the next one can start one byte on.
+			b.WriteString(s[from : start+1])
+			from = start + 1
+		}
+		i = strings.Index(s[from:], pat)
+	}
+	b.WriteString(s[from:])
+	return b.String()
+}
 
 // remoteAgentStamp folds the mtime and size of the state DB, its WAL and
 // SHM into one comparable string.

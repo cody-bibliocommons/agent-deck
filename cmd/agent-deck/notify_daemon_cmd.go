@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -11,8 +12,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/events"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/update"
 )
 
 // versionCheckInterval is how often the always-on daemon re-reads the on-disk
@@ -21,7 +24,7 @@ const versionCheckInterval = 60 * time.Second
 
 // handleNotifyDaemon runs the always-on transition notifier daemon.
 func handleNotifyDaemon(args []string) {
-	fs := flag.NewFlagSet("notify-daemon", flag.ExitOnError)
+	fs := flag.NewFlagSet("notify-daemon", flag.ContinueOnError)
 	once := fs.Bool("once", false, "Run one sync pass and exit")
 
 	fs.Usage = func() {
@@ -29,13 +32,16 @@ func handleNotifyDaemon(args []string) {
 		fmt.Println()
 		fmt.Println("Run status-driven transition notification daemon.")
 	}
-	if helpRequested(args) {
+	// notify-daemon takes no positional operands (only --once), so a bare
+	// "help" can never collide with a legitimate data value; treat it the
+	// same as --help/-h (issue #2025).
+	if hooksHelpRequested(args) {
 		fs.Usage()
 		return
 	}
 
-	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, normalizeArgs(fs, args)); err != nil {
+		exitCLI(1)
 	}
 
 	// handleNotifyDaemon is dispatched from main()'s early command switch and
@@ -56,6 +62,11 @@ func handleNotifyDaemon(args []string) {
 		"debug", os.Getenv("AGENTDECK_DEBUG") != "",
 	)
 
+	// Review round 2 (P1-A/P1-B): the hook half of the spine must not stay
+	// broken until an operator runs `hooks install`. Repair a dangling,
+	// stale-version or marker-less install before the first sync pass.
+	healClaudeHooksAtDaemonStart()
+
 	daemon := session.NewTransitionDaemon()
 	if *once {
 		daemon.SyncOnce(context.Background())
@@ -67,19 +78,17 @@ func handleNotifyDaemon(args []string) {
 		return
 	}
 
+	defer startRuntimeHealth("", "notify-daemon")()
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// STEP 1 (issue #1214): never run stale code. The transition-notifier unit
-	// is Restart=always, so cleanly exiting on a binary upgrade guarantees the
-	// supervisor brings the daemon back on the current binary — the 20-day
-	// stale window becomes impossible. RuntimeMaxSec in the unit file is the
-	// belt-and-suspenders backstop for environments without this watcher.
-	go watchBinaryVersion(ctx, cancel)
+	realNotifyDaemonStart().begin(ctx, cancel)
 
 	if err := daemon.Run(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "notify-daemon error: %v\n", err)
-		os.Exit(1)
+		_ = events.CloseDefault()
+		exitCLI(1)
 	}
 }
 
@@ -133,6 +142,7 @@ func initDaemonLogging() func() {
 		logCfg.Compress = ls.GetDebugCompress()
 	}
 	logging.Init(logCfg)
+	session.LogStoreRootSelection()
 	return logging.Shutdown
 }
 
@@ -142,14 +152,29 @@ func initDaemonLogging() func() {
 // fresh. Recycling only on a definite mismatch (ShouldRecycleForVersion ignores
 // empty/unknown versions) means a transient read failure never flaps the daemon.
 func watchBinaryVersion(ctx context.Context, cancel context.CancelFunc) {
-	ticker := time.NewTicker(versionCheckInterval)
+	watchBinaryVersionAt(ctx, cancel, os.Executable, versionCheckInterval)
+}
+
+// watchBinaryVersionAt is watchBinaryVersion with the executable lookup and
+// interval as seams. The install path is resolved once, before the first
+// tick: after an upgrade swaps the binary (rename to <path>.old, new file into
+// <path>, remove .old), os.Executable on Linux reports the running inode as
+// "<path>.old (deleted)", which cannot be run, so probing it would read
+// "unknown" forever and the daemon would never recycle.
+func watchBinaryVersionAt(ctx context.Context, cancel context.CancelFunc, executable func() (string, error), interval time.Duration) {
+	exe, err := executable()
+	if err != nil || exe == "" {
+		return
+	}
+	exe = installedExePath(exe)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			onDisk := readOnDiskVersion()
+			onDisk := readOnDiskVersion(exe)
 			if session.ShouldRecycleForVersion(Version, onDisk) {
 				fmt.Fprintf(os.Stderr, "notify-daemon: binary upgraded (running %s, on-disk %s); recycling\n", Version, onDisk)
 				cancel()
@@ -159,16 +184,31 @@ func watchBinaryVersion(ctx context.Context, cancel context.CancelFunc) {
 	}
 }
 
-// readOnDiskVersion runs the current executable path with `version` and parses
-// the semver token. After an in-place upgrade the path holds the new bytes while
-// this process still runs the old inode, so this reads the NEW version. Returns
-// "" on any failure (treated as "unknown" -> no recycle).
-func readOnDiskVersion() string {
-	exe, err := os.Executable()
-	if err != nil {
-		return ""
+// installedExePath maps the path os.Executable reports for this process to
+// the install path an upgrade writes: Linux appends " (deleted)" once the
+// running file is unlinked, and the updater moves the running file to
+// <path>.old before the new one takes its place. The ".old" suffix is only
+// dropped when the install path exists, so an install that really ends in
+// ".old" keeps its name.
+func installedExePath(exe string) string {
+	p := strings.TrimSuffix(exe, " (deleted)")
+	if base, ok := strings.CutSuffix(p, ".old"); ok {
+		if _, err := os.Stat(base); err == nil {
+			return base
+		}
 	}
-	out, err := exec.Command(exe, "version").Output()
+	return p
+}
+
+// readOnDiskVersion runs the binary at the install path with `version` and
+// parses the semver token. After an in-place upgrade the path holds the new
+// bytes while this process still runs the old inode, so this reads the NEW
+// version. Returns "" on any failure (treated as "unknown" -> no recycle).
+func readOnDiskVersion(exe string) string {
+	// Bounded so a hung binary cannot stall the version watcher.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, installedExePath(exe), "version").Output() //nolint:gosec // G204: the path is this process's own install path (os.Executable), the argument is the fixed "version", no shell
 	if err != nil {
 		return ""
 	}
@@ -194,4 +234,136 @@ func parseAgentDeckVersion(s string) string {
 		}
 	}
 	return strings.TrimSpace(rest[:end])
+}
+
+// notifyDaemonStart is the background work the long-running daemon starts
+// before its run loop. A seam so tests can drive the real start sequence
+// with fakes and prove what it starts, and how often.
+type notifyDaemonStart struct {
+	watchVersion        func(ctx context.Context, cancel context.CancelFunc)
+	headlessAutoInstall func(ctx context.Context)
+	healUpdateTimer     func()
+	// settlePending drops this service's own deferred launchd
+	// re-registration once launchd has started it again (nil: skipped).
+	settlePending func()
+}
+
+func realNotifyDaemonStart() notifyDaemonStart {
+	return notifyDaemonStart{
+		watchVersion:        watchBinaryVersion,
+		headlessAutoInstall: startHeadlessAutoInstall,
+		healUpdateTimer: func() {
+			healUpdateTimerAtDaemonStart(logging.ForComponent(logging.CompNotif))
+		},
+		settlePending: func() {
+			settleOwnPendingAtDaemonStart(os.Getppid(), daemonStartedAt, logging.ForComponent(logging.CompNotif))
+		},
+	}
+}
+
+// daemonStartedAt is when this process came up: a launchd deferral
+// recorded before it is one launchd has since answered by starting the
+// service again on the replaced binary.
+var daemonStartedAt = time.Now()
+
+// daemonSettlePending is update.SettleRespawnedService; a seam so tests
+// never read the host's pending marker.
+var daemonSettlePending = update.SettleRespawnedService
+
+// settleOwnPendingAtDaemonStart clears the daemon's own deferred launchd
+// re-registration once launchd has respawned it (2026-10-10: the notifier
+// stayed "pending" after it was already running the new build, because
+// every run inside it keeps the entry and the only run outside it, a TUI
+// tick, was parked in an attach all night). Only the service's main
+// process (parent launchd, pid 1) may settle: a child inheriting
+// XPC_SERVICE_NAME proves nothing about the service's own start.
+func settleOwnPendingAtDaemonStart(ppid int, startedAt time.Time, log *slog.Logger) {
+	if ppid != 1 {
+		return
+	}
+	if _, err := daemonSettlePending(update.RebootstrapOptions{Logger: log}, startedAt); err != nil {
+		log.Warn("launchagent_pending_settle_failed", "error", err.Error())
+	}
+}
+
+// begin starts the daemon's background work; it is called once per start.
+func (s notifyDaemonStart) begin(ctx context.Context, cancel context.CancelFunc) {
+	// STEP 1 (issue #1214): never run stale code. The transition-notifier unit
+	// is Restart=always, so cleanly exiting on a binary upgrade guarantees the
+	// supervisor brings the daemon back on the current binary — the 20-day
+	// stale window becomes impossible. RuntimeMaxSec in the unit file is the
+	// belt-and-suspenders backstop for environments without this watcher.
+	go s.watchVersion(ctx, cancel)
+
+	// A headless machine running only notify-daemon (no `web --no-tui`, no
+	// open TUI) previously had nothing polling GitHub between runs of the
+	// daily update timer: near-event-driven updates need every long-running
+	// process to poll, not just the ones with a UI. Same installer, same
+	// gates (auto_install, suppression, Homebrew) as `web --no-tui` uses.
+	s.headlessAutoInstall(ctx)
+
+	// The update timer heals the way the hooks do (#2472): once per daemon
+	// start, off the start path, gated by [updates] manage_timer.
+	go s.healUpdateTimer()
+
+	if s.settlePending != nil {
+		go s.settlePending()
+	}
+}
+
+// daemonEnsureUpdateTimer is the daemon's timer heal; a seam so tests never
+// touch the host's launchd or systemd.
+var daemonEnsureUpdateTimer = session.AutoEnsureUpdateTimer
+
+// healUpdateTimerAtDaemonStart installs or heals this host's update timer
+// once (a missing, inactive or legacy timer; see update.EnsureTimer) and
+// logs one line with the outcome. Best-effort: the daemon runs regardless.
+func healUpdateTimerAtDaemonStart(log *slog.Logger) update.TimerEnsureResult {
+	res, err := daemonEnsureUpdateTimer(log)
+	switch {
+	case err != nil:
+		log.Warn("update_timer_heal_failed", "action", res.Action, "error", err.Error())
+	case res.Changed():
+		log.Info("update_timer_healed", "action", res.Action, "kind", res.Status.Kind, "line", res.Line())
+	default:
+		log.Info("update_timer_heal_skipped", "action", res.Action, "reason", res.Reason)
+	}
+	return res
+}
+
+// healClaudeHooksAtDaemonStart runs session.HealClaudeHooks for the daemon's
+// Claude config dir when hooks are enabled. Best-effort: a failure is logged
+// and the daemon still runs.
+func healClaudeHooksAtDaemonStart() {
+	cfg, _ := session.LoadUserConfig()
+	if cfg != nil && !cfg.Claude.GetHooksEnabled() {
+		return
+	}
+	configDir := getClaudeConfigDirForHooks()
+	res, err := session.HealClaudeHooks(configDir, Version)
+	log := logging.ForComponent(logging.CompNotif)
+	// The accounts usage feed exists by construction: every configured slot's
+	// statusLine is wrapped with the ingester here too, so a remote whose
+	// binary was just updated starts feeding without an operator visit.
+	for _, r := range session.HealUsageFeeds(cfg) {
+		switch {
+		case r.Err != nil:
+			log.Warn("claude_usage_feed_heal_failed", "slot", r.Slot, "error", r.Err.Error())
+		case r.Changed:
+			log.Info("claude_usage_feed_wired", "slot", r.Slot, "command", r.Feed.Command)
+		}
+		for _, warning := range r.Feed.Warnings {
+			log.Warn("claude_usage_feed_warning", "slot", r.Slot, "warning", warning)
+		}
+	}
+	switch {
+	case err != nil:
+		log.Warn("claude_hooks_heal_failed", "config_dir", configDir, "error", err.Error())
+	case res.Healed:
+		log.Info("claude_hooks_healed", "config_dir", configDir, "reasons", strings.Join(res.Reasons, "; "))
+	case res.Skipped != "":
+		// An unpinnable dev build, or a hook binary newer than this one:
+		// reported, never written (review round 3, finding 2).
+		log.Info("claude_hooks_heal_skipped", "config_dir", configDir, "reason", res.Skipped)
+	}
 }

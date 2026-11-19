@@ -28,6 +28,11 @@ type fakeMutator struct {
 	updateSessionFn    func(id string, updates map[string]string) ([]string, bool, error)
 	createGroupFn      func(name, parentPath string) (string, error)
 	renameGroupFn      func(groupPath, newName string) error
+	// renamedPath, when set, is the post-rename path RenameGroup reports;
+	// otherwise the group keeps its path.
+	renamedPath        string
+	setGroupExpandedFn func(groupPath string, expanded bool) error
+	moveSessionFn      func(id, groupPath string) (string, bool, error)
 	deleteGroupFn      func(groupPath string) error
 	finishWorktreeFn   func(id string, opts WorktreeFinishOptions) (WorktreeFinishResult, error)
 }
@@ -116,11 +121,31 @@ func (f *fakeMutator) CreateGroup(name, parentPath string) (string, error) {
 	return f.createGroupFn(name, parentPath)
 }
 
-func (f *fakeMutator) RenameGroup(groupPath, newName string) error {
+func (f *fakeMutator) RenameGroup(groupPath, newName string) (string, error) {
 	if f.renameGroupFn == nil {
-		return fmt.Errorf("renameGroup not configured")
+		return "", fmt.Errorf("renameGroup not configured")
 	}
-	return f.renameGroupFn(groupPath, newName)
+	if err := f.renameGroupFn(groupPath, newName); err != nil {
+		return "", err
+	}
+	if f.renamedPath != "" {
+		return f.renamedPath, nil
+	}
+	return groupPath, nil
+}
+
+func (f *fakeMutator) SetGroupExpanded(groupPath string, expanded bool) error {
+	if f.setGroupExpandedFn == nil {
+		return fmt.Errorf("setGroupExpanded not configured")
+	}
+	return f.setGroupExpandedFn(groupPath, expanded)
+}
+
+func (f *fakeMutator) MoveSessionToGroup(id, groupPath string) (string, bool, error) {
+	if f.moveSessionFn == nil {
+		return "", false, fmt.Errorf("moveSession not configured")
+	}
+	return f.moveSessionFn(id, groupPath)
 }
 
 func (f *fakeMutator) DeleteGroup(groupPath string) error {
@@ -165,7 +190,7 @@ func TestSessionsCollectionGET(t *testing.T) {
 		},
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/api/sessions", nil)
+	req := newLocalRequest(http.MethodGet, "/api/sessions", nil)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -197,7 +222,7 @@ func TestSessionsCollectionPOSTCreatesSession(t *testing.T) {
 	}
 
 	body := strings.NewReader(`{"title":"Test","tool":"claude","projectPath":"/tmp"}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/sessions", body)
+	req := newLocalRequest(http.MethodPost, "/api/sessions", body)
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
@@ -226,7 +251,7 @@ func TestSessionsCollectionPOSTForwardsModelID(t *testing.T) {
 	}
 
 	body := strings.NewReader(`{"title":"Test","tool":"claude","projectPath":"/tmp","modelId":"claude-sonnet-4-6"}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/sessions", body)
+	req := newLocalRequest(http.MethodPost, "/api/sessions", body)
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
@@ -255,7 +280,7 @@ func TestSessionsCollectionPOSTForwardsReasoningEffort(t *testing.T) {
 	}
 
 	body := strings.NewReader(`{"title":"Test","tool":"codex","projectPath":"/tmp","reasoningEffort":"high"}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/sessions", body)
+	req := newLocalRequest(http.MethodPost, "/api/sessions", body)
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
@@ -282,7 +307,7 @@ func TestSessionsCollectionPOSTRejectsInvalidReasoningEffort(t *testing.T) {
 	}
 
 	body := strings.NewReader(`{"title":"Test","tool":"claude","projectPath":"/tmp","reasoningEffort":"minimal"}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/sessions", body)
+	req := newLocalRequest(http.MethodPost, "/api/sessions", body)
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
@@ -301,7 +326,7 @@ func TestSessionsCollectionPOSTNilMutatorReturns503(t *testing.T) {
 	// mutator is nil
 
 	body := strings.NewReader(`{"title":"Test","tool":"claude","projectPath":"/tmp"}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/sessions", body)
+	req := newLocalRequest(http.MethodPost, "/api/sessions", body)
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
@@ -322,7 +347,7 @@ func TestSessionsCollectionPOSTMutationsDisabled(t *testing.T) {
 	srv.menuData = &fakeMenuDataLoader{snapshot: &MenuSnapshot{}}
 
 	body := strings.NewReader(`{"title":"Test","tool":"claude","projectPath":"/tmp"}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/sessions", body)
+	req := newLocalRequest(http.MethodPost, "/api/sessions", body)
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
@@ -344,7 +369,7 @@ func TestSessionCreateMissingTitle(t *testing.T) {
 	srv.mutator = &fakeMutator{}
 
 	body := strings.NewReader(`{"tool":"claude","projectPath":"/tmp"}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/sessions", body)
+	req := newLocalRequest(http.MethodPost, "/api/sessions", body)
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
@@ -366,7 +391,7 @@ func TestSessionCreateMissingPath(t *testing.T) {
 	srv.mutator = &fakeMutator{}
 
 	body := strings.NewReader(`{"title":"Test","tool":"claude"}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/sessions", body)
+	req := newLocalRequest(http.MethodPost, "/api/sessions", body)
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
@@ -389,7 +414,7 @@ func TestSessionStopOK(t *testing.T) {
 		stopSessionFn: func(id string) error { return nil },
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/sessions/test-id/stop", nil)
+	req := newLocalRequest(http.MethodPost, "/api/sessions/test-id/stop", nil)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -408,7 +433,7 @@ func TestSessionDeleteOK(t *testing.T) {
 		deleteSessionFn: func(id string) error { return nil },
 	}
 
-	req := httptest.NewRequest(http.MethodDelete, "/api/sessions/test-id", nil)
+	req := newLocalRequest(http.MethodDelete, "/api/sessions/test-id", nil)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -427,7 +452,7 @@ func TestSessionStartOK(t *testing.T) {
 		startSessionFn: func(id string) error { return nil },
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/sessions/test-id/start", nil)
+	req := newLocalRequest(http.MethodPost, "/api/sessions/test-id/start", nil)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -446,7 +471,7 @@ func TestSessionRestartOK(t *testing.T) {
 		restartSessionFn: func(id string) error { return nil },
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/sessions/test-id/restart", nil)
+	req := newLocalRequest(http.MethodPost, "/api/sessions/test-id/restart", nil)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -465,7 +490,7 @@ func TestSessionForkOK(t *testing.T) {
 		forkSessionFn: func(id string) (string, error) { return "forked-id", nil },
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/sessions/test-id/fork", nil)
+	req := newLocalRequest(http.MethodPost, "/api/sessions/test-id/fork", nil)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -484,7 +509,7 @@ func TestSessionsUnauthorized(t *testing.T) {
 	})
 	srv.menuData = &fakeMenuDataLoader{snapshot: &MenuSnapshot{}}
 
-	req := httptest.NewRequest(http.MethodGet, "/api/sessions", nil)
+	req := newLocalRequest(http.MethodGet, "/api/sessions", nil)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -504,7 +529,7 @@ func TestMutationNilMutatorReturns503(t *testing.T) {
 	srv.menuData = &fakeMenuDataLoader{snapshot: &MenuSnapshot{}}
 	// mutator is nil
 
-	req := httptest.NewRequest(http.MethodPost, "/api/sessions/test-id/stop", nil)
+	req := newLocalRequest(http.MethodPost, "/api/sessions/test-id/stop", nil)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -543,7 +568,7 @@ func TestSessionCloseOK(t *testing.T) {
 		},
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/sessions/test-id/close", nil)
+	req := newLocalRequest(http.MethodPost, "/api/sessions/test-id/close", nil)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -565,7 +590,7 @@ func TestSessionCloseMutationsDisabled(t *testing.T) {
 	})
 	srv.menuData = &fakeMenuDataLoader{snapshot: &MenuSnapshot{}}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/sessions/test-id/close", nil)
+	req := newLocalRequest(http.MethodPost, "/api/sessions/test-id/close", nil)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -581,7 +606,7 @@ func TestSessionCloseNilMutatorReturns503(t *testing.T) {
 	})
 	srv.menuData = &fakeMenuDataLoader{snapshot: &MenuSnapshot{}}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/sessions/test-id/close", nil)
+	req := newLocalRequest(http.MethodPost, "/api/sessions/test-id/close", nil)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -600,7 +625,7 @@ func TestSessionCloseMutatorError(t *testing.T) {
 		closeSessionFn: func(id string) error { return fmt.Errorf("kill failed: signal 9") },
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/sessions/test-id/close", nil)
+	req := newLocalRequest(http.MethodPost, "/api/sessions/test-id/close", nil)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -622,7 +647,7 @@ func TestSessionCloseNotifiesSSE(t *testing.T) {
 	ch := srv.subscribeMenuChanges()
 	defer srv.unsubscribeMenuChanges(ch)
 
-	req := httptest.NewRequest(http.MethodPost, "/api/sessions/whatever/close", nil)
+	req := newLocalRequest(http.MethodPost, "/api/sessions/whatever/close", nil)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
@@ -657,7 +682,7 @@ func TestSessionDeleteUndoRoundtrip(t *testing.T) {
 	}
 
 	// Delete.
-	delReq := httptest.NewRequest(http.MethodDelete, "/api/sessions/sess-42", nil)
+	delReq := newLocalRequest(http.MethodDelete, "/api/sessions/sess-42", nil)
 	delRR := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(delRR, delReq)
 	if delRR.Code != http.StatusOK {
@@ -668,7 +693,7 @@ func TestSessionDeleteUndoRoundtrip(t *testing.T) {
 	}
 
 	// Undo.
-	undoReq := httptest.NewRequest(http.MethodPost, "/api/sessions/undelete", nil)
+	undoReq := newLocalRequest(http.MethodPost, "/api/sessions/undelete", nil)
 	undoRR := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(undoRR, undoReq)
 	if undoRR.Code != http.StatusOK {
@@ -692,7 +717,7 @@ func TestSessionUndoNothing(t *testing.T) {
 		undoDeleteFn: func() (string, error) { return "", ErrUndoNothing },
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/sessions/undelete", nil)
+	req := newLocalRequest(http.MethodPost, "/api/sessions/undelete", nil)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -718,7 +743,7 @@ func TestSessionUndoExpiredReturns404(t *testing.T) {
 		undoDeleteFn: func() (string, error) { return "", ErrUndoExpired },
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/sessions/undelete", nil)
+	req := newLocalRequest(http.MethodPost, "/api/sessions/undelete", nil)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -737,7 +762,7 @@ func TestSessionUndoMutatorError(t *testing.T) {
 		undoDeleteFn: func() (string, error) { return "", fmt.Errorf("restart failed: tmux missing") },
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/sessions/undelete", nil)
+	req := newLocalRequest(http.MethodPost, "/api/sessions/undelete", nil)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -753,7 +778,7 @@ func TestSessionUndoNilMutatorReturns503(t *testing.T) {
 	})
 	srv.menuData = &fakeMenuDataLoader{snapshot: &MenuSnapshot{}}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/sessions/undelete", nil)
+	req := newLocalRequest(http.MethodPost, "/api/sessions/undelete", nil)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -769,7 +794,7 @@ func TestSessionUndoMutationsDisabled(t *testing.T) {
 	})
 	srv.menuData = &fakeMenuDataLoader{snapshot: &MenuSnapshot{}}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/sessions/undelete", nil)
+	req := newLocalRequest(http.MethodPost, "/api/sessions/undelete", nil)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -785,10 +810,10 @@ func TestSessionUndoUnauthorized(t *testing.T) {
 	})
 	srv.menuData = &fakeMenuDataLoader{snapshot: &MenuSnapshot{}}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/sessions/undelete", nil)
+	req := newLocalRequest(http.MethodPost, "/api/sessions/undelete", nil)
 	// Same-origin so the request clears CSRF (fail-closed when a token is set)
 	// and reaches the auth check — the behavior under test.
-	req.Header.Set("Origin", "http://example.com")
+	req.Header.Set("Origin", "http://localhost")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -810,7 +835,7 @@ func TestMutationNotifiesSSE(t *testing.T) {
 	ch := srv.subscribeMenuChanges()
 	defer srv.unsubscribeMenuChanges(ch)
 
-	req := httptest.NewRequest(http.MethodPost, "/api/sessions/test-id/stop", nil)
+	req := newLocalRequest(http.MethodPost, "/api/sessions/test-id/stop", nil)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -851,7 +876,7 @@ func TestSessionPatchUpdatesTitle(t *testing.T) {
 	}
 
 	body := strings.NewReader(`{"title":"renamed"}`)
-	req := httptest.NewRequest(http.MethodPatch, "/api/sessions/sess-001", body)
+	req := newLocalRequest(http.MethodPatch, "/api/sessions/sess-001", body)
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
@@ -902,7 +927,7 @@ func TestSessionPatchForwardsAllSupportedFields(t *testing.T) {
 	  "skipPermissions": true,
 	  "autoMode": false
 	}`)
-	req := httptest.NewRequest(http.MethodPatch, "/api/sessions/sess-1", body)
+	req := newLocalRequest(http.MethodPatch, "/api/sessions/sess-1", body)
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
@@ -946,7 +971,7 @@ func TestSessionPatchEmptyBodyRejected(t *testing.T) {
 	}
 
 	body := strings.NewReader(`{}`)
-	req := httptest.NewRequest(http.MethodPatch, "/api/sessions/sess-1", body)
+	req := newLocalRequest(http.MethodPatch, "/api/sessions/sess-1", body)
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
@@ -970,7 +995,7 @@ func TestSessionPatchEmptyTitleRejected(t *testing.T) {
 	}
 
 	body := strings.NewReader(`{"title":"   "}`)
-	req := httptest.NewRequest(http.MethodPatch, "/api/sessions/sess-1", body)
+	req := newLocalRequest(http.MethodPatch, "/api/sessions/sess-1", body)
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
@@ -992,7 +1017,7 @@ func TestSessionPatchMalformedJSONRejected(t *testing.T) {
 	srv.mutator = &fakeMutator{}
 
 	body := strings.NewReader(`{not-json`)
-	req := httptest.NewRequest(http.MethodPatch, "/api/sessions/sess-1", body)
+	req := newLocalRequest(http.MethodPatch, "/api/sessions/sess-1", body)
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
@@ -1015,7 +1040,7 @@ func TestSessionPatchMutationErrorReturns400(t *testing.T) {
 	}
 
 	body := strings.NewReader(`{"color":"bogus"}`)
-	req := httptest.NewRequest(http.MethodPatch, "/api/sessions/sess-1", body)
+	req := newLocalRequest(http.MethodPatch, "/api/sessions/sess-1", body)
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
@@ -1041,7 +1066,7 @@ func TestSessionPatchNotFoundReturns404(t *testing.T) {
 	}
 
 	body := strings.NewReader(`{"title":"x"}`)
-	req := httptest.NewRequest(http.MethodPatch, "/api/sessions/does-not-exist", body)
+	req := newLocalRequest(http.MethodPatch, "/api/sessions/does-not-exist", body)
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
@@ -1060,7 +1085,7 @@ func TestSessionPatchNilMutatorReturns503(t *testing.T) {
 	// mutator is nil
 
 	body := strings.NewReader(`{"title":"x"}`)
-	req := httptest.NewRequest(http.MethodPatch, "/api/sessions/sess-1", body)
+	req := newLocalRequest(http.MethodPatch, "/api/sessions/sess-1", body)
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
@@ -1078,7 +1103,7 @@ func TestSessionPatchMutationsDisabledReturns403(t *testing.T) {
 	srv.menuData = &fakeMenuDataLoader{snapshot: &MenuSnapshot{}}
 
 	body := strings.NewReader(`{"title":"x"}`)
-	req := httptest.NewRequest(http.MethodPatch, "/api/sessions/sess-1", body)
+	req := newLocalRequest(http.MethodPatch, "/api/sessions/sess-1", body)
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
@@ -1104,7 +1129,7 @@ func TestSessionPatchNotifiesSSE(t *testing.T) {
 	defer srv.unsubscribeMenuChanges(ch)
 
 	body := strings.NewReader(`{"title":"renamed"}`)
-	req := httptest.NewRequest(http.MethodPatch, "/api/sessions/sess-1", body)
+	req := newLocalRequest(http.MethodPatch, "/api/sessions/sess-1", body)
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
@@ -1142,7 +1167,7 @@ func TestSessionPatchUnicodeAndLongTitle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	req := httptest.NewRequest(http.MethodPatch, "/api/sessions/sess-1", strings.NewReader(string(payload)))
+	req := newLocalRequest(http.MethodPatch, "/api/sessions/sess-1", strings.NewReader(string(payload)))
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
@@ -1170,7 +1195,7 @@ func TestSessionArchiveOK(t *testing.T) {
 		},
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/sessions/test-id/archive", nil)
+	req := newLocalRequest(http.MethodPost, "/api/sessions/test-id/archive", nil)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -1197,7 +1222,7 @@ func TestSessionUnarchiveOK(t *testing.T) {
 		},
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/sessions/test-id/unarchive", nil)
+	req := newLocalRequest(http.MethodPost, "/api/sessions/test-id/unarchive", nil)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -1228,7 +1253,7 @@ func TestArchivedSessionsList(t *testing.T) {
 		archivedSnapshot: archivedSnap,
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/api/sessions/archived", nil)
+	req := newLocalRequest(http.MethodGet, "/api/sessions/archived", nil)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -1237,5 +1262,38 @@ func TestArchivedSessionsList(t *testing.T) {
 	}
 	if !strings.Contains(rr.Body.String(), `"arch-1"`) {
 		t.Errorf("archived list: expected arch-1 in body: %s", rr.Body.String())
+	}
+}
+
+// TestSessionsCollectionPOSTForwardsGroupPath pins that a create request
+// naming a group actually creates the session there. The handler has always
+// threaded GroupPath, but the web client never sent it — so every
+// browser-created session silently landed in the default group.
+func TestSessionsCollectionPOSTForwardsGroupPath(t *testing.T) {
+	srv := NewServer(Config{
+		ListenAddr:   "127.0.0.1:0",
+		WebMutations: true,
+	})
+	srv.menuData = &fakeMenuDataLoader{snapshot: &MenuSnapshot{}}
+
+	var gotGroup string
+	srv.mutator = &fakeMutator{
+		createSessionFn: func(title, tool, projectPath, groupPath, modelID, reasoningEffort string) (string, error) {
+			gotGroup = groupPath
+			return "new-id", nil
+		},
+	}
+
+	body := strings.NewReader(`{"title":"Test","tool":"claude","projectPath":"/tmp","groupPath":"work/innotrade"}`)
+	req := newLocalRequest(http.MethodPost, "/api/sessions", body)
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusCreated, rr.Code, rr.Body.String())
+	}
+	if gotGroup != "work/innotrade" {
+		t.Fatalf("groupPath = %q, want %q", gotGroup, "work/innotrade")
 	}
 }

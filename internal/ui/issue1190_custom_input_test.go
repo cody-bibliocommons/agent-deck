@@ -26,6 +26,7 @@ import (
 
 func enter(h *Home)  { h.handleNewDialogKey(tea.KeyMsg{Type: tea.KeyEnter}) }
 func down(h *Home)   { h.handleNewDialogKey(tea.KeyMsg{Type: tea.KeyDown}) }
+func space(h *Home)  { h.handleNewDialogKey(tea.KeyMsg{Type: tea.KeySpace}) }
 func escKey(h *Home) { h.handleNewDialogKey(tea.KeyMsg{Type: tea.KeyEsc}) }
 
 func typeHome(h *Home, s string) {
@@ -45,6 +46,7 @@ func TestIssue1190_CustomPathSelectThenType(t *testing.T) {
 	h.newDialog.SetDefaultTool("")
 	h.newDialog.SetSize(120, 50)
 	h.newDialog.Show()
+	h.newDialog.enterAdvances = true // Enter opens browse in the opt-in walk (ASK-110 default: Enter creates)
 	h.newDialog.focusIndex = h.newDialog.indexOf(focusPath)
 	h.newDialog.pathInput.SetValue("") // emulate an empty custom-path scenario
 	h.newDialog.updateFocus()
@@ -89,9 +91,9 @@ func TestIssue1190_CustomModelSelectThenType(t *testing.T) {
 	h.newDialog.modelInput.SetValue("")
 	h.newDialog.updateFocus()
 
-	enter(h) // open the model dropdown
+	space(h) // step into the model dropdown (Enter now advances, see newdialog_flow_test.go)
 	if !h.newDialog.IsModelSuggestionsActive() {
-		t.Fatal("Enter on the model field should open the model suggestions dropdown")
+		t.Fatal("Space on the model field should open the model suggestions dropdown")
 	}
 	if h.newDialog.modelSuggestionCursor != 0 {
 		t.Fatalf("model dropdown should start on the synthetic custom entry (cursor 0), got %d", h.newDialog.modelSuggestionCursor)
@@ -153,8 +155,7 @@ func TestIssue1190_RealModelSuggestionEnterStillAdvances(t *testing.T) {
 	h.newDialog.modelInput.SetValue("")
 	h.newDialog.updateFocus()
 
-	enter(h) // open dropdown
-	down(h)  // move to first real suggestion (cursor 1)
+	down(h) // ↓ steps into the dropdown on the first real suggestion (cursor 1)
 	if h.newDialog.modelSuggestionCursor != 1 {
 		t.Fatalf("down should move to first real model suggestion (cursor 1), got %d", h.newDialog.modelSuggestionCursor)
 	}

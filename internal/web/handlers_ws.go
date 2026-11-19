@@ -84,16 +84,34 @@ func (s *Server) handleSessionWS(w http.ResponseWriter, r *http.Request) {
 	// CRLF/control-char id can't forge fake log lines (go/log-injection).
 	logSessionID := logging.SanitizeValue(sessionID)
 
-	snapshot, err := s.menuData.LoadMenuSnapshot()
-	if err != nil {
-		writeAPIError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to load session data")
-		return
+	// Resolve the session from the cached snapshot first. LoadMenuSnapshot
+	// can hold the menu-data lock for a full inline refresh (seconds on a
+	// busy host with many sessions), and the terminal open only needs the
+	// tmux target. Unknown ids still go through the full load so new
+	// sessions and the 404 path behave as before (#2663).
+	var (
+		snapshot    *MenuSnapshot
+		menuSession *MenuSession
+		found       bool
+		fromCache   bool
+		err         error
+	)
+	if cached, ok := s.menuData.(interface{ CachedMenuSnapshot() *MenuSnapshot }); ok {
+		snapshot = cached.CachedMenuSnapshot()
+		menuSession, found = snapshotSessionByID(snapshot, sessionID)
+		fromCache = found
 	}
-
-	menuSession, found := snapshotSessionByID(snapshot, sessionID)
 	if !found {
-		writeAPIError(w, http.StatusNotFound, "NOT_FOUND", "session not found")
-		return
+		snapshot, err = s.menuData.LoadMenuSnapshot()
+		if err != nil {
+			writeAPIError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to load session data")
+			return
+		}
+		menuSession, found = snapshotSessionByID(snapshot, sessionID)
+		if !found {
+			writeAPIError(w, http.StatusNotFound, "NOT_FOUND", "session not found")
+			return
+		}
 	}
 
 	conn, err := wsUpgrader.Upgrade(w, r, nil)
@@ -106,9 +124,9 @@ func (s *Server) handleSessionWS(w http.ResponseWriter, r *http.Request) {
 	// actually runs. Without this, an idle session whose client vanished
 	// (network drop, mobile app killed) leaves the read loop below blocked
 	// forever in ReadMessage, so `defer bridge.Close()` never fires and the
-	// tmux attach client leaks. Under `window-size largest` a single leaked
-	// wide client then pins the shared window geometry for every other viewer
-	// — the symptom being a phone terminal that stops wrapping to its screen.
+	// tmux attach client leaks. Because attached clients participate in window
+	// sizing, a leaked client can then distort the shared geometry for every
+	// other viewer — for example, a phone terminal may stop wrapping correctly.
 	// We send protocol-level pings and require a pong within pongWait; both
 	// browsers and URLSessionWebSocketTask answer pings automatically.
 	pongWait, pingPeriod := wsPongWait, wsPingPeriod
@@ -157,7 +175,22 @@ func (s *Server) handleSessionWS(w http.ResponseWriter, r *http.Request) {
 
 	var bridge *tmuxPTYBridge
 	if menuSession.TmuxSession != "" {
-		bridge, err = newTmuxPTYBridge(menuSession.TmuxSession, menuSession.TmuxSocketName, sessionID, writer)
+		bridge, err = attachTmuxPTYBridge(menuSession.TmuxSession, menuSession.TmuxSocketName, sessionID, writer)
+		if err != nil && fromCache && errors.Is(err, ErrTmuxSessionNotFound) {
+			// The cached snapshot can name a tmux session that was replaced
+			// since it was published (restart/start recreate the tmux session
+			// under a new name, possibly from the CLI or TUI). Re-resolve
+			// through the full load and retry once if the target changed.
+			if fresh, loadErr := s.menuData.LoadMenuSnapshot(); loadErr == nil {
+				if freshSession, ok := snapshotSessionByID(fresh, sessionID); ok &&
+					freshSession.TmuxSession != "" &&
+					(freshSession.TmuxSession != menuSession.TmuxSession ||
+						freshSession.TmuxSocketName != menuSession.TmuxSocketName) {
+					menuSession = freshSession
+					bridge, err = attachTmuxPTYBridge(menuSession.TmuxSession, menuSession.TmuxSocketName, sessionID, writer)
+				}
+			}
+		}
 		if err != nil {
 			logging.ForComponent(logging.CompWeb).Error("terminal_attach_failed",
 				slog.String("session_id", logSessionID),

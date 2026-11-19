@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
+	"github.com/asheshgoplani/agent-deck/internal/testutil"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -19,6 +20,8 @@ import (
 // Two independent registries receive equivalent local and SSH operations.
 // Compare successful JSON schemas and independently inspect each side effect.
 func TestRemoteSuccessfulMutationParity(t *testing.T) {
+	testutil.RequireTmux(t)
+	parallelSubprocessTest(t)
 	bin := channelsCLIBinary(t)
 	controller, server, local, shim := t.TempDir(), t.TempDir(), t.TempDir(), t.TempDir()
 	startParitySSH(t, server, shim)
@@ -43,6 +46,7 @@ func TestRemoteSuccessfulMutationParity(t *testing.T) {
 		return string(out)
 	}
 	for i, home := range homes {
+		write(filepath.Join(home, ".zshrc"), "# remote mutation parity test\n")
 		write(filepath.Join(home, ".config/agent-deck/config.toml"), "[tmux]\nsocket_name = '"+sockets[i]+"'\n[profiles.person_a.claude]\nconfig_dir = '"+filepath.Join(home, "claude-a")+"'\n[mcps.parity]\ncommand = 'true'\n")
 		git(home, "init", "-b", "main")
 		git(home, "config", "user.name", "Test")
@@ -223,6 +227,11 @@ while True:
 		{name: "worktree-info", args: func(int) []string { return []string{"worktree", "info", "worktree", "--json"} }},
 		{name: "mcp-attach", args: func(int) []string { return []string{"mcp", "attach", "worktree", "parity", "--json"} }},
 		{name: "skill-attach", args: func(int) []string { return []string{"skill", "attach", "worktree", "parity", "--json"} }},
+		// The switch preview runs on the server against its own slots and
+		// transcript; the same JSON contract comes back through the passthrough.
+		{name: "switch-preview", args: func(int) []string {
+			return []string{"session", "switch-preview", "worktree", "--to-harness", "claude", "--to-account", "person_a", "--json"}
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -270,7 +279,7 @@ while True:
 			for _, row := range rows {
 				if row.Title == "worktree" || row.Title == "launched" {
 					seen[row.Title] = true
-					if row.Account != "person_a" || row.ProjectPath != row.WorktreePath || row.WorktreeRepo != home {
+					if row.Account != "person_a" || canonicalPathKey(row.ProjectPath) != canonicalPathKey(row.WorktreePath) || canonicalPathKey(row.WorktreeRepo) != canonicalPathKey(home) {
 						t.Errorf("side %d persisted worktree/account mismatch: %+v", side, row)
 					}
 				}

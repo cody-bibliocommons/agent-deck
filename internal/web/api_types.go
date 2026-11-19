@@ -14,16 +14,19 @@ const (
 	ErrCodeInternalError    = "INTERNAL_ERROR"
 	ErrCodeNotImplemented   = "NOT_IMPLEMENTED"
 	ErrCodeReadOnly         = "READ_ONLY"
+	ErrCodeFileLinkRefused  = "FILE_LINK_REFUSED"
 )
 
 // CreateSessionRequest is the body for POST /api/sessions.
 type CreateSessionRequest struct {
-	Title           string `json:"title"`
-	Tool            string `json:"tool"`
-	ProjectPath     string `json:"projectPath"`
-	GroupPath       string `json:"groupPath,omitempty"`
-	ModelID         string `json:"modelId,omitempty"`
-	ReasoningEffort string `json:"reasoningEffort,omitempty"`
+	Title           string   `json:"title"`
+	Tool            string   `json:"tool"`
+	ProjectPath     string   `json:"projectPath"`
+	CreateDir       bool     `json:"createDir,omitempty"`
+	CreateDirPaths  []string `json:"createDirPaths,omitempty"`
+	GroupPath       string   `json:"groupPath,omitempty"`
+	ModelID         string   `json:"modelId,omitempty"`
+	ReasoningEffort string   `json:"reasoningEffort,omitempty"`
 }
 
 // CreateGroupRequest is the body for POST /api/groups.
@@ -32,9 +35,18 @@ type CreateGroupRequest struct {
 	ParentPath string `json:"parentPath,omitempty"`
 }
 
-// RenameGroupRequest is the body for PATCH /api/groups/:path.
-type RenameGroupRequest struct {
+// UpdateGroupRequest is the body for PATCH /api/groups/:path. Both fields are
+// optional, but at least one must be present.
+//
+// Expanded is a pointer for the same reason UpdateSessionRequest's bools are:
+// a missing field must not read as "collapse this group". When both are sent,
+// the handler applies Expanded first — a rename changes the path out from
+// under the collapse write.
+type UpdateGroupRequest struct {
 	Name string `json:"name"`
+	// Expanded persists the group's collapse state so the web sidebar and the
+	// TUI agree. nil leaves it untouched.
+	Expanded *bool `json:"expanded,omitempty"`
 }
 
 // UpdateSessionRequest is the body for PATCH /api/sessions/{id}. Every field
@@ -55,6 +67,22 @@ type UpdateSessionRequest struct {
 	Channels        *string `json:"channels,omitempty"`
 	SkipPermissions *bool   `json:"skipPermissions,omitempty"`
 	AutoMode        *bool   `json:"autoMode,omitempty"`
+}
+
+// MoveSessionRequest is the body for POST /api/sessions/{id}/move (#2368).
+// GroupPath "" or "root" moves the session to the default group.
+type MoveSessionRequest struct {
+	GroupPath string `json:"groupPath"`
+}
+
+// MoveSessionResponse confirms a move. GroupPath is where the session landed
+// (after case-insensitive matching or group creation). RestartRequired is true
+// when the destination group resolves a different Claude config dir, which
+// the running session only picks up on its next restart.
+type MoveSessionResponse struct {
+	SessionID       string `json:"sessionId"`
+	GroupPath       string `json:"groupPath"`
+	RestartRequired bool   `json:"restartRequired"`
 }
 
 // UpdateSessionResponse confirms a PATCH succeeded. RestartRequired is true
@@ -119,6 +147,27 @@ type SettingsResponse struct {
 	// ConfirmLinkOpen reports whether every other host still confirms.
 	TrustedDomains  []string `json:"trustedDomains"`
 	ConfirmLinkOpen bool     `json:"confirmLinkOpen"`
+	// FileLinkRoots are the `[web] file_link_roots` directories whose
+	// file:// links open through GET /api/files (issue #2676). Empty means
+	// file links only copy their path.
+	FileLinkRoots []string `json:"fileLinkRoots"`
+	// FileLinkHost is this machine's hostname: a file://<host>/path link
+	// (what `ls --hyperlink` emits) is this machine's file only when the
+	// host matches.
+	FileLinkHost string `json:"fileLinkHost"`
+
+	// ModelCatalog carries the same model and effort lists the TUI dialog
+	// uses, keyed by picker tool name, so the web dialog shows models the
+	// installed CLI reports (#2388). Tools without a catalog are omitted and
+	// the dialog keeps its built-in list for them.
+	ModelCatalog map[string]ToolModelCatalog `json:"modelCatalog"`
+}
+
+// ToolModelCatalog is one tool's entry in SettingsResponse.ModelCatalog.
+type ToolModelCatalog struct {
+	Models           []string            `json:"models"`
+	ReasoningEfforts []string            `json:"reasoningEfforts"`
+	ModelEfforts     map[string][]string `json:"modelEfforts,omitempty"`
 }
 
 // ProfilesResponse is returned by GET /api/profiles.

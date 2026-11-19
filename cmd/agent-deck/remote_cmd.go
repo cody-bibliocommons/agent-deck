@@ -8,14 +8,44 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
+	"os/signal"
+	"path/filepath"
+	"sort"
 	"strings"
+	"syscall"
+	"time"
 
+	"github.com/mattn/go-runewidth"
+
+	"github.com/asheshgoplani/agent-deck/internal/logging"
+	"github.com/asheshgoplani/agent-deck/internal/provider"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/update"
 )
 
+// resolveRemoteConfig loads the user config and looks up the RemoteConfig
+// for name — the "load config, check config.Remotes, check the key"
+// resolution every remote subcommand (and completion_cmd.go's
+// printRemoteSessionCompletions) needs before it can build an SSHRunner.
+// loadErr is only set when LoadUserConfig itself failed; exists is false
+// whenever config.Remotes is nil or has no entry for name — callers that
+// want a distinct message for each case check loadErr first.
+func resolveRemoteConfig(name string) (rc session.RemoteConfig, exists bool, loadErr error) {
+	config, err := session.LoadUserConfig()
+	if err != nil {
+		return session.RemoteConfig{}, false, err
+	}
+	if config.Remotes == nil {
+		return session.RemoteConfig{}, false, nil
+	}
+	rc, exists = config.Remotes[name]
+	return rc, exists, nil
+}
+
 func handleRemote(profile string, args []string) {
+	installRemoteSignalCleanup()
 	if len(args) == 0 {
 		printRemoteUsage()
 		return
@@ -31,7 +61,7 @@ func handleRemote(profile string, args []string) {
 		}
 		if len(args) < 3 {
 			fmt.Fprintln(os.Stderr, "Usage: agent-deck remote exec <name> <command> [arguments]")
-			os.Exit(2)
+			exitCLI(2)
 		}
 		handleRemoteExec(args[1], args[2:])
 		return
@@ -47,13 +77,19 @@ func handleRemote(profile string, args []string) {
 	if config, err := session.LoadUserConfig(); err == nil {
 		if _, exists := config.Remotes[args[0]]; exists && isRemoteManagementCommand(args[0]) {
 			fmt.Fprintf(os.Stderr, "Ambiguous remote name %q; use 'agent-deck remote exec %s <command>' or rename this remote in config before managing remotes\n", args[0], args[0])
-			os.Exit(2)
+			exitCLI(2)
 		}
 	}
 
 	switch args[0] {
 	case "add":
+		if remoteAddProviderRequested(args[1:]) {
+			handleRemoteAddProvider(profile, args[1:])
+			return
+		}
 		handleRemoteAdd(args[1:])
+	case "destroy":
+		handleRemoteDestroy(args[1:])
 	case "remove", "rm":
 		handleRemoteRemove(args[1:])
 	case "list", "ls":
@@ -73,9 +109,60 @@ func handleRemote(profile string, args []string) {
 	}
 }
 
+// remoteSignalGrace is how long a signalled remote command may take to
+// return through its own context handling after its ssh groups are gone.
+const remoteSignalGrace = 2 * time.Second
+
+// remoteSignalProviderWait bounds how long a signalled remote command waits
+// for provider work (a rollback or destroy, each bounded at 2 minutes by
+// the provider package) before it exits anyway.
+const remoteSignalProviderWait = 3 * time.Minute
+
+// installRemoteSignalCleanup makes a signal to any `remote ...` command kill
+// its ssh process groups before the CLI exits. ssh runs in its own process
+// group (so a timeout can kill everything it started), which also means the
+// default "die on SIGTERM" no longer reaches it: a poller that times the CLI
+// out would otherwise leave the ssh, and the remote command behind it,
+// running (2026-10 remote list pile-up). Commands that watch their own
+// signal context still finish on their own, inside remoteSignalGrace.
+func installRemoteSignalCleanup() {
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	go func() {
+		sig := <-sigs
+		session.KillSSHProcesses()
+		awaitRemoteSignalExit(sigs, providerWork, remoteSignalGrace, remoteSignalProviderWait)
+		code := 1
+		if s, ok := sig.(syscall.Signal); ok {
+			code = 128 + int(s)
+		}
+		exitCLI(code)
+	}()
+}
+
+// awaitRemoteSignalExit returns when a signalled remote command may exit:
+// after grace, or, while provider work is in flight (a sandbox create
+// rolling back, a destroy), once that work is done, so the sandbox is not
+// left running. That wait is bounded by maxWait, and a second signal ends
+// it at once.
+func awaitRemoteSignalExit(sigs <-chan os.Signal, work *providerWorkTracker, grace, maxWait time.Duration) {
+	if !work.busy() {
+		time.Sleep(grace)
+		return
+	}
+	fmt.Fprintln(os.Stderr, "Waiting for the sandbox provider to clean up (press Ctrl-C again to quit now)...")
+	timer := time.NewTimer(maxWait)
+	defer timer.Stop()
+	select {
+	case <-work.done():
+	case <-sigs:
+	case <-timer.C:
+	}
+}
+
 func isRemoteManagementCommand(name string) bool {
 	switch name {
-	case "add", "remove", "rm", "list", "ls", "sessions", "drain", "attach", "rename", "update", "exec":
+	case "add", "remove", "rm", "destroy", "list", "ls", "sessions", "drain", "attach", "rename", "update", "exec":
 		return true
 	}
 	return false
@@ -87,31 +174,74 @@ func printRemoteSubcommandUsage(command string) {
 		fmt.Println("Usage: agent-deck remote exec <name> <command> [arguments]")
 	case "add":
 		fmt.Println("Usage: agent-deck remote add <name> <user@host> [options]")
+		fmt.Println("       agent-deck remote add --provider <name> [--name <remote>]")
 		fmt.Println("\nOptions:")
 		fmt.Println("  --agent-deck-path string")
 		fmt.Println("        Path to agent-deck on the remote (default: agent-deck)")
 		fmt.Println("  --profile string")
 		fmt.Println("        Remote profile to use (default: default)")
+		fmt.Println("  --provider string")
+		fmt.Println("        Create a sandbox with this [providers.<name>] and register it (no <user@host>)")
+		fmt.Println("  --name string")
+		fmt.Println("        With --provider: remote name (default: <provider>-<random suffix>)")
 	case "remove", "rm":
 		fmt.Println("Usage: agent-deck remote remove <name>")
+	case "destroy":
+		fmt.Println("Usage: agent-deck remote destroy <name> [--yes] [--force]")
+		fmt.Println("\nStops the remote's sessions, destroys its provider sandbox and removes the remote.")
+		fmt.Println("Only for remotes added with --provider; use 'remote remove' for a plain remote.")
+		fmt.Println("\nOptions:")
+		fmt.Println("  --yes")
+		fmt.Println("        Stop the remote's sessions without asking (required when not on a terminal)")
+		fmt.Println("  --force")
+		fmt.Println("        Destroy even when the remote's sessions cannot be listed")
 	case "list", "ls":
 		fmt.Println("Usage: agent-deck remote list [options]")
 		fmt.Println("\nOptions:")
+		fmt.Println("  --check")
+		fmt.Println("        Ask each remote for its agent-deck version and update timer now (two SSH calls per remote)")
+		fmt.Println("  --retry")
+		fmt.Println("        Clear cached poll/authentication state for all configured remotes (no SSH unless --check)")
+		fmt.Println("  --owner <name>")
+		fmt.Println("        Show only sandboxes owned by <name>; \"me\" is this machine's [sandbox] owner (default $USER)")
 		fmt.Println("  --json")
 		fmt.Println("        Output as JSON")
 	case "sessions":
 		fmt.Println("Usage: agent-deck remote sessions [name] [options]")
 		fmt.Println("\nOptions:")
 		fmt.Println("  --json")
-		fmt.Println("        Output as JSON")
+		fmt.Println("        Output as JSON: a bare array of sessions")
+		fmt.Println("  --with-errors")
+		fmt.Println("        With --json, wrap output as {\"sessions\":[...],\"errors\":[...]} and")
+		fmt.Println("        exit 1 if any remote failed")
+		fmt.Println("        JSON includes transcript_path and harness-native session IDs when known;")
+		fmt.Println("        transcript_path belongs to the remote host.")
+		fmt.Println("  --json-envelope")
+		fmt.Println("        Alias for --json --with-errors")
 	case "drain":
 		printRemoteDrainUsage(os.Stdout)
 	case "attach":
 		fmt.Println("Usage: agent-deck remote attach <remote-name> <session-title-or-id>")
+		fmt.Println("\nCtrl+V with an image on this machine's clipboard sends it to the session's Claude or Gemini composer; off with [remote] paste_images = false.")
 	case "rename":
 		fmt.Println("Usage: agent-deck remote rename <remote-name> <session-title-or-id> <new-title>")
 	case "update":
-		fmt.Println("Usage: agent-deck remote update [name]")
+		fmt.Println("Usage: agent-deck remote update [name | --all]")
+		fmt.Println("\nUpdates every remote that is older than this controller (v" + Version + ") when no name is given.")
+		fmt.Println("Exit status is 1 when any remote failed.")
+		fmt.Println("\nOptions:")
+		fmt.Println("  --all")
+		fmt.Println("        Update every configured remote that is older than this controller")
+		fmt.Println("  --from-build string")
+		fmt.Println("        Install release-layout archives from a local directory")
+		fmt.Println("  --force")
+		fmt.Println("        Allow reinstalling or downgrading")
+		fmt.Println("  --dry-run")
+		fmt.Println("        Verify artifacts and show destination paths without installing")
+		fmt.Println("  --install-timer")
+		fmt.Println("        Install or migrate each remote's own update timer instead of updating its binary")
+		fmt.Println("  --json")
+		fmt.Println("        Output every result as JSON")
 	default:
 		printRemoteUsage()
 	}
@@ -123,29 +253,56 @@ func printRemoteUsage() {
 	fmt.Println("Manage remote agent-deck instances.")
 	fmt.Println("Run commands: agent-deck remote <name> <command> [arguments]")
 	fmt.Println("  Use remote exec <name> <command> when a name matches a management command.")
-	fmt.Println("  list/status, show/output/send, add/launch, session start/stop/restart/fork/archive/unarchive/set,")
-	fmt.Println("  worktree list/info/cleanup, mcp list/attach, skill list/attach, group list/reorder")
+	fmt.Println("  list/status/health, show/output/send, add/launch, session start/stop/restart/fork/archive/unarchive/set,")
+	fmt.Println("  session switch/switch-preview/switch-account (runs on the remote; its own accounts and harnesses),")
+	fmt.Println("  recall timeline/follow/search/sessions/show/context/export/status, events follow, session send-status,")
+	fmt.Println("  session queue list/release/cancel (queue entry IDs; --json supported),")
+	fmt.Println("  session ownership inspect <id> [--json] (read-only receipt),")
+	fmt.Println("  triggers (read-only list: --session/--kind/--health/--all/--json),")
+	fmt.Println("  events publish forwards the Mac app's replies only (macapp.open.ack, macapp.browser.response,")
+	fmt.Println("  macapp.app.focus) with --data-file - on stdin, at most 2 MiB.")
+	fmt.Println("  Follow streams use --jsonl; events --since resumes a host cursor.")
+	fmt.Println("  A forwarded follow runs until its stdin closes, then exits 0. Stdin from /dev/null (</dev/null,")
+	fmt.Println("  a background job of a non-interactive shell) ends it within seconds with no output: hold a pipe open.")
+	fmt.Println("  worktree list/info/cleanup, mcp list/attach, skill list/attached/attach/detach, group list/reorder,")
+	fmt.Println("  limits [--json] (read-only: the remote's own accounts and 5h/7d windows)")
 	fmt.Println()
 	fmt.Println("Commands:")
 	fmt.Println("  add <name> <user@host>    Add a remote agent-deck instance")
+	fmt.Println("  add --provider <name> [--name x]")
+	fmt.Println("                            Create a provider sandbox and register it as a remote")
 	fmt.Println("  remove <name>             Remove a remote")
+	fmt.Println("  destroy <name> [--yes]    Stop a sandbox remote's sessions, destroy it, remove it")
 	fmt.Println("  list                      List configured remotes")
-	fmt.Println("  sessions [name]           Fetch sessions from remote(s)")
-	fmt.Println("  drain <name|user@host>    Pull completion/transition records from a remote")
+	fmt.Println("  sessions [name] [--json] [--with-errors|--json-envelope]")
+	fmt.Println("                            Fetch sessions from remote(s); --json is a bare array,")
+	fmt.Println("                            --with-errors wraps it with per-remote failures")
+	fmt.Println("  drain <name>              Pull completion/transition records from a remote")
 	fmt.Println("                            into this machine's inbox (read-only on the remote)")
 	fmt.Println("  attach <name> <session>   Attach to a remote session")
 	fmt.Println("  rename <name> <session> <new-title>  Rename a remote session")
-	fmt.Println("  update [name]             Install/update agent-deck on remote(s)")
+	fmt.Println("  update [name | --all]     Install/update agent-deck on remote(s)")
+	fmt.Println("  update --install-timer [name | --all]")
+	fmt.Println("                            Install/migrate each remote's own update timer")
 	fmt.Println()
 	fmt.Println("Examples:")
 	fmt.Println("  agent-deck remote add dev user@dev-box")
 	fmt.Println("  agent-deck remote add prod user@prod-server --agent-deck-path /usr/local/bin/agent-deck")
+	fmt.Println("  agent-deck remote add --provider docker --name sb1")
+	fmt.Println("  agent-deck remote destroy sb1 --yes")
 	fmt.Println("  agent-deck remote list")
-	fmt.Println("  agent-deck remote sessions dev")
+	fmt.Println("  agent-deck remote sessions dev --json")
+	fmt.Println("  agent-deck remote dev recall timeline SESSION --json --tail 100")
+	fmt.Println("  agent-deck remote dev recall follow SESSION --after CURSOR --jsonl --status")
+	fmt.Println("  agent-deck remote dev events follow --jsonl --since 123")
+	fmt.Println("  agent-deck remote dev session send-status SEND_ID --json")
+	fmt.Println("  agent-deck remote dev session queue list --json SESSION")
+	fmt.Println("  agent-deck remote dev session queue release QUEUE_ID --json")
+	fmt.Println("  agent-deck remote dev session queue cancel QUEUE_ID --json")
 	fmt.Println("  agent-deck remote drain dev       # pull finished/stalled reports from dev")
 	fmt.Println("  agent-deck remote attach dev my-session")
 	fmt.Println("  agent-deck remote rename dev my-session new-name")
-	fmt.Println("  agent-deck remote update          # Update all remotes")
+	fmt.Println("  agent-deck remote update --all    # Update every remote older than this controller")
 	fmt.Println("  agent-deck remote update dev      # Update specific remote")
 }
 
@@ -154,7 +311,7 @@ func isValidRemoteName(name string) bool {
 }
 
 func handleRemoteAdd(args []string) {
-	fs := flag.NewFlagSet("remote add", flag.ExitOnError)
+	fs := flag.NewFlagSet("remote add", flag.ContinueOnError)
 	agentDeckPath := fs.String("agent-deck-path", "", "Path to agent-deck on the remote (default: agent-deck)")
 	remoteProfile := fs.String("profile", "", "Remote profile to use (default: default)")
 
@@ -167,15 +324,27 @@ func handleRemoteAdd(args []string) {
 
 	// Reorder: move flags before positional args so Go's flag package sees them
 	reordered := reorderRemoteArgs(fs, args)
-	if err := fs.Parse(reordered); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, reordered); err != nil {
+		exitCLI(1)
 	}
 
 	remaining := fs.Args()
 	if len(remaining) < 2 {
 		fmt.Println("Error: requires <name> and <user@host> arguments")
 		fs.Usage()
-		os.Exit(1)
+		exitCLI(1)
+	}
+	// A bare trailing "help" is a consent request, not a third operand: this
+	// command takes exactly two positional values, so there is no legitimate
+	// data value it could be confused with (issue #2025).
+	if len(remaining) == 3 && remaining[2] == "help" {
+		fs.Usage()
+		return
+	}
+	if len(remaining) != 2 {
+		fmt.Printf("Error: unexpected extra argument(s): %s\n", strings.Join(remaining[2:], " "))
+		fs.Usage()
+		exitCLI(1)
 	}
 
 	name := remaining[0]
@@ -185,7 +354,7 @@ func handleRemoteAdd(args []string) {
 	// Colon is reserved by the UI's internal remote session identifier format.
 	if !isValidRemoteName(name) {
 		fmt.Println("Error: remote name must not contain spaces, slashes, dots, or colons, or match a remote management command")
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	// Load existing config
@@ -200,7 +369,7 @@ func handleRemoteAdd(args []string) {
 
 	if _, exists := config.Remotes[name]; exists {
 		fmt.Printf("Error: remote '%s' already exists (use 'agent-deck remote remove %s' first)\n", name, name)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	rc := session.RemoteConfig{
@@ -217,7 +386,7 @@ func handleRemoteAdd(args []string) {
 
 	if err := session.SaveUserConfig(config); err != nil {
 		fmt.Printf("Error: failed to save config: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	fmt.Printf("Added remote '%s' (%s)\n", name, host)
@@ -244,27 +413,51 @@ func handleRemoteAdd(args []string) {
 }
 
 func handleRemoteRemove(args []string) {
+	if code := runRemoteRemove(args); code != 0 {
+		exitCLI(code)
+	}
+}
+
+// runRemoteRemove is `remote remove <name>`: forget the remote. For a
+// provider sandbox it says the sandbox keeps running and points to `remote
+// destroy`; on a terminal it asks first.
+func runRemoteRemove(args []string) int {
+	out := providerDeps.stdout
 	if len(args) < 1 {
-		fmt.Println("Usage: agent-deck remote remove <name>")
-		os.Exit(1)
+		fmt.Fprintln(out, "Usage: agent-deck remote remove <name>")
+		return 1
 	}
 
 	name := args[0]
 
 	config, err := session.LoadUserConfig()
 	if err != nil {
-		fmt.Printf("Error: failed to load config: %v\n", err)
-		os.Exit(1)
+		fmt.Fprintf(out, "Error: failed to load config: %v\n", err)
+		return 1
 	}
 
-	if config.Remotes == nil {
-		fmt.Printf("Error: remote '%s' not found\n", name)
-		os.Exit(1)
+	rc, exists := config.Remotes[name]
+	if !exists {
+		fmt.Fprintf(out, "Error: remote '%s' not found\n", name)
+		return 1
 	}
 
-	if _, exists := config.Remotes[name]; !exists {
-		fmt.Printf("Error: remote '%s' not found\n", name)
-		os.Exit(1)
+	if provider.IsSandbox(rc) {
+		errOut := providerDeps.stderr
+		files := filepath.Dir(rc.SSHConfig)
+		if rc.SSHConfig == "" {
+			files, _ = provider.SandboxDir(name)
+		}
+		fmt.Fprintf(errOut, "Warning: '%s' is a sandbox (provider %s). Removing the remote leaves sandbox %s still running and its ssh files in %s.\n", name, rc.Provider, rc.SandboxID, files)
+		fmt.Fprintf(errOut, "  To stop and destroy it instead: agent-deck remote destroy %s\n", name)
+		if providerDeps.isTTY() {
+			fmt.Fprintf(out, "Forget '%s' and leave the sandbox running? [y/N] ", name)
+			answer, _ := bufio.NewReader(providerDeps.stdin).ReadString('\n')
+			if a := strings.ToLower(strings.TrimSpace(answer)); a != "y" && a != "yes" {
+				fmt.Fprintln(out, "Aborted. Nothing was changed.")
+				return 1
+			}
+		}
 	}
 
 	delete(config.Remotes, name)
@@ -275,28 +468,62 @@ func handleRemoteRemove(args []string) {
 	}
 
 	if err := session.SaveUserConfig(config); err != nil {
-		fmt.Printf("Error: failed to save config: %v\n", err)
-		os.Exit(1)
+		fmt.Fprintf(out, "Error: failed to save config: %v\n", err)
+		return 1
 	}
 
-	fmt.Printf("Removed remote '%s'\n", name)
+	fmt.Fprintf(out, "Removed remote '%s'\n", name)
+	return 0
 }
 
 func handleRemoteList(args []string) {
-	fs := flag.NewFlagSet("remote list", flag.ExitOnError)
+	fs := flag.NewFlagSet("remote list", flag.ContinueOnError)
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
-	_ = fs.Parse(args)
+	check := fs.Bool("check", false, "Ask each remote for its agent-deck version and update timer now")
+	retry := fs.Bool("retry", false, "Clear cached poll/authentication state for all configured remotes (no SSH unless --check)")
+	ownerFilter := fs.String("owner", "", "Show only sandboxes owned by this person (\"me\" = [sandbox] owner, else $USER)")
+	_ = parseCLIFlags(fs, args)
 
 	config, err := session.LoadUserConfig()
 	if err != nil {
 		fmt.Printf("Error: failed to load config: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
+	}
+	owner := strings.TrimSpace(*ownerFilter)
+	if owner == "me" {
+		owner = config.SandboxOwner()
+	}
+	if owner != "" {
+		config = withRemotesOwnedBy(config, owner)
 	}
 
 	if len(config.Remotes) == 0 {
+		// #2920: --json must stay parseable with nothing configured.
+		if *jsonOutput {
+			fmt.Println("[]")
+			return
+		}
+		if owner != "" {
+			fmt.Printf("No sandboxes owned by %s.\n", session.PrintableOwner(owner))
+			return
+		}
 		fmt.Println("No remotes configured.")
 		fmt.Println("\nAdd one with: agent-deck remote add <name> <user@host>")
 		return
+	}
+
+	if *retry {
+		for name := range config.Remotes {
+			if err := session.ResetRemotePoll(name); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: failed to reset remote poll: %v\n", err)
+				exitCLI(1)
+			}
+		}
+	}
+	polls := session.LoadRemotePolls()
+	versions := session.LoadRemoteVersions()
+	if *check {
+		versions = probeRemoteVersions(context.Background(), config.Remotes)
 	}
 
 	if *jsonOutput {
@@ -305,48 +532,311 @@ func handleRemoteList(args []string) {
 			Host          string `json:"host"`
 			AgentDeckPath string `json:"agent_deck_path"`
 			Profile       string `json:"profile"`
+			// Version is the last agent-deck version the remote reported
+			// (empty when never checked); Outdated is true when it is older
+			// than this controller.
+			Version          string `json:"version,omitempty"`
+			InstalledFrom    string `json:"installed_from,omitempty"`
+			VersionCheckedAt string `json:"version_checked_at,omitempty"`
+			Outdated         bool   `json:"outdated"`
+			// VersionState is the same same/older/newer/unknown compare the
+			// remote preview panel shows (session.RemoteVersionCompare),
+			// always present so scripts don't have to re-derive it from
+			// Version/Outdated.
+			VersionState string `json:"version_state"`
+			// BuildDiffers is true when VersionState is "same" but the raw
+			// version strings differ only in build metadata (a "+local..."
+			// suffix on one side) — the honest label for that case is "same
+			// release, different build", not a bare "same" (walk defect #1).
+			BuildDiffers   bool   `json:"build_differs,omitempty"`
+			LastPollMS     *int64 `json:"last_poll_ms"`
+			LastPollStatus string `json:"last_poll_status"`
+			LastPollError  string `json:"last_poll_error"`
+			// Timer is the remote's own update timer (installed, kind,
+			// active, last_run, next_run), as `--check` last read it from
+			// the remote's `update --timer-status --json`; kind "unknown"
+			// for a remote too old to say (#2472). Omitted when never read.
+			Timer          *update.TimerStatus `json:"timer,omitempty"`
+			TimerCheckedAt string              `json:"timer_checked_at,omitempty"`
+			// Kind, Provider and SandboxID describe a provider sandbox
+			// remote ("sandbox (provider docker)"); omitted for plain ones.
+			Kind      string `json:"kind,omitempty"`
+			Provider  string `json:"provider,omitempty"`
+			SandboxID string `json:"sandbox_id,omitempty"`
+			// Owner is who created the sandbox ([sandbox] owner or $USER
+			// on the machine that made it); SSHConfig is the path of its
+			// own ssh_config. Both omitted for plain remotes.
+			Owner     string `json:"owner,omitempty"`
+			SSHConfig string `json:"ssh_config,omitempty"`
 		}
 
-		var remotes []remoteJSON
+		remotes := []remoteJSON{}
 		for name, rc := range config.Remotes {
-			remotes = append(remotes, remoteJSON{
+			row := remoteJSON{
 				Name:          name,
 				Host:          rc.Host,
 				AgentDeckPath: rc.GetAgentDeckPath(),
 				Profile:       rc.GetProfile(),
-			})
+				Kind:          provider.DisplayKind(rc),
+				Provider:      rc.Provider,
+				SandboxID:     rc.SandboxID,
+				Owner:         session.PrintableOwner(rc.Owner),
+			}
+			if provider.IsSandbox(rc) {
+				row.SSHConfig = rc.SSHConfig
+			}
+			state := versions[name]
+			row.VersionState = state.Compare(Version).String()
+			row.BuildDiffers = state.BuildDiffers(Version)
+			if !state.CheckedAt.IsZero() {
+				row.VersionCheckedAt = state.CheckedAt.Format(time.RFC3339)
+			}
+			if state.Found {
+				row.Version = state.Version
+				row.InstalledFrom = state.InstalledFrom
+				row.Outdated = state.Outdated(Version)
+			}
+			poll := configuredRemotePoll(polls[name], rc)
+			row.LastPollMS, row.LastPollStatus, row.LastPollError = poll.LastPollMS, poll.LastPollStatus, poll.LastPollError
+			row.Timer = state.Timer
+			if !state.TimerCheckedAt.IsZero() {
+				row.TimerCheckedAt = state.TimerCheckedAt.Format(time.RFC3339)
+			}
+			remotes = append(remotes, row)
 		}
 
 		output, err := json.MarshalIndent(remotes, "", "  ")
 		if err != nil {
 			fmt.Printf("Error: failed to format JSON: %v\n", err)
-			os.Exit(1)
+			exitCLI(1)
 		}
 		fmt.Println(string(output))
 		return
 	}
 
-	fmt.Printf("%-15s %-30s %-20s %s\n", "NAME", "HOST", "PATH", "PROFILE")
-	fmt.Println(strings.Repeat("-", 70))
+	// A sandbox's host cell ("sandbox (provider docker) · owner: alice")
+	// can be wider than the usual 30; widen the column so PATH and the
+	// rest stay aligned.
+	hosts := make(map[string]string, len(config.Remotes))
+	hostWidth := 30
 	for name, rc := range config.Remotes {
-		fmt.Printf("%-15s %-30s %-20s %s\n", name, rc.Host, rc.GetAgentDeckPath(), rc.GetProfile())
+		host := rc.Host
+		if kind := provider.DisplayKind(rc); kind != "" {
+			host = kind
+			if owner := session.PrintableOwner(rc.Owner); owner != "" {
+				host += " · owner: " + owner
+			}
+		}
+		hosts[name] = host
+		hostWidth = max(hostWidth, runewidth.StringWidth(host))
 	}
-	fmt.Printf("\nTotal: %d remotes\n", len(config.Remotes))
+	fmt.Printf("%-15s %s %-20s %-10s %s\n", "NAME", runewidth.FillRight("HOST", hostWidth), "PATH", "PROFILE", "VERSION / LAST POLL")
+	fmt.Println(strings.Repeat("-", 84+hostWidth-30))
+	for name, rc := range config.Remotes {
+		status := remoteVersionColumn(versions[name], Version) + " / " + remotePollColumn(configuredRemotePoll(polls[name], rc))
+		// The remote's own update timer, once a --check has read it (#2472).
+		if timer := versions[name].Timer; timer != nil {
+			status += " / " + remoteTimerColumn(timer)
+		}
+		fmt.Printf("%-15s %s %-20s %-10s %s\n", name, runewidth.FillRight(hosts[name], hostWidth), rc.GetAgentDeckPath(), rc.GetProfile(), status)
+	}
+	fmt.Printf("\nTotal: %d remotes (controller v%s)\n", len(config.Remotes), Version)
+}
+
+// withRemotesOwnedBy returns a copy of cfg whose Remotes holds only the
+// sandboxes owned by owner (`remote list --owner`). Plain remotes and
+// sandboxes made before owners have none and never match.
+func withRemotesOwnedBy(cfg *session.UserConfig, owner string) *session.UserConfig {
+	filtered := *cfg
+	filtered.Remotes = map[string]session.RemoteConfig{}
+	for name, rc := range cfg.Remotes {
+		if rc.Owner != "" && rc.Owner == owner {
+			filtered.Remotes[name] = rc
+		}
+	}
+	return &filtered
+}
+
+// configuredRemotePoll treats a changed SSH identity as never polled.
+func configuredRemotePoll(state session.RemotePollState, rc session.RemoteConfig) session.RemotePollState {
+	if !state.Matches(rc) || state.LastPollStatus == "" {
+		return session.RemotePollState{LastPollStatus: "unknown"}
+	}
+	return state
+}
+
+func remotePollColumn(state session.RemotePollState) string {
+	text := state.LastPollStatus
+	if state.LastPollMS != nil {
+		text += fmt.Sprintf(" (%dms)", *state.LastPollMS)
+	}
+	if state.LastPollError != "" {
+		text += ": " + state.LastPollError
+	}
+	return text
+}
+
+// remoteVersionColumn renders the VERSION cell of `remote list`: the cached
+// version, "↑" appended when it is older than controller, "-" when unknown.
+func remoteVersionColumn(state session.RemoteVersionState, controller string) string {
+	if !state.Found || state.Version == "" {
+		return "-"
+	}
+	if state.Outdated(controller) {
+		return "v" + state.Version + " ↑"
+	}
+	return "v" + state.Version
+}
+
+// probeRemoteVersions asks every remote for its version and its update
+// timer now and refreshes the shared cache so the TUI and later list calls
+// see the same answer.
+func probeRemoteVersions(ctx context.Context, remotes map[string]session.RemoteConfig) map[string]session.RemoteVersionState {
+	states := make(map[string]session.RemoteVersionState, len(remotes))
+	for name, rc := range remotes {
+		prober := newRemoteProber(name, rc)
+		version, found := prober.CheckBinary(ctx)
+		timer := probeRemoteTimer(ctx, prober, found)
+		now := time.Now()
+		states[name] = session.RemoteVersionState{Version: version, Found: found, CheckedAt: now, Timer: &timer, TimerCheckedAt: now}
+	}
+	_ = session.RecordRemoteVersions(states)
+	// Keep fresh probe results even if the best-effort cache write failed.
+	cached := session.LoadRemoteVersions()
+	for name, state := range states {
+		if cached[name].Version == state.Version {
+			state.InstalledFrom = cached[name].InstalledFrom
+			states[name] = state
+		}
+	}
+	return states
+}
+
+type remoteSessionError struct {
+	Name  string `json:"name"`
+	Host  string `json:"host"`
+	Error string `json:"error"`
+}
+
+type remoteSessionsOutput struct {
+	Sessions []session.RemoteSessionInfo `json:"sessions"`
+	Errors   []remoteSessionError        `json:"errors"`
+}
+
+// parseRemoteSessionsArgs parses `remote sessions` flags. envelope reports
+// whether --with-errors or --json-envelope opted into the
+// {"sessions":[...],"errors":[...]} shape; jsonOutput covers either JSON
+// form. --json alone must keep emitting the bare array, since existing
+// consumers (conductor scripts, skills) pipe it through `jq '.[]'` and a
+// shape change breaks them silently.
+func parseRemoteSessionsArgs(args []string) (remoteName string, jsonOutput bool, envelope bool, err error) {
+	fs := flag.NewFlagSet("remote sessions", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	jsonFlag := fs.Bool("json", false, "Output as JSON (bare array of sessions)")
+	withErrorsFlag := fs.Bool("with-errors", false, "With --json, wrap output as {\"sessions\":[...],\"errors\":[...]}")
+	jsonEnvelopeFlag := fs.Bool("json-envelope", false, "Alias for --json --with-errors")
+	if err := fs.Parse(reorderRemoteArgs(fs, args)); err != nil {
+		return "", false, false, err
+	}
+	if len(fs.Args()) > 1 {
+		return "", false, false, fmt.Errorf("accepts at most one remote name")
+	}
+	if len(fs.Args()) == 1 {
+		remoteName = fs.Args()[0]
+	}
+	envelope = *withErrorsFlag || *jsonEnvelopeFlag
+	jsonOutput = *jsonFlag || envelope
+	return remoteName, jsonOutput, envelope, nil
+}
+
+func addRemoteSessionFetch(
+	output *remoteSessionsOutput,
+	name string,
+	host string,
+	sessions []session.RemoteSessionInfo,
+	err error,
+) bool {
+	if err != nil {
+		output.Errors = append(output.Errors, remoteSessionError{
+			Name:  name,
+			Host:  host,
+			Error: err.Error(),
+		})
+		return false
+	}
+	for i := range sessions {
+		sessions[i].RemoteName = name
+	}
+	output.Sessions = append(output.Sessions, sessions...)
+	return true
+}
+
+// writeRemoteSessionsJSON prints the opt-in envelope. Both slices are
+// normalized to non-nil so they always marshal as `[]` rather than `null`.
+func writeRemoteSessionsJSON(output remoteSessionsOutput) {
+	if output.Sessions == nil {
+		output.Sessions = []session.RemoteSessionInfo{}
+	}
+	if output.Errors == nil {
+		output.Errors = []remoteSessionError{}
+	}
+	encoded, err := json.MarshalIndent(output, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: failed to format JSON: %v\n", err)
+		exitCLI(1)
+	}
+	fmt.Println(string(encoded))
+}
+
+// writeRemoteSessionsArray prints the default bare array. Before walk defect
+// #2 a nil slice marshaled as `null` (matching what agent-deck emitted
+// before #2207); a nil slice here is normalized to `[]` so a zero-session
+// remote gives every `--json` consumer (this bare array and the
+// --with-errors envelope) the same empty-array shape instead of one that
+// makes `jq '.[]'` choke on `null`.
+func writeRemoteSessionsArray(sessions []session.RemoteSessionInfo) {
+	if sessions == nil {
+		sessions = []session.RemoteSessionInfo{}
+	}
+	encoded, err := json.MarshalIndent(sessions, "", "  ")
+	if err != nil {
+		fmt.Printf("Error: failed to format JSON: %v\n", err)
+		exitCLI(1)
+	}
+	fmt.Println(string(encoded))
 }
 
 func handleRemoteSessions(args []string) {
-	fs := flag.NewFlagSet("remote sessions", flag.ExitOnError)
-	jsonOutput := fs.Bool("json", false, "Output as JSON")
-	_ = fs.Parse(args)
+	remoteName, jsonOutput, envelope, err := parseRemoteSessionsArgs(args)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: remote sessions flag parsing failed: %v\n", err)
+		exitCLI(2)
+	}
 
 	config, err := session.LoadUserConfig()
 	if err != nil {
-		fmt.Printf("Error: failed to load config: %v\n", err)
-		os.Exit(1)
+		if envelope {
+			writeRemoteSessionsJSON(remoteSessionsOutput{
+				Errors: []remoteSessionError{{Name: "config", Error: err.Error()}},
+			})
+		} else {
+			// Matches the pre-#2207 release: plain text even under --json,
+			// since a config load failure has no session list to report.
+			fmt.Printf("Error: failed to load config: %v\n", err)
+		}
+		exitCLI(1)
 	}
 
 	if len(config.Remotes) == 0 {
-		fmt.Println("No remotes configured.")
+		switch {
+		case envelope:
+			writeRemoteSessionsJSON(remoteSessionsOutput{})
+		case jsonOutput:
+			// #2920: the bare array, same as a configured remote with no sessions.
+			writeRemoteSessionsArray(nil)
+		default:
+			fmt.Println("No remotes configured.")
+		}
 		return
 	}
 
@@ -355,14 +845,25 @@ func handleRemoteSessions(args []string) {
 	// forever on the ControlMaster=auto reuse.
 	session.CleanStaleSSHSockets()
 
-	// Filter to specific remote if name provided
-	remoteName := ""
-	if len(fs.Args()) > 0 {
-		remoteName = fs.Args()[0]
+	if remoteName != "" {
+		if _, exists := config.Remotes[remoteName]; !exists {
+			if envelope {
+				writeRemoteSessionsJSON(remoteSessionsOutput{
+					Errors: []remoteSessionError{{Name: remoteName, Error: "remote not found"}},
+				})
+			} else {
+				fmt.Printf("Error: remote '%s' not found\n", remoteName)
+			}
+			exitCLI(1)
+		}
 	}
 
 	ctx := context.Background()
-	var allSessions []session.RemoteSessionInfo
+
+	// Both slices start nil and are only appended to; writeRemoteSessionsArray
+	// and writeRemoteSessionsJSON each normalize a nil Sessions to `[]` before
+	// marshaling (walk defect #2).
+	var output remoteSessionsOutput
 
 	for name, rc := range config.Remotes {
 		if remoteName != "" && name != remoteName {
@@ -370,268 +871,460 @@ func handleRemoteSessions(args []string) {
 		}
 
 		runner := session.NewSSHRunner(name, rc)
-		sessions, err := runner.FetchSessions(ctx)
-		if err != nil {
-			if !*jsonOutput {
+		sessions, _, err := runner.FetchSessions(ctx)
+		if !addRemoteSessionFetch(&output, name, rc.Host, sessions, err) {
+			if !jsonOutput {
 				fmt.Printf("  [%s] Error: %v\n", name, err)
+			} else if !envelope {
+				// #3107: the bare array has no room for errors. Keep stdout a
+				// valid array and say it on stderr, so `[]` is never read as
+				// "reachable, no sessions".
+				fmt.Fprintf(os.Stderr, "[%s] Error: %v\n", name, err)
 			}
 			continue
 		}
 
-		for i := range sessions {
-			sessions[i].RemoteName = name
-		}
-		allSessions = append(allSessions, sessions...)
-
-		if !*jsonOutput {
+		if !jsonOutput {
 			fmt.Printf("\n═══ Remote: %s (%s) ═══\n\n", name, rc.Host)
-			if len(sessions) == 0 {
-				fmt.Println("  No sessions found.")
-			} else {
-				fmt.Printf("  %-20s %-15s %-10s %s\n", "TITLE", "TOOL", "STATUS", "ID")
-				fmt.Printf("  %s\n", strings.Repeat("-", 60))
-				for _, s := range sessions {
-					title := s.Title
-					if len(title) > 20 {
-						title = title[:17] + "..."
-					}
-					id := s.ID
-					if len(id) > 8 {
-						id = id[:8]
-					}
-					fmt.Printf("  %-20s %-15s %-10s %s\n", title, s.Tool, s.Status, id)
-				}
+			writeRemoteSessionsText(os.Stdout, sessions)
+		}
+	}
+
+	switch {
+	case envelope:
+		writeRemoteSessionsJSON(output)
+	case jsonOutput:
+		writeRemoteSessionsArray(output.Sessions)
+	}
+	// #3107: an unreachable remote is "unknown", never "no sessions", so any
+	// failed remote fails the command in every output mode. Stdout still
+	// carries the sessions that were reachable.
+	if len(output.Errors) != 0 {
+		exitCLI(1)
+	}
+}
+
+// writeRemoteSessionsText prints one remote's session table for the text
+// output of `remote sessions`. Archived rows are left out (#2972): `list
+// --json` on the remote keeps them with "archived": true, and an archived
+// session keeps a live-looking status. The JSON outputs still carry them.
+// Titles are cut by display width, so a multi-byte character is never split.
+func writeRemoteSessionsText(w io.Writer, sessions []session.RemoteSessionInfo) {
+	live := make([]session.RemoteSessionInfo, 0, len(sessions))
+	for _, s := range sessions {
+		if !s.Archived {
+			live = append(live, s)
+		}
+	}
+	archived := len(sessions) - len(live)
+	if len(live) == 0 {
+		fmt.Fprintln(w, "  No sessions found.")
+	} else {
+		fmt.Fprintf(w, "  %-20s %-15s %-10s %s\n", "TITLE", "TOOL", "STATUS", "ID")
+		fmt.Fprintf(w, "  %s\n", strings.Repeat("-", 60))
+		for _, s := range live {
+			title := runewidth.FillRight(truncateWidth(s.Title, 20), 20)
+			id := s.ID
+			if len(id) > 8 {
+				id = id[:8]
 			}
+			fmt.Fprintf(w, "  %s %-15s %-10s %s\n", title, s.Tool, s.Status, id)
 		}
 	}
-
-	if remoteName != "" {
-		if _, exists := config.Remotes[remoteName]; !exists {
-			fmt.Printf("Error: remote '%s' not found\n", remoteName)
-			os.Exit(1)
-		}
-	}
-
-	if *jsonOutput {
-		output, err := json.MarshalIndent(allSessions, "", "  ")
-		if err != nil {
-			fmt.Printf("Error: failed to format JSON: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Println(string(output))
+	if archived > 0 {
+		fmt.Fprintf(w, "  (%d archived not shown; --json lists them)\n", archived)
 	}
 }
 
 func handleRemoteAttach(args []string) {
 	if len(args) < 2 {
 		fmt.Println("Usage: agent-deck remote attach <remote-name> <session-title-or-id>")
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	remoteName := args[0]
 	sessionRef := args[1]
 
-	config, err := session.LoadUserConfig()
+	rc, exists, err := resolveRemoteConfig(remoteName)
 	if err != nil {
 		fmt.Printf("Error: failed to load config: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
-
-	if config.Remotes == nil {
-		fmt.Printf("Error: remote '%s' not found\n", remoteName)
-		os.Exit(1)
-	}
-
-	rc, exists := config.Remotes[remoteName]
 	if !exists {
 		fmt.Printf("Error: remote '%s' not found\n", remoteName)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	// Try to resolve session reference (could be title or ID)
 	runner := session.NewSSHRunner(remoteName, rc)
 
 	ctx := context.Background()
-	sessions, err := runner.FetchSessions(ctx)
-	if err != nil {
-		fmt.Printf("Error: failed to fetch remote sessions: %v\n", err)
-		os.Exit(1)
-	}
+	match := resolveRemoteSessionRef(ctx, runner, remoteName, sessionRef)
 
-	// Find matching session by title or ID prefix
-	var matchID string
-	for _, s := range sessions {
-		if s.Title == sessionRef || strings.HasPrefix(s.ID, sessionRef) {
-			matchID = s.ID
-			break
-		}
-	}
-
-	if matchID == "" {
-		fmt.Printf("Error: session '%s' not found on remote '%s'\n", sessionRef, remoteName)
-		os.Exit(1)
-	}
-
-	if err := runner.Attach(matchID); err != nil {
+	if err := runner.Attach(match.ID); err != nil {
 		fmt.Printf("Error: failed to attach: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
+}
+
+// resolveRemoteSessionRef resolves one remote session by title or ID for a
+// single-target command, without listing the whole remote
+// (SSHRunner.ResolveSession), and exits with the CLI's usual message when
+// it cannot.
+func resolveRemoteSessionRef(ctx context.Context, runner *session.SSHRunner, remoteName, ref string) session.RemoteSessionInfo {
+	match, err := runner.ResolveSession(ctx, ref)
+	switch {
+	case errors.Is(err, session.ErrRemoteSessionNotFound):
+		fmt.Printf("Error: session '%s' not found on remote '%s'\n", ref, remoteName)
+		exitCLI(1)
+	case err != nil:
+		fmt.Printf("Error: failed to resolve remote session: %v\n", err)
+		exitCLI(1)
+	}
+	return match
 }
 
 func handleRemoteRename(args []string) {
 	if len(args) < 3 {
 		fmt.Println("Usage: agent-deck remote rename <remote-name> <session-title-or-id> <new-title>")
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	remoteName := args[0]
 	sessionRef := args[1]
 	newTitle := strings.Join(args[2:], " ")
 
-	config, err := session.LoadUserConfig()
+	rc, exists, err := resolveRemoteConfig(remoteName)
 	if err != nil {
 		fmt.Printf("Error: failed to load config: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
-
-	if config.Remotes == nil {
-		fmt.Printf("Error: remote '%s' not found\n", remoteName)
-		os.Exit(1)
-	}
-
-	rc, exists := config.Remotes[remoteName]
 	if !exists {
 		fmt.Printf("Error: remote '%s' not found\n", remoteName)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	runner := session.NewSSHRunner(remoteName, rc)
 	ctx := context.Background()
 
-	// Resolve session reference
-	sessions, err := runner.FetchSessions(ctx)
-	if err != nil {
-		fmt.Printf("Error: failed to fetch remote sessions: %v\n", err)
-		os.Exit(1)
-	}
-
-	var matchID, oldTitle string
-	for _, s := range sessions {
-		if s.Title == sessionRef || strings.HasPrefix(s.ID, sessionRef) {
-			matchID = s.ID
-			oldTitle = s.Title
-			break
-		}
-	}
-
-	if matchID == "" {
-		fmt.Printf("Error: session '%s' not found on remote '%s'\n", sessionRef, remoteName)
-		os.Exit(1)
-	}
+	match := resolveRemoteSessionRef(ctx, runner, remoteName, sessionRef)
+	matchID, oldTitle := match.ID, match.Title
 
 	_, err = runner.RunCommand(ctx, "rename", matchID, newTitle)
 	if err != nil {
 		fmt.Printf("Error: failed to rename session: %v\n", err)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	fmt.Printf("Renamed '%s' → '%s' on remote '%s'\n", oldTitle, newTitle, remoteName)
 }
 
 func handleRemoteUpdate(args []string) {
+	fs := flag.NewFlagSet("remote update", flag.ContinueOnError)
+	all := fs.Bool("all", false, "Update every configured remote that is older than this controller")
+	fromBuild := fs.String("from-build", "", "Install archives from a local build directory")
+	force := fs.Bool("force", false, "Allow reinstalling or downgrading")
+	dryRun := fs.Bool("dry-run", false, "Show the verified installation plan without changing remotes")
+	jsonOutput := fs.Bool("json", false, "Output every result as JSON")
+	installTimer := fs.Bool("install-timer", false, "Install or migrate each remote's own update timer (its `update --install-timer`) instead of updating its binary")
+	_ = parseCLIFlags(fs, reorderRemoteArgs(fs, args))
+	if fs.NArg() > 1 {
+		fmt.Fprintln(os.Stderr, "Error: expected one remote name or --all")
+		exitCLI(2)
+	}
+	if *installTimer && (*fromBuild != "" || *force || *dryRun) {
+		fmt.Fprintln(os.Stderr, "Error: --install-timer takes only a remote name or --all (and --json)")
+		exitCLI(2)
+	}
+	// An explicit update also installs (or migrates) each updated remote's
+	// own timer, so it stops depending on this controller's nudge (#2472).
+	opts := remoteUpdateCLIOptions{JSON: *jsonOutput, Update: session.RemoteUpdateOptions{Force: *force, DryRun: *dryRun, EnsureTimer: !*dryRun}}
+	if *fromBuild != "" {
+		build, err := session.LoadLocalBuild(*fromBuild)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			exitCLI(1)
+		}
+		opts.Update.LocalBuild = build
+	}
+
 	config, err := session.LoadUserConfig()
 	if err != nil {
-		fmt.Printf("Error: failed to load config: %v\n", err)
-		os.Exit(1)
+		fmt.Fprintf(os.Stderr, "Error: failed to load config: %v\n", err)
+		exitCLI(1)
 	}
 
 	if len(config.Remotes) == 0 {
-		fmt.Println("No remotes configured.")
+		if *jsonOutput {
+			fmt.Println("[]")
+		} else {
+			fmt.Println("No remotes configured.")
+		}
 		return
 	}
 
-	// Filter to specific remote if name provided
-	remoteName := ""
-	if len(args) > 0 {
-		remoteName = args[0]
+	remotes := config.Remotes
+	if name := fs.Arg(0); name != "" {
+		if *all {
+			fmt.Fprintln(os.Stderr, "Error: pass either a remote name or --all, not both")
+			exitCLI(2)
+		}
+		rc, exists := config.Remotes[name]
+		if !exists {
+			fmt.Fprintf(os.Stderr, "Error: remote '%s' not found\n", name)
+			exitCLI(1)
+		}
+		remotes = map[string]session.RemoteConfig{name: rc}
 	}
 
-	ctx := context.Background()
-
-	for name, rc := range config.Remotes {
-		if remoteName != "" && name != remoteName {
-			continue
+	if *installTimer {
+		results := runRemoteTimerInstall(context.Background(), remotes)
+		if printRemoteTimerInstall(os.Stdout, results, *jsonOutput) > 0 {
+			exitCLI(1)
 		}
-
-		fmt.Printf("\n═══ Remote: %s (%s) ═══\n", name, rc.Host)
-
-		runner := session.NewSSHRunner(name, rc)
-
-		// Check current version
-		remoteVersion, found := runner.CheckBinary(ctx)
-		if found {
-			fmt.Printf("  Current version: v%s\n", remoteVersion)
-			if update.CompareVersions(remoteVersion, Version) >= 0 {
-				fmt.Printf("  ✓ Up to date (local: v%s)\n", Version)
-				continue
-			}
-			fmt.Printf("  Updating to v%s...\n", Version)
-		} else {
-			fmt.Printf("  agent-deck not found, installing v%s...\n", Version)
-		}
-
-		if err := installOnRemote(runner, ctx); err != nil {
-			fmt.Printf("  ✗ Failed: %v\n", err)
-		} else {
-			fmt.Printf("  ✓ Installed v%s\n", Version)
-		}
+		return
 	}
 
-	if remoteName != "" {
-		if _, exists := config.Remotes[remoteName]; !exists {
-			fmt.Printf("\nError: remote '%s' not found\n", remoteName)
-			os.Exit(1)
+	results := runRemoteUpdatesCLI(context.Background(), remotes, Version, remoteSweepWait, opts)
+	if *jsonOutput {
+		if err := writeRemoteUpdateJSON(os.Stdout, results); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			exitCLI(1)
 		}
+	} else {
+		printRemoteUpdateTable(os.Stdout, results)
+	}
+	if session.CountRemoteUpdateFailures(results) > 0 {
+		exitCLI(1)
 	}
 }
 
-// updateRemotesAfterLocalUpdate prompts the user to update remotes after a successful local update.
+// remoteSweepWait bounds how long an explicit update waits for a sweep this
+// controller is already running (the TUI's startup sweep, typically).
+const remoteSweepWait = 2 * time.Minute
+
+type remoteUpdateCLIOptions struct {
+	Update session.RemoteUpdateOptions
+	JSON   bool
+}
+
+// runRemoteUpdatesCLI is the explicit `remote update` run. It first waits
+// up to wait for a sweep this controller is already running: racing it
+// would only meet the remotes' deploy locks. When the sweep is still going
+// afterwards, the remotes it covers are reported as being updated by it
+// (skipped, not failed) and the rest are updated here; otherwise this run
+// marks itself as the sweep so a later one waits in turn (#2244).
+func runRemoteUpdatesCLI(ctx context.Context, remotes map[string]session.RemoteConfig, target string, wait time.Duration, options ...remoteUpdateCLIOptions) []session.RemoteUpdateResult {
+	opts := remoteUpdateCLIOptions{}
+	if len(options) > 0 {
+		opts = options[0]
+	}
+	if opts.Update.LocalBuild != nil {
+		target = opts.Update.LocalBuild.Version
+	}
+	if opts.Update.DryRun {
+		return runRemoteUpdates(ctx, remotes, target, true, opts)
+	}
+	names := remoteNames(remotes)
+	deadline := time.Now().Add(wait)
+	var announced bool
+	for {
+		end, err := session.BeginRemoteSweep(names)
+		if err == nil {
+			defer end()
+			return runRemoteUpdates(ctx, remotes, target, true, opts)
+		}
+		if !errors.Is(err, session.ErrRemoteSweepRunning) || time.Now().After(deadline) {
+			break
+		}
+		if sweep, ok := session.RemoteSweepInProgress(); ok && !announced && !opts.JSON {
+			fmt.Printf("A remote sweep is already running on this controller (pid %d, started %s); waiting for it...\n", sweep.PID, sweep.StartedAt.Format(time.Kitchen))
+			announced = true
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(remoteSweepPoll(wait)):
+		}
+	}
+
+	sweep, running := session.RemoteSweepInProgress()
+	rest := make(map[string]session.RemoteConfig, len(remotes))
+	results := make([]session.RemoteUpdateResult, 0, len(names))
+	for _, name := range names {
+		if running && sweep.Covers(name) {
+			skipped := session.RemoteUpdateResult{
+				Name: name, Host: remotes[name].Host, To: strings.TrimPrefix(target, "v"),
+				Outcome: session.RemoteUpdateOutcomeSkipped,
+				Note:    fmt.Sprintf("sweep already in progress, remote %s is being updated by %d", name, sweep.PID),
+			}
+			results = append(results, skipped)
+			if !opts.JSON {
+				fmt.Printf("\n═══ Remote: %s (%s) ═══\n  %s\n", name, remotes[name].Host, formatRemoteUpdateResult(skipped))
+			}
+			continue
+		}
+		rest[name] = remotes[name]
+	}
+	if len(rest) > 0 {
+		results = append(results, runRemoteUpdates(ctx, rest, target, true, opts)...)
+	}
+	sort.Slice(results, func(i, j int) bool { return results[i].Name < results[j].Name })
+	return results
+}
+
+// remoteSweepPoll is how often the wait re-checks; short waits (tests) poll
+// faster.
+func remoteSweepPoll(wait time.Duration) time.Duration {
+	if wait < time.Second {
+		return wait / 4
+	}
+	return 500 * time.Millisecond
+}
+
+// runRemoteUpdates drives session.UpdateRemotes with the CLI's progress and
+// per-remote reporting. installMissing mirrors the explicit CLI contract
+// (a remote without agent-deck gets it installed); the unattended paths
+// pass false.
+func runRemoteUpdates(ctx context.Context, remotes map[string]session.RemoteConfig, target string, installMissing bool, options ...remoteUpdateCLIOptions) []session.RemoteUpdateResult {
+	cli := remoteUpdateCLIOptions{}
+	if len(options) > 0 {
+		cli = options[0]
+	}
+	opts := cli.Update
+	opts.InstallMissing = installMissing
+	if !cli.JSON {
+		opts.Progress = func(line string) { fmt.Printf("  %s\n", line) }
+		opts.OnResult = func(r session.RemoteUpdateResult) { fmt.Printf("  %s\n", formatRemoteUpdateResult(r)) }
+	}
+	opts.NewRunner = func(name string, rc session.RemoteConfig) session.RemoteBinaryInstaller {
+		if !cli.JSON {
+			fmt.Printf("\n═══ Remote: %s (%s) ═══\n", name, rc.Host)
+		}
+		if remoteUpdateRunner != nil {
+			return remoteUpdateRunner(name, rc)
+		}
+		return session.NewSSHRunner(name, rc)
+	}
+	return session.UpdateRemotes(ctx, remotes, target, opts)
+}
+
+// remoteUpdateRunner builds the installer for the CLI update paths. A
+// package variable so tests substitute a stub; nil means NewSSHRunner.
+var remoteUpdateRunner func(name string, rc session.RemoteConfig) session.RemoteBinaryInstaller
+
+// formatRemoteUpdateResult renders one remote's outcome with the CLI's glyphs.
+func formatRemoteUpdateResult(r session.RemoteUpdateResult) string {
+	line := ""
+	switch r.Outcome {
+	case session.RemoteUpdateOutcomeUpdated:
+		if r.From == "" {
+			line = fmt.Sprintf("✓ Installed v%s", r.To)
+		} else {
+			line = fmt.Sprintf("✓ Updated v%s → v%s", r.From, r.To)
+		}
+	case session.RemoteUpdateOutcomeCurrent:
+		line = fmt.Sprintf("✓ Up to date (v%s)", r.From)
+	case session.RemoteUpdateOutcomeSkipped:
+		if r.Err == nil {
+			return "– Skipped: " + r.Note
+		}
+		line = fmt.Sprintf("– Skipped: %v", r.Err)
+	default:
+		line = fmt.Sprintf("✗ Failed: %v", r.Err)
+	}
+	// The installer's report: where the binary went, what was left alone,
+	// what a failing second deploy still changed (#2244).
+	if r.Note != "" {
+		line += "; " + r.Note
+	}
+	return line
+}
+
+// remoteUpdateSummary is the closing line of a multi-remote run:
+// "3 remotes: 1 updated, 1 already current, 1 failed".
+func remoteUpdateSummary(results []session.RemoteUpdateResult) string {
+	counts := map[session.RemoteUpdateOutcome]int{}
+	for _, r := range results {
+		counts[r.Outcome]++
+	}
+	parts := []string{}
+	if n := counts[session.RemoteUpdateOutcomeUpdated]; n > 0 {
+		parts = append(parts, fmt.Sprintf("%d updated", n))
+	}
+	if n := counts[session.RemoteUpdateOutcomeCurrent]; n > 0 {
+		parts = append(parts, fmt.Sprintf("%d already current", n))
+	}
+	if n := counts[session.RemoteUpdateOutcomeSkipped]; n > 0 {
+		parts = append(parts, fmt.Sprintf("%d skipped", n))
+	}
+	if n := counts[session.RemoteUpdateOutcomeFailed]; n > 0 {
+		parts = append(parts, fmt.Sprintf("%d failed", n))
+	}
+	noun := "remotes"
+	if len(results) == 1 {
+		noun = "remote"
+	}
+	if len(parts) == 0 {
+		return fmt.Sprintf("%d %s", len(results), noun)
+	}
+	return fmt.Sprintf("%d %s: %s", len(results), noun, strings.Join(parts, ", "))
+}
+
+// updateRemotesAfterLocalUpdate runs after a successful local update. With
+// [updates] auto_update_remotes (the default) it pushes newVersion to every
+// older remote without asking; with the key off it prompts as before.
 func updateRemotesAfterLocalUpdate(newVersion string) {
 	config, err := session.LoadUserConfig()
 	if err != nil || config == nil || len(config.Remotes) == 0 {
 		return
 	}
 
-	fmt.Printf("\nYou have %d remote(s) configured. Update them too? [Y/n] ", len(config.Remotes))
-	reader := bufio.NewReader(os.Stdin)
-	response, readErr := reader.ReadString('\n')
-	if !shouldProceedWithRemoteUpdate(response, readErr) {
-		return
-	}
-
-	ctx := context.Background()
-	for name, rc := range config.Remotes {
-		fmt.Printf("\n═══ Remote: %s (%s) ═══\n", name, rc.Host)
-		runner := session.NewSSHRunner(name, rc)
-
-		remoteVersion, found := runner.CheckBinary(ctx)
-		if found {
-			fmt.Printf("  Current version: v%s\n", remoteVersion)
-			if update.CompareVersions(remoteVersion, newVersion) >= 0 {
-				fmt.Printf("  ✓ Up to date\n")
-				continue
-			}
-			fmt.Printf("  Updating to v%s...\n", newVersion)
-		} else {
-			fmt.Printf("  agent-deck not found, installing v%s...\n", newVersion)
-		}
-
-		if err := installOnRemote(runner, ctx); err != nil {
-			fmt.Printf("  ✗ Failed: %v\n", err)
-		} else {
-			fmt.Printf("  ✓ Installed v%s\n", newVersion)
+	unattended := session.GetUpdateSettings().GetAutoUpdateRemotes()
+	if unattended {
+		fmt.Printf("\nauto_update_remotes is on: updating %d remote(s) to v%s\n", len(config.Remotes), newVersion)
+	} else {
+		fmt.Printf("\nYou have %d remote(s) configured. Update them too? [Y/n] ", len(config.Remotes))
+		reader := bufio.NewReader(os.Stdin)
+		response, readErr := reader.ReadString('\n')
+		if !shouldProceedWithRemoteUpdate(response, readErr) {
+			return
 		}
 	}
+
+	results := runPostUpdateRemoteSweep(context.Background(), config.Remotes, newVersion, unattended)
+	fmt.Printf("\n%s\n", remoteUpdateSummary(results))
+}
+
+// runPostUpdateRemoteSweep is the sweep after a successful local update,
+// split from the prompt so a test can drive it against a stubbed runner.
+// It installs onto remotes it could not version only when a person
+// answered the prompt: the unattended sweep never pushes a binary onto a
+// host whose agent-deck it could not run (offline, or a probe that failed
+// for any reason), the same contract as the startup sweep (#2164). The
+// run is stamped so the next TUI start does not sweep again at once.
+func runPostUpdateRemoteSweep(ctx context.Context, remotes map[string]session.RemoteConfig, newVersion string, unattended bool) []session.RemoteUpdateResult {
+	end, err := session.BeginRemoteSweep(remoteNames(remotes))
+	if err != nil {
+		// A sweep from a TUI is still running: it pushes the version it was
+		// started with. Let it finish rather than race it (#2244).
+		fmt.Printf("  a remote sweep is already running on this controller; run `agent-deck remote update --all` after it finishes\n")
+		return nil
+	}
+	defer end()
+	results := runRemoteUpdates(ctx, remotes, newVersion, !unattended)
+	_ = session.MarkRemoteAutoUpdateRan(time.Now(), newVersion)
+	return results
+}
+
+// remoteNames returns the remotes' names in sorted order.
+func remoteNames(remotes map[string]session.RemoteConfig) []string {
+	names := make([]string, 0, len(remotes))
+	for name := range remotes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func shouldProceedWithRemoteUpdate(response string, readErr error) bool {
@@ -651,41 +1344,13 @@ func shouldProceedWithRemoteUpdate(response string, readErr error) bool {
 	return false
 }
 
-// installOnRemote detects the remote platform and deploys the matching agent-deck binary.
-// It first tries to find a matching release on GitHub. If no release is available for the
-// local version, it falls back to downloading the latest release for the remote platform.
+// installOnRemote deploys the controller's version onto one remote with the
+// CLI's progress lines (used by `remote add` when the binary is missing).
 func installOnRemote(runner *session.SSHRunner, ctx context.Context) error {
-	// Detect remote platform
-	goos, goarch, err := runner.DetectPlatform(ctx)
-	if err != nil {
-		return err
-	}
-	fmt.Printf("  Platform: %s/%s\n", goos, goarch)
-
-	// Fetch latest release from GitHub
-	release, err := update.FetchLatestRelease()
-	if err != nil {
-		return fmt.Errorf("failed to fetch release info: %w", err)
-	}
-
-	// Download, verify SHA-256 against the release's checksums.txt, and extract.
-	// We NEVER pipe an unverified artifact to a remote: a missing checksums.txt,
-	// a missing entry, or a hash mismatch aborts the deploy (#1206).
-	fmt.Printf("  Downloading + verifying %s/%s binary...\n", goos, goarch)
-	binaryData, err := update.DownloadVerifiedBinary(release, goos, goarch)
-	if err != nil {
-		return fmt.Errorf("download/verify failed: %w", err)
-	}
-
-	// Deploy to remote and verify the remote actually runs the new version
-	// before we report success (#1171: deploy + version-check used to target
-	// different files, producing a false "✓ Installed").
-	fmt.Printf("  Deploying to %s...\n", runner.Host)
-	if err := runner.InstallBinary(ctx, binaryData, Version); err != nil {
-		return fmt.Errorf("deploy failed: %w", err)
-	}
-
-	return nil
+	_, err := session.DeployRemoteBinary(ctx, runner, Version, session.RemoteUpdateOptions{
+		Progress: func(line string) { fmt.Printf("  %s\n", line) },
+	})
+	return err
 }
 
 // reorderRemoteArgs moves flags before positional args for Go's flag package.
@@ -693,7 +1358,12 @@ func reorderRemoteArgs(fs *flag.FlagSet, args []string) []string {
 	// Collect known value flags from the FlagSet
 	valueFlags := map[string]bool{}
 	fs.VisitAll(func(f *flag.Flag) {
-		valueFlags["--"+f.Name] = true
+		isBool := false
+		if bf, ok := f.Value.(interface{ IsBoolFlag() bool }); ok {
+			isBool = bf.IsBoolFlag()
+		}
+		valueFlags["--"+f.Name] = !isBool
+		valueFlags["-"+f.Name] = !isBool
 	})
 
 	var flags, positional []string
@@ -712,3 +1382,83 @@ func reorderRemoteArgs(fs *flag.FlagSet, args []string) []string {
 	}
 	return append(flags, positional...)
 }
+
+// startRemoteAutoUpdate is the unattended half of [updates]
+// auto_update_remotes: on TUI startup, push the controller's version to every
+// remote that reports an older one. It never blocks startup (the sweep runs
+// in a goroutine), never prompts, and only writes to the debug log because
+// the TUI owns the screen by then. Throttled to once per check interval via
+// a claim in the shared version cache (check and stamp under one lock, so
+// two TUIs starting together run one sweep, and a stamp that cannot be
+// written means no sweep); the explicit `agent-deck update` path resets
+// that stamp too, so a fresh controller version still sweeps promptly.
+func startRemoteAutoUpdate() {
+	// Cache claims can wait on another writer, so they also belong off startup.
+	go func() {
+		settings := session.GetUpdateSettings()
+		config, err := session.LoadUserConfig()
+		if err != nil || config == nil {
+			return
+		}
+		if !session.ClaimRemoteAutoUpdateRun(settings, len(config.Remotes), Version, time.Now()) {
+			return
+		}
+		remotes := config.Remotes
+		runRemoteAutoUpdate(remotes, Version)
+	}()
+}
+
+// runRemoteAutoUpdate is the body of the startup sweep, split out so a test
+// can run it synchronously against a stubbed runner. The caller has already
+// claimed the run (stamped the cache), so a crash mid-sweep does not retry
+// on every restart.
+func runRemoteAutoUpdate(remotes map[string]session.RemoteConfig, target string) []session.RemoteUpdateResult {
+	log := logging.ForComponent(logging.CompSession)
+	// Authentication must not be retried by a startup sweep while a recent TUI
+	// poll auth failure is still fresh; after RemoteAuthRetryBackoff it is
+	// retryable again (see RemotePollState.AuthBlocked). Explicit remote checks
+	// and updates remain user-controlled.
+	polls := session.LoadRemotePolls()
+	eligible := make(map[string]session.RemoteConfig, len(remotes))
+	var skipped []session.RemoteUpdateResult
+	for name, rc := range remotes {
+		if state := polls[name]; state.Matches(rc) && state.AuthBlocked(time.Now()) {
+			skipped = append(skipped, session.RemoteUpdateResult{Name: name, Host: rc.Host, Outcome: session.RemoteUpdateOutcomeSkipped, Note: "auth failed; polling paused"})
+			log.Info("remote_auto_update_skipped", slog.String("remote", name), slog.String("reason", "auth failed"))
+			continue
+		}
+		eligible[name] = rc
+	}
+	remotes = eligible
+	if len(remotes) == 0 {
+		sort.Slice(skipped, func(i, j int) bool { return skipped[i].Name < skipped[j].Name })
+		return skipped
+	}
+	end, err := session.BeginRemoteSweep(remoteNames(remotes))
+	if err != nil {
+		log.Info("remote_auto_update_skipped", slog.String("reason", err.Error()))
+		return nil
+	}
+	defer end()
+	log.Info("remote_auto_update_start", slog.Int("remotes", len(remotes)), slog.String("target", target))
+	results := session.UpdateRemotes(context.Background(), remotes, target, session.RemoteUpdateOptions{
+		InstallMissing: false,
+		NewRunner:      remoteAutoUpdateRunner,
+		OnResult: func(r session.RemoteUpdateResult) {
+			attrs := []any{slog.String("remote", r.Name), slog.String("host", r.Host), slog.String("outcome", r.String())}
+			if r.Outcome == session.RemoteUpdateOutcomeFailed {
+				log.Warn("remote_auto_update_result", attrs...)
+			} else {
+				log.Info("remote_auto_update_result", attrs...)
+			}
+		},
+	})
+	results = append(results, skipped...)
+	sort.Slice(results, func(i, j int) bool { return results[i].Name < results[j].Name })
+	log.Info("remote_auto_update_done", slog.String("summary", remoteUpdateSummary(results)))
+	return results
+}
+
+// remoteAutoUpdateRunner builds the installer for the startup sweep. A
+// package variable so tests substitute a stub; nil means NewSSHRunner.
+var remoteAutoUpdateRunner func(name string, rc session.RemoteConfig) session.RemoteBinaryInstaller

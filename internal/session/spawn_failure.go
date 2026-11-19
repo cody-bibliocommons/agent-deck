@@ -28,7 +28,7 @@ type SpawnFailureRecord struct {
 	InstanceID  string `json:"instance_id"`
 	Tool        string `json:"tool"`
 	Command     string `json:"command,omitempty"`
-	Reason      string `json:"reason"`                 // tmux_start_failed | spawn_died_fast | prepare_failed
+	Reason      string `json:"reason"`                 // tmux_start_failed | spawn_died_fast | prepare_failed | "tool not found on PATH: <tool> (searched: <the pane's PATH>)"
 	DyingOutput string `json:"dying_output,omitempty"` // last pane snapshot captured while alive
 	ElapsedMs   int64  `json:"elapsed_ms"`             // ms from spawn to observed death (0 for tmux_start_failed)
 	Timestamp   int64  `json:"ts"`
@@ -55,113 +55,82 @@ func writeSpawnFailureRecord(rec SpawnFailureRecord) error {
 	return writeSpawnFailureRecordTo(rec, spawnFailureDir())
 }
 
-// envExportPattern matches shell export statements with single-quoted values
-// (including the quote escape produced by buildEnvExports) so persisted
-// commands never carry credential values. Only the value is redacted; the key
-// stays visible for diagnosis.
-var envExportPattern = regexp.MustCompile(`export ([A-Za-z_][A-Za-z0-9_]*)='(?:[^']*(?:'\\''[^']*)*)'`)
+// shellValuePattern is deliberately bounded to shell argument forms. It is
+// not a general secret detector: it recognizes values attached to an explicitly
+// sensitive environment variable or option and leaves session IDs, paths, and
+// ordinary command arguments intact. The optional final quote handles malformed
+// command strings safely without allowing the value to escape redaction.
+const shellValuePattern = `'(?:[^']*(?:'\\''[^']*)*)'?|"(?:\\.|[^"])*"?|[^\s;&|]+`
 
-// redactEnvValues strips env values from a persisted command or error string.
-// A restart --env API_KEY=... that fails during prepare would otherwise write
-// the literal secret into a sidecar that session show exposes.
-func redactEnvValues(s string) string {
-	return envExportPattern.ReplaceAllString(s, "export $1='[redacted]'")
+var (
+	shellAssignmentPattern     = regexp.MustCompile(`(?is)(\b(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*)((?:` + shellValuePattern + `))`)
+	sensitiveOptionPattern     = regexp.MustCompile(`(?is)(--([A-Za-z][A-Za-z0-9_-]*)=?[ \t]*)((?:` + shellValuePattern + `))`)
+	authorizationHeaderPattern = regexp.MustCompile(`(?is)(\b(?:proxy-)?authorization["']?[ \t]*[:=][ \t]*)(["']?)(bearer|basic)[ \t]+(?:'[^'\r\n]*'?|"[^"\r\n]*"?|[^ \t\r\n,;'"&|]+)(["']?)`)
+)
+
+// redactSpawnFailureDiagnostic removes common credential-bearing values before
+// they cross a persistence, display, lifecycle, or log boundary. It is bounded
+// to explicit secret-shaped names plus Authorization Bearer/Basic headers; it
+// intentionally does not attempt to identify arbitrary prose as a secret.
+func redactSpawnFailureDiagnostic(s string) string {
+	s = authorizationHeaderPattern.ReplaceAllString(s, `${1}${2}${3} [redacted]${4}`)
+	s = redactSensitiveValues(s, shellAssignmentPattern)
+	return redactSensitiveValues(s, sensitiveOptionPattern)
 }
 
-// redactSidecarBytes redacts every string field of an already-persisted sidecar,
-// returning (redacted, true) only when something actually changed.
-//
-// It works on the decoded fields rather than the raw JSON text on purpose: a
-// value containing a quote carries the shell quote escape, which JSON in turn
-// escapes the backslash of, and envExportPattern would only half-match that —
-// a regex sweep over the raw bytes would leave part of such a secret on disk.
-// Decoding into
-// json.RawMessage (not into SpawnFailureRecord) keeps numbers byte-exact and
-// preserves fields written by a newer or older version of the struct, so a
-// rewrite never silently drops a record's contents.
-func redactSidecarBytes(data []byte) ([]byte, bool) {
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(data, &fields); err != nil {
-		return nil, false
-	}
-	changed := false
-	for key, raw := range fields {
-		var s string
-		if err := json.Unmarshal(raw, &s); err != nil {
-			continue // not a string: numbers and nested shapes stay verbatim
+func redactSensitiveValues(s string, pattern *regexp.Regexp) string {
+	return pattern.ReplaceAllStringFunc(s, func(match string) string {
+		parts := pattern.FindStringSubmatch(match)
+		if len(parts) != 4 || !isSensitiveDiagnosticName(parts[2]) {
+			return match
 		}
-		redacted := redactEnvValues(s)
-		if redacted == s {
-			continue
+		// The header pass has already reduced this Authorization value to a
+		// scheme plus marker. Preserve that useful failure identity rather than
+		// replacing the entire header value a second time.
+		if strings.EqualFold(parts[2], "authorization") && strings.Contains(parts[3], "[redacted]") {
+			return match
 		}
-		encoded, err := json.Marshal(redacted)
-		if err != nil {
-			continue
-		}
-		fields[key] = encoded
-		changed = true
-	}
-	if !changed {
-		return nil, false
-	}
-	out, err := json.MarshalIndent(fields, "", "  ")
-	if err != nil {
-		return nil, false
-	}
-	return out, true
+		return parts[1] + redactedShellValue(parts[3])
+	})
 }
 
-// ensureSpawnFailureDirSecure hardens a spawn-failure directory that already
-// exists. os.MkdirAll leaves an EXISTING directory's mode untouched, so an
-// install upgraded from a version that created the dir 0755 keeps it — and every
-// 0644 sidecar already in it, written before redaction existed — readable by
-// every other local user. Without this, the redaction above only ever protects
-// fresh installs, and the credentials that actually leaked stay leaked.
-//
-// So: tighten the directory, then sweep the sidecars already in it — chmod 0600
-// AND rewrite them through the redactor, so a stored credential is removed from
-// disk rather than merely hidden behind directory permissions.
-//
-// Best-effort by construction: every step ignores its error and moves on. This
-// runs on the spawn-failure path only (a handful of files, and only when a
-// session has already failed to start), and it must never be the reason a
-// failure record fails to be written.
-func ensureSpawnFailureDirSecure(dir string) {
-	info, err := os.Stat(dir)
-	if err != nil || !info.IsDir() {
+func isSensitiveDiagnosticName(name string) bool {
+	upper := strings.ToUpper(name)
+	compact := strings.NewReplacer("_", "", "-", "").Replace(upper)
+	if strings.Contains(compact, "APIKEY") || strings.Contains(compact, "TOKEN") ||
+		strings.Contains(compact, "SECRET") || strings.Contains(compact, "PASSWORD") ||
+		strings.Contains(compact, "PASSWD") || strings.Contains(compact, "CREDENTIAL") ||
+		strings.Contains(compact, "AUTHORIZATION") {
+		return true
+	}
+	if upper == "AUTH" || upper == "KEY" || strings.HasSuffix(upper, "_KEY") || strings.HasSuffix(upper, "-KEY") {
+		return true
+	}
+	// OTEL headers are a known source of Authorization values (#2216). Other
+	// header options retain their non-secret diagnostic identity; an embedded
+	// Authorization Bearer/Basic value is handled by the header pattern above.
+	return strings.Contains(upper, "OTEL") && strings.Contains(upper, "HEADER")
+}
+
+func redactedShellValue(value string) string {
+	if strings.HasPrefix(value, "'") {
+		return "'[redacted]'"
+	}
+	if strings.HasPrefix(value, `"`) {
+		return `"[redacted]"`
+	}
+	return "[redacted]"
+}
+
+// redactSpawnFailureRecord is used at every sidecar boundary. In particular,
+// reads sanitize legacy records in memory only: old evidence remains untouched
+// on disk while every current presentation is safe to copy into an issue.
+func redactSpawnFailureRecord(rec *SpawnFailureRecord) {
+	if rec == nil {
 		return
 	}
-	if info.Mode().Perm() != 0o700 {
-		_ = os.Chmod(dir, 0o700)
-	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return
-	}
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
-		}
-		fi, err := entry.Info()
-		// Lstat semantics: a symlink is never a regular file here, so we can
-		// neither chmod nor rewrite through one into an unrelated target.
-		if err != nil || !fi.Mode().IsRegular() {
-			continue
-		}
-		path := filepath.Join(dir, entry.Name())
-		if fi.Mode().Perm() != 0o600 {
-			_ = os.Chmod(path, 0o600)
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		redacted, changed := redactSidecarBytes(data)
-		if !changed {
-			continue
-		}
-		_ = safeio.SafeOverwrite(path, redacted, safeio.Options{Perm: 0o600, SkipBackup: true})
-	}
+	rec.Command = redactSpawnFailureDiagnostic(rec.Command)
+	rec.DyingOutput = redactSpawnFailureDiagnostic(rec.DyingOutput)
 }
 
 // writeSpawnFailureRecordTo is the path-explicit variant, used by
@@ -173,17 +142,17 @@ func writeSpawnFailureRecordTo(rec SpawnFailureRecord, dir string) error {
 	if rec.Timestamp == 0 {
 		rec.Timestamp = time.Now().Unix()
 	}
-	// Single choke point: every writer funnels through here, so redaction and
-	// tight permissions cannot be forgotten at a call site.
-	rec.Command = redactEnvValues(rec.Command)
-	rec.DyingOutput = redactEnvValues(rec.DyingOutput)
+	// Single choke point: every new sidecar is redacted before it reaches disk.
+	// Do not sweep or rewrite older records here: legacy evidence must remain
+	// intact, and readSpawnFailureRecord redacts it at presentation time.
+	redactSpawnFailureRecord(&rec)
 	path := filepath.Join(dir, rec.InstanceID+".json")
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("create spawn-failure dir: %w", err)
 	}
-	// MkdirAll above only sets the mode on a directory it creates; upgraded
-	// installs come with a 0755 one full of world-readable pre-fix sidecars.
-	ensureSpawnFailureDirSecure(filepath.Dir(path))
+	if err := os.Chmod(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("secure spawn-failure dir: %w", err)
+	}
 	data, err := json.MarshalIndent(rec, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal spawn-failure record: %w", err)
@@ -208,6 +177,9 @@ func readSpawnFailureRecord(instanceID string) (*SpawnFailureRecord, error) {
 	if err := json.Unmarshal(data, &rec); err != nil {
 		return nil, err
 	}
+	// Legacy records can predate persistence redaction. Sanitize only the
+	// returned copy so existing evidence is not deleted or rewritten.
+	redactSpawnFailureRecord(&rec)
 	return &rec, nil
 }
 
@@ -216,6 +188,7 @@ func readSpawnFailureRecord(instanceID string) (*SpawnFailureRecord, error) {
 // masks a now-healthy session.
 func clearSpawnFailureRecord(instanceID string) {
 	_ = safeio.SafeRemove(spawnFailureRecordPath(instanceID), safeio.RemoveOptions{})
+	clearSpawnToolProbeMarker(instanceID)
 }
 
 // SpawnFailure returns the recorded spawn-failure diagnostic for this instance,
@@ -235,26 +208,36 @@ func (r *SpawnFailureRecord) FormatForDisplay() string {
 	if r == nil {
 		return ""
 	}
+	// Callers can construct a record directly, bypassing the sidecar reader.
+	// Keep this presentation boundary safe without changing the caller's value.
+	rec := *r
+	redactSpawnFailureRecord(&rec)
 	var b strings.Builder
 	b.WriteString("⚠  session failed to start\n")
-	switch r.Reason {
-	case "tmux_start_failed":
+	switch {
+	case rec.IsToolNotFound():
+		// "<tool> (searched: <PATH>)" is the tail of the reason; say what it
+		// means and where to put the binary.
+		fmt.Fprintf(&b, "The tool was not found on PATH: %s.\n", strings.TrimPrefix(rec.Reason, spawnToolNotFoundPrefix))
+		fmt.Fprintf(&b, "The command exited after %dms. Install the tool into one of the searched directories\n", rec.ElapsedMs)
+		b.WriteString("(~/.local/bin and ~/bin are added to PATH automatically), or use its full path as the command.\n")
+	case rec.Reason == "tmux_start_failed":
 		b.WriteString("The terminal session could not be created.\n")
-	case "spawn_died_fast":
-		fmt.Fprintf(&b, "The command exited almost immediately (after %dms).\n", r.ElapsedMs)
-	case "prepare_failed":
+	case rec.Reason == "spawn_died_fast":
+		fmt.Fprintf(&b, "The command exited almost immediately (after %dms).\n", rec.ElapsedMs)
+	case rec.Reason == "prepare_failed":
 		// Nothing was launched, so the default arm's "ended unexpectedly
 		// during startup" would be actively misleading here.
 		b.WriteString("The command could not be prepared, so nothing was launched.\n")
 	default:
 		b.WriteString("The session ended unexpectedly during startup.\n")
 	}
-	if r.Command != "" {
-		fmt.Fprintf(&b, "\ncommand: %s\n", r.Command)
+	if rec.Command != "" {
+		fmt.Fprintf(&b, "\ncommand: %s\n", rec.Command)
 	}
-	if strings.TrimSpace(r.DyingOutput) != "" {
+	if strings.TrimSpace(rec.DyingOutput) != "" {
 		b.WriteString("\nlast output before exit:\n")
-		b.WriteString(strings.TrimRight(r.DyingOutput, "\n"))
+		b.WriteString(strings.TrimRight(rec.DyingOutput, "\n"))
 		b.WriteString("\n")
 	} else {
 		b.WriteString("\n(no output was captured before the process exited)\n")
@@ -262,6 +245,15 @@ func (r *SpawnFailureRecord) FormatForDisplay() string {
 	b.WriteString("\nTip: run the command manually in this directory to see the full error,\n")
 	b.WriteString("or check logs/session-id-lifecycle.jsonl for the spawn trace.\n")
 	return b.String()
+}
+
+// lifecycleFastDeathReason words the spawn_died_fast lifecycle event: the
+// elapsed time, prefixed by the not-found attribution when there is one.
+func lifecycleFastDeathReason(reason string, elapsedMs int64) string {
+	if strings.HasPrefix(reason, spawnToolNotFoundPrefix) {
+		return fmt.Sprintf("%s; exited after %dms", reason, elapsedMs)
+	}
+	return fmt.Sprintf("exited after %dms", elapsedMs)
 }
 
 // spawnFastDeathWindow / spawnFastDeathTick bound the fast-death watcher: a
@@ -312,22 +304,39 @@ const (
 // lifecycleLogPath and failureDir are resolved before the goroutine starts and
 // passed by value, so the watcher cannot write through a later process-global
 // HOME value.
-func (i *Instance) startFastDeathWatcher(command string, sess *tmux.Session, id, tool string, logger *slog.Logger) {
-	gen, wake := i.newSpawnGenWatch()
+//
+// probeTool and probeMarker (see Instance.spawnToolLookup) let a death be
+// attributed to a tool the pane could not find; both are "" when no probe
+// was emitted.
+func (i *Instance) startFastDeathWatcher(command string, gen uint64, wake <-chan struct{}, sess *tmux.Session, id, tool string, logger *slog.Logger, probeTool, probeMarker string) {
 	lifecycleLogPath := GetSessionIDLifecycleLogPath()
 	failureDir := spawnFailureDir()
-	i.spawnWatchers.Add(1)
-	go func() {
-		defer i.spawnWatchers.Done()
-		i.watchForFastDeath(command, gen, wake, sess, id, tool, logger, lifecycleLogPath, failureDir)
-	}()
+	exitReceiptPath := i.trackedCommandExitReceiptPath()
+	i.goSpawnWatcher(func() {
+		i.watchForFastDeath(command, gen, wake, sess, id, tool, logger, lifecycleLogPath, failureDir, probeTool, probeMarker, exitReceiptPath)
+	})
 }
 
+// waitForFastDeathWatchers blocks until every goroutine a spawn started and
+// tracks in spawnWatchers has returned: the fast-death watcher and the
+// ownership attribution pass. Bump the generation first (bumpSpawnGenAndBarrier)
+// so they stop at their next wake instead of running out their window.
 func (i *Instance) waitForFastDeathWatchers() {
 	i.spawnWatchers.Wait()
 }
 
-func (i *Instance) watchForFastDeath(command string, gen uint64, wake <-chan struct{}, sess *tmux.Session, id, tool string, logger *slog.Logger, lifecycleLogPath, failureDir string) {
+// retireFastDeathWatchers supersedes the previous spawn's watcher and joins it
+// before tmux.Session.Start runs again on the same session (#2805). The watcher
+// reads sess.Name (Exists, IsPaneDead, CapturePane) with no lock, and Start
+// rewrites Name when the old tmux session still exists, so without the join a
+// restart races a watcher still holding the previous spawn. The bump closes the
+// watcher's wake channel, so it returns after at most the tmux call it is in.
+func (i *Instance) retireFastDeathWatchers() {
+	i.bumpSpawnGen(false)
+	i.waitForFastDeathWatchers()
+}
+
+func (i *Instance) watchForFastDeath(command string, gen uint64, wake <-chan struct{}, sess *tmux.Session, id, tool string, logger *slog.Logger, lifecycleLogPath, failureDir string, probeTool, probeMarker, exitReceiptPath string) {
 	if sess == nil {
 		return
 	}
@@ -357,7 +366,12 @@ func (i *Instance) watchForFastDeath(command string, gen uint64, wake <-chan str
 			return
 		}
 
-		if sess.Exists() {
+		// #2202: remain-on-exit (sandbox sessions, and anything configured
+		// that way) keeps the tmux session alive with a dead pane instead of
+		// tearing it down when the initial process exits — Exists() alone
+		// would call that "alive" forever and never record the fast death.
+		// A dead pane is therefore treated exactly like a vanished session.
+		if sess.Exists() && !sess.IsPaneDead() {
 			// Alive: snapshot the current pane so we hold the dying output the
 			// instant it disappears (tmux discards the pane on process exit for
 			// non-remain-on-exit sessions).
@@ -367,10 +381,15 @@ func (i *Instance) watchForFastDeath(command string, gen uint64, wake <-chan str
 				}
 			}
 			if time.Now().After(deadline) {
-				// Survived the window: healthy start. The commit re-checks the
-				// generation under the write barrier — CapturePane above shells
-				// out to tmux, so a teardown can easily have started since the
-				// check at the top of this iteration.
+				// Survived the window: healthy start. A probe marker left by a
+				// pane that fell through to a shell (exit-to-shell) is not a
+				// spawn failure; drop it. The commit re-checks the generation
+				// under the write barrier — CapturePane above shells out to
+				// tmux, so a teardown can easily have started since the check
+				// at the top of this iteration.
+				if probeMarker != "" {
+					_ = os.Remove(probeMarker)
+				}
 				_ = i.commitSpawnWatchWrite(gen, func() {
 					_ = writeSessionIDLifecycleEventTo(SessionIDLifecycleEvent{
 						InstanceID: id,
@@ -386,6 +405,12 @@ func (i *Instance) watchForFastDeath(command string, gen uint64, wake <-chan str
 		if i.spawnGen.Load() != gen {
 			return
 		}
+		// A tracked one-shot command that ran to completion left its dead
+		// pane and exit status behind on purpose. That is the command's
+		// result, reported as process-exited, not a spawn failure.
+		if trackedCommandExitObserved(sess, exitReceiptPath) {
+			return
+		}
 
 		// Session is gone — but sess.Exists() shells out to tmux, so a
 		// teardown may well have started during that call: killInternal and
@@ -394,12 +419,31 @@ func (i *Instance) watchForFastDeath(command string, gen uint64, wake <-chan str
 		// the iteration. Everything below therefore commits under the write
 		// barrier, which re-checks the generation, rather than trusting the
 		// earlier check.
+		//
+		// A dead-but-still-existing pane (remain-on-exit) still holds its
+		// content, unlike a torn-down session — grab it now in case the
+		// process died before any earlier tick captured a snapshot.
+		if lastSnapshot == "" {
+			if content, err := sess.CapturePane(); err == nil {
+				if trimmed := strings.TrimSpace(content); trimmed != "" {
+					lastSnapshot = trimmed
+				}
+			}
+		}
 		elapsed := time.Since(start).Milliseconds()
+		// A tool the pane itself could not find (the probe's marker, see
+		// spawn_path.go) is named instead of leaving the user to infer it
+		// from a 261ms exit (g14 parity walk). Any other death, marker or
+		// not, keeps the generic reason with the dying output.
+		reason := "spawn_died_fast"
+		if notFound := spawnToolNotFoundReason(probeTool, probeMarker); notFound != "" {
+			reason = notFound
+		}
 		rec := SpawnFailureRecord{
 			InstanceID:  id,
 			Tool:        tool,
 			Command:     command,
-			Reason:      "spawn_died_fast",
+			Reason:      reason,
 			DyingOutput: lastSnapshot,
 			ElapsedMs:   elapsed,
 		}
@@ -411,7 +455,7 @@ func (i *Instance) watchForFastDeath(command string, gen uint64, wake <-chan str
 				Tool:       tool,
 				Action:     "spawn_died_fast",
 				Source:     "spawn_watcher",
-				Reason:     fmt.Sprintf("exited after %dms", elapsed),
+				Reason:     lifecycleFastDeathReason(reason, elapsed),
 			}, lifecycleLogPath)
 		})
 		if !committed {
@@ -425,19 +469,21 @@ func (i *Instance) watchForFastDeath(command string, gen uint64, wake <-chan str
 		// part that must be ordered against teardown, not the diagnostics.
 		if writeErr != nil {
 			logger.Warn("spawn_failure_record_write_failed",
-				slog.String("instance_id", logging.SanitizeValue(id)),
-				slog.String("error", logging.SanitizeValue(writeErr.Error())))
+				slog.String("instance_id", strings.ReplaceAll(strings.ReplaceAll(logging.SanitizeValue(id), "\n", ""), "\r", "")),
+				slog.String("error", strings.ReplaceAll(strings.ReplaceAll(logging.SanitizeValue(writeErr.Error()), "\n", ""), "\r", "")))
 		}
 		// Every value here is session-supplied: the tool and command come from
 		// user config, and dying_output is raw captured pane content — newlines
 		// and control characters in it would otherwise forge log records
-		// (CodeQL go/log-injection).
+		// (CodeQL go/log-injection). Secrets are redacted first (env values,
+		// then credential-shaped options); the outer ReplaceAll pair is the
+		// line-break strip in the form CodeQL models.
 		logger.Error("spawn_died_fast",
-			slog.String("instance_id", logging.SanitizeValue(id)),
-			slog.String("tool", logging.SanitizeValue(tool)),
-			slog.String("command", logging.SanitizeValue(command)),
+			slog.String("instance_id", strings.ReplaceAll(strings.ReplaceAll(logging.SanitizeValue(id), "\n", ""), "\r", "")),
+			slog.String("tool", strings.ReplaceAll(strings.ReplaceAll(logging.SanitizeValue(tool), "\n", ""), "\r", "")),
+			slog.String("command", strings.ReplaceAll(strings.ReplaceAll(logging.RedactCommandEnv(redactSpawnFailureDiagnostic(command)), "\n", ""), "\r", "")),
 			slog.Int64("elapsed_ms", elapsed),
-			slog.String("dying_output", logging.SanitizeValue(lastSnapshot)))
+			slog.String("dying_output", strings.ReplaceAll(strings.ReplaceAll(logging.SanitizeValue(redactSpawnFailureDiagnostic(lastSnapshot)), "\n", ""), "\r", "")))
 		return
 	}
 }
@@ -455,15 +501,17 @@ func (i *Instance) recordPrepareFailure(command string, prepErr error) {
 	if prepErr == nil {
 		return
 	}
+	safeCommand := redactSpawnFailureDiagnostic(command)
+	safeError := redactSpawnFailureDiagnostic(prepErr.Error())
 	rec := SpawnFailureRecord{
 		InstanceID: i.ID,
 		Tool:       i.Tool,
-		Command:    command,
+		Command:    safeCommand,
 		Reason:     "prepare_failed",
 		// Reusing DyingOutput for the error string, as recordTmuxStartFailure
 		// already does: there is no pane to snapshot, so the error IS the
 		// diagnostic.
-		DyingOutput: prepErr.Error(),
+		DyingOutput: safeError,
 	}
 	if err := writeSpawnFailureRecord(rec); err != nil {
 		sessionLog.Warn("spawn_failure_record_write_failed",
@@ -475,7 +523,7 @@ func (i *Instance) recordPrepareFailure(command string, prepErr error) {
 		Tool:       i.Tool,
 		Action:     "spawn_failed",
 		Source:     "prepare_command",
-		Reason:     prepErr.Error(),
+		Reason:     safeError,
 	})
 }
 
@@ -484,12 +532,14 @@ func (i *Instance) recordPrepareFailure(command string, prepErr error) {
 // the fast-death path this has no pane to snapshot — the error string is the
 // diagnostic.
 func (i *Instance) recordTmuxStartFailure(command string, startErr error) {
+	safeCommand := redactSpawnFailureDiagnostic(command)
+	safeError := redactSpawnFailureDiagnostic(startErr.Error())
 	rec := SpawnFailureRecord{
 		InstanceID:  i.ID,
 		Tool:        i.Tool,
-		Command:     command,
+		Command:     safeCommand,
 		Reason:      "tmux_start_failed",
-		DyingOutput: startErr.Error(),
+		DyingOutput: safeError,
 	}
 	if err := writeSpawnFailureRecord(rec); err != nil {
 		sessionLog.Warn("spawn_failure_record_write_failed",
@@ -501,7 +551,7 @@ func (i *Instance) recordTmuxStartFailure(command string, startErr error) {
 		Tool:       i.Tool,
 		Action:     "spawn_failed",
 		Source:     "spawn_watcher",
-		Reason:     startErr.Error(),
+		Reason:     safeError,
 	})
 }
 

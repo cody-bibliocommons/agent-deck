@@ -1,0 +1,313 @@
+package core
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/health"
+	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/tmux"
+)
+
+// SessionListIn is the input of session.list.
+type SessionListIn struct {
+	Profile           string `json:"profile" doc:"Profile to list; ignored with all_profiles"`
+	AllProfiles       bool   `json:"all_profiles,omitempty" doc:"List every profile"`
+	IncludeSuperseded bool   `json:"include_superseded,omitempty" doc:"Include archived source rows retained for cross-harness recovery"`
+	LiveStatus        bool   `json:"live_status,omitempty" doc:"Refresh status and fill the live fields (status, substate, viewers, model); single profile only"`
+	ExcludeArchived   bool   `json:"exclude_archived,omitempty" doc:"Skip archived sessions before any status work or encoding"`
+}
+
+// SessionListOut is the output of session.list.
+type SessionListOut struct {
+	Profile  string       `json:"profile,omitempty" doc:"Resolved profile name (single-profile listing)"`
+	Sessions []SessionRow `json:"sessions" doc:"Sessions of the single profile; empty with all_profiles"`
+	// Stats feeds the opt-in --stats diagnostic on the direct CLI. Wall
+	// time and process-local tmux call counts are not stable command data,
+	// so they are deliberately absent from canonical envelopes.
+	Stats *session.ListStats `json:"-"`
+	// Profiles and ProfileCount are set for all_profiles. ProfileCount counts
+	// every profile found, including ones that failed to load or are empty.
+	Profiles     []ProfileSessions `json:"profiles,omitempty"`
+	ProfileCount int               `json:"profile_count,omitempty"`
+}
+
+// ProfileSessions is one profile of an all-profiles listing.
+type ProfileSessions struct {
+	Profile  string       `json:"profile"`
+	Sessions []SessionRow `json:"sessions"`
+}
+
+// SessionRow is one listed session. Status is the raw session status; the
+// fields marked live are only filled with live_status.
+//
+// Field order and tags mirror the sessionJSON struct of buildListJSON in
+// cmd/agent-deck/main.go: `list --json` marshals these rows directly, so a
+// reorder here changes its bytes.
+type SessionRow struct {
+	ID                string         `json:"id"`
+	ParentSessionID   string         `json:"parent_session_id,omitempty"`
+	ParentProjectPath string         `json:"parent_project_path,omitempty"`
+	Title             string         `json:"title"`
+	Path              string         `json:"path"`
+	Group             string         `json:"group"`
+	Tool              string         `json:"tool"`
+	Account           string         `json:"account"`
+	Command           string         `json:"command,omitempty"`
+	ModelID           string         `json:"model_id,omitempty" doc:"live"`
+	Model             string         `json:"model,omitempty" doc:"live"`
+	ModelVersion      string         `json:"model_version,omitempty" doc:"live"`
+	Status            string         `json:"status"`
+	StatusSource      string         `json:"status_source,omitempty" doc:"cached for an absent historical row whose stored status was used; live after a status refresh; stale when the refresh could not capture the pane (batched capture timed out): status is the last observation or the default, substate last known or absent"`
+	Substate          string         `json:"substate,omitempty" doc:"live"`
+	ExitCode          *int           `json:"exit_code,omitempty" doc:"live"`
+	SubstateDetail    string         `json:"substate_detail,omitempty" doc:"live"`
+	TmuxSession       string         `json:"tmux_session,omitempty" doc:"live"`
+	TmuxSocketName    string         `json:"tmux_socket_name,omitempty" doc:"tmux -L socket the session lives on; absent on the default server"`
+	TmuxBinary        string         `json:"tmux_binary,omitempty" doc:"the [tmux.binaries] client for that socket; absent when none applies (run the bare tmux)"`
+	Profile           string         `json:"profile"`
+	CreatedAt         time.Time      `json:"created_at"`
+	SSHHost           string         `json:"ssh_host,omitempty"`
+	SSHRemotePath     string         `json:"ssh_remote_path,omitempty"`
+	Channels          []string       `json:"channels,omitempty" doc:"live"`
+	ExtraArgs         []string       `json:"extra_args,omitempty" doc:"live"`
+	Color             string         `json:"color,omitempty" doc:"live"`
+	Favorite          bool           `json:"favorite,omitempty" doc:"live"`
+	Archived          bool           `json:"archived" doc:"live"`
+	ArchivedAt        time.Time      `json:"archived_at,omitempty" doc:"live"`
+	SupersededBy      string         `json:"superseded_by,omitempty" doc:"live"`
+	Supersedes        string         `json:"supersedes,omitempty" doc:"live"`
+	CodexSessionID    string         `json:"codex_session_id,omitempty"`
+	ClaudeSessionID   string         `json:"claude_session_id,omitempty"`
+	TranscriptPath    string         `json:"transcript_path,omitempty"`
+	ResolvedCodexHome string         `json:"resolved_codex_home,omitempty"`
+	LastActivityAt    string         `json:"last_activity_at,omitempty" doc:"live"`
+	Viewers           *[]tmux.Viewer `json:"viewers,omitempty" doc:"live; absent when tmux could not be asked"`
+
+	// BackgroundWork is the in-flight background work behind substate
+	// background-work (issue #2473).
+	BackgroundWork *tmux.BackgroundWork `json:"background_work,omitempty" doc:"live; in-flight background work (workflow, agent, bash, monitor) behind substate background-work"`
+
+	// IntendedSwitch marks the current account/model as switched on purpose
+	// (`session set ... --intended`); omitted when none or expired.
+	IntendedSwitch *session.IntendedSwitchJSON `json:"intended_switch,omitempty" doc:"intended account/model switch: the switch is intended while account and model equal it and now < expires_at; absent when none or expired"`
+
+	// ConductorName is the stable conductor key of a conductor session, so
+	// a consumer finds a renamed or decorated conductor without parsing its
+	// title. Absent for any other session.
+	ConductorName string `json:"conductor_name,omitempty" doc:"stable conductor name of a conductor session (survives renames); absent for other sessions"`
+}
+
+func sessionList(ctx context.Context, in SessionListIn) (SessionListOut, error) {
+	if in.AllProfiles {
+		return listAllProfiles(in)
+	}
+	storage, err := session.NewStorageWithProfile(in.Profile)
+	if err != nil {
+		return SessionListOut{}, &Error{Code: CodeStorage, Message: fmt.Sprintf("failed to initialize storage: %v", err), Cause: err}
+	}
+	instances, _, err := storage.LoadWithGroups()
+	if err != nil {
+		return SessionListOut{}, &Error{Code: CodeStorage, Message: fmt.Sprintf("failed to load sessions: %v", err), Cause: err}
+	}
+	if !in.IncludeSuperseded {
+		instances = session.VisibleInstances(instances)
+	}
+	out := SessionListOut{Profile: storage.Profile(), Sessions: []SessionRow{}}
+	// all keeps archived rows for parent-path recovery; only listed rows get
+	// a status pass (#3089).
+	all := instances
+	if in.ExcludeArchived {
+		instances = session.FilterInstancesByArchive(instances, false)
+	}
+	if len(instances) == 0 {
+		return out, nil
+	}
+	transcripts := session.ListedTranscriptPaths(instances)
+	if !in.LiveStatus {
+		for _, inst := range instances {
+			out.Sessions = append(out.Sessions, staticSessionRow(inst, all, out.Profile, transcripts))
+		}
+		return out, nil
+	}
+
+	// Warm the pane-title cache and hook statuses so the listing reports the
+	// status the TUI and /api/menu do (#610), and record the pass (#2331).
+	started := time.Now()
+	tmuxBefore := tmux.SubprocessStarts()
+	skipsBefore := tmux.CaptureBatchSkips()
+	refresh, cached := session.CLIStatusCandidates(instances)
+	session.RefreshInstancesForCLIStatus(refresh)
+	out.Sessions = liveSessionRows(ctx, out.Profile, instances, all, cached, transcripts)
+	elapsed := time.Since(started)
+	tmuxCalls := tmux.SubprocessStarts() - tmuxBefore
+	health.RecordStatusPass(elapsed, len(instances), tmuxCalls)
+	out.Stats = &session.ListStats{
+		StatusPassMS:    elapsed.Milliseconds(),
+		TmuxCalls:       tmuxCalls,
+		Sessions:        len(instances),
+		CapturesSkipped: tmux.CaptureBatchSkips() - skipsBefore,
+	}
+	return out, nil
+}
+
+// staticSessionRow fills the stored fields only; no tmux or pane access.
+func staticSessionRow(inst *session.Instance, instances []*session.Instance, profile string, transcripts map[*session.Instance]string) SessionRow {
+	socketName, binary := TmuxRoute(inst)
+	return SessionRow{
+		ID:                inst.ID,
+		ParentSessionID:   inst.ParentSessionID,
+		ParentProjectPath: parentProjectPath(inst, instances),
+		Title:             inst.Title,
+		Path:              inst.ProjectPath,
+		Group:             inst.GroupPath,
+		Tool:              inst.Tool,
+		Account:           inst.Account,
+		Command:           inst.Command,
+		Status:            string(inst.Status),
+		TmuxSocketName:    socketName,
+		TmuxBinary:        binary,
+		Profile:           profile,
+		CreatedAt:         inst.CreatedAt,
+		SSHHost:           inst.SSHHost,
+		SSHRemotePath:     inst.SSHRemotePath,
+		CodexSessionID:    inst.CodexSessionID,
+		ClaudeSessionID:   inst.ClaudeSessionID,
+		TranscriptPath:    transcripts[inst],
+		ResolvedCodexHome: inst.ResolvedCodexHome(),
+		IntendedSwitch:    inst.ActiveIntendedSwitchJSON(time.Now()),
+		ConductorName:     inst.ListedConductorName(),
+	}
+}
+
+// liveSessionRows refreshes each session's status and fills every field.
+// Callers warm the status caches first. all is the full row set parent paths
+// are recovered from; instances may be a subset of it.
+func liveSessionRows(ctx context.Context, profile string, instances, all []*session.Instance, cached map[*session.Instance]bool, transcripts map[*session.Instance]string) []SessionRow {
+	rows := make([]SessionRow, len(instances))
+	viewers := session.ViewersByTmuxSession(ctx, instances)
+	var pass session.StatusUpdatePass
+	for i, inst := range instances {
+		// Listings need live status, not native-session discovery.
+		if !cached[inst] {
+			_ = pass.UpdateStatusOnly(inst)
+		}
+		// The substate read is this pass's one pane capture and can settle
+		// the status (hook lag): take it before the status.
+		substate := ""
+		if !cached[inst] {
+			substate = string(inst.Substate())
+		} else {
+			substate = string(inst.HistoricalSubstate())
+		}
+		row := staticSessionRow(inst, all, profile, transcripts)
+		row.StatusSource = listedStatusSource(inst, cached[inst])
+		row.Substate = substate
+		row.ExitCode = inst.ExitCode()
+		row.SubstateDetail = inst.SubstateDetail()
+		row.BackgroundWork = inst.BackgroundWorkJSON()
+		row.Channels = inst.Channels
+		row.ExtraArgs = inst.ExtraArgs
+		row.Color = inst.Color
+		row.Favorite = inst.Favorite
+		row.Archived = inst.IsArchived()
+		row.ArchivedAt = inst.ArchivedAtThreadSafe()
+		row.SupersededBy = inst.SupersededBy
+		row.Supersedes = inst.Supersedes
+		row.LastActivityAt = inst.DisplayLastActivityTime().Format(time.RFC3339Nano)
+		if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil {
+			row.TmuxSession = tmuxSess.Name
+			if v, known := viewers[tmuxSess.Name]; known {
+				row.Viewers = &v
+			}
+		}
+		if modelInfo := inst.LaunchModelInfo(); modelInfo.ModelID != "" {
+			row.ModelID = modelInfo.ModelID
+			row.Model = modelInfo.ModelID
+			row.ModelVersion = modelInfo.Version
+		}
+		rows[i] = row
+	}
+	return rows
+}
+
+// listedStatusSource is a live row's status_source: cached for an absent row
+// whose stored status was used, stale when its pane was capture-skipped
+// after a batched-capture timeout (#3089), live otherwise.
+func listedStatusSource(inst *session.Instance, cached bool) string {
+	if cached {
+		return "cached"
+	}
+	if sess := inst.GetTmuxSession(); sess != nil && sess.CaptureSkipped() {
+		return "stale"
+	}
+	return "live"
+}
+
+// listAllProfiles loads every profile's stored rows. A profile that fails to
+// open or load is skipped, as the CLI always did, but still counted.
+func listAllProfiles(in SessionListIn) (SessionListOut, error) {
+	profiles, err := session.ListProfiles()
+	if err != nil {
+		return SessionListOut{}, &Error{Code: CodeStorage, Message: fmt.Sprintf("failed to list profiles: %v", err), Cause: err}
+	}
+	out := SessionListOut{ProfileCount: len(profiles), Profiles: []ProfileSessions{}, Sessions: []SessionRow{}}
+	for _, name := range profiles {
+		storage, err := session.NewStorageWithProfile(name)
+		if err != nil {
+			continue
+		}
+		instances, _, err := storage.LoadWithGroups()
+		if err != nil {
+			continue
+		}
+		if !in.IncludeSuperseded {
+			instances = session.VisibleInstances(instances)
+		}
+		all := instances
+		if in.ExcludeArchived {
+			instances = session.FilterInstancesByArchive(instances, false)
+		}
+		transcripts := session.ListedTranscriptPaths(instances)
+		ps := ProfileSessions{Profile: name, Sessions: make([]SessionRow, 0, len(instances))}
+		for _, inst := range instances {
+			ps.Sessions = append(ps.Sessions, staticSessionRow(inst, all, name, transcripts))
+		}
+		out.Profiles = append(out.Profiles, ps)
+	}
+	return out, nil
+}
+
+// parentProjectPath reports the parent path represented by the stored parent
+// id, recovering it from the parent row for older rows that lack it.
+func parentProjectPath(inst *session.Instance, instances []*session.Instance) string {
+	if inst == nil || inst.ParentSessionID == "" {
+		return ""
+	}
+	if inst.ParentProjectPath != "" {
+		return inst.ParentProjectPath
+	}
+	for _, candidate := range instances {
+		if candidate.ID == inst.ParentSessionID {
+			return candidate.ProjectPath
+		}
+	}
+	return ""
+}
+
+// TmuxRoute names the tmux server a session lives on, for clients that run
+// tmux against it themselves (a desktop app's terminal pane reads styles and
+// sizes and keeps a control-mode mirror over ssh): the -L socket name, and
+// the [tmux.binaries] client for that socket. A tmux client only talks to a
+// server of its own version (3.4 against 3.6a: "server exited
+// unexpectedly"), so "tmux -L <socket>" alone is not enough. Both are ""
+// (omitted from JSON) on the default server or a socket without its own
+// binary, so older consumers see no change.
+func TmuxRoute(inst *session.Instance) (socketName, binary string) {
+	socketName = inst.TmuxSocketName
+	if bin, ok := tmux.ConfiguredBinary(socketName); ok {
+		binary = bin
+	}
+	return socketName, binary
+}

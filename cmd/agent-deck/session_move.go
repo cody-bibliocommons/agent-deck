@@ -16,7 +16,7 @@ import (
 // set path + group move + cp ~/.claude/projects/<old>/ + session restart)
 // into a single atomic command.
 func handleSessionMove(profile string, args []string) {
-	fs := flag.NewFlagSet("session move", flag.ExitOnError)
+	fs := flag.NewFlagSet("session move", flag.ContinueOnError)
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	quiet := fs.Bool("quiet", false, "Minimal output")
 	quietShort := fs.Bool("q", false, "Minimal output (short)")
@@ -47,8 +47,8 @@ func handleSessionMove(profile string, args []string) {
 		fmt.Println("  agent-deck session move my-project --to-profile march")
 	}
 
-	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
-		os.Exit(1)
+	if err := parseCLIFlags(fs, normalizeArgs(fs, args)); err != nil {
+		exitCLI(1)
 	}
 
 	quietMode := *quiet || *quietShort
@@ -61,12 +61,12 @@ func handleSessionMove(profile string, args []string) {
 		if fs.NArg() < 1 {
 			out.Error("session move --to-profile requires <id|title>", ErrCodeInvalidOperation)
 			fs.Usage()
-			os.Exit(1)
+			exitCLI(1)
 		}
 		if fs.NArg() > 1 {
 			out.Error("--to-profile is incompatible with a <new-path> positional argument", ErrCodeInvalidOperation)
 			fs.Usage()
-			os.Exit(1)
+			exitCLI(1)
 		}
 		// Reject path-move flags that don't apply when migrating across
 		// profiles — silently ignoring them masks user mistakes. Detect via
@@ -81,7 +81,7 @@ func handleSessionMove(profile string, args []string) {
 		if len(incompatible) > 0 {
 			out.Error(fmt.Sprintf("--to-profile is incompatible with: %s", incompatible), ErrCodeInvalidOperation)
 			fs.Usage()
-			os.Exit(1)
+			exitCLI(1)
 		}
 		handleSessionMoveToProfile(profile, *toProfile, fs.Arg(0), *force, out)
 		return
@@ -90,7 +90,7 @@ func handleSessionMove(profile string, args []string) {
 	if fs.NArg() < 2 {
 		out.Error("session move requires <id|title> and <new-path>", ErrCodeInvalidOperation)
 		fs.Usage()
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	identifier := fs.Arg(0)
@@ -99,16 +99,16 @@ func handleSessionMove(profile string, args []string) {
 	storage, instances, groups, err := loadSessionData(profile)
 	if err != nil {
 		out.Error(err.Error(), ErrCodeNotFound)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	inst, errMsg, errCode := ResolveSession(identifier, instances)
 	if inst == nil {
 		out.Error(errMsg, errCode)
 		if errCode == ErrCodeNotFound {
-			os.Exit(2)
+			exitCLI(2)
 		}
-		os.Exit(1)
+		exitCLI(1)
 		return
 	}
 
@@ -122,7 +122,7 @@ func handleSessionMove(profile string, args []string) {
 		resolved, resErr := resolveAddPath(newPath)
 		if resErr != nil {
 			out.Error(fmt.Sprintf("resolve new path: %v", resErr), ErrCodeInvalidOperation)
-			os.Exit(1)
+			exitCLI(1)
 		}
 		newPath = resolved
 	}
@@ -130,64 +130,94 @@ func handleSessionMove(profile string, args []string) {
 	oldPath := inst.ProjectPath
 	oldGroup := inst.GroupPath
 
-	home, err := os.UserHomeDir()
-	if err != nil {
-		out.Error(fmt.Sprintf("resolve home dir: %v", err), ErrCodeInvalidOperation)
-		os.Exit(1)
+	groupTree := session.NewGroupTreeWithGroups(instances, groups)
+	moveCfg, _ := session.LoadUserConfig()
+	if moveCfg != nil {
+		session.ReconcileDeclarativeGroups(groupTree, moveCfg)
 	}
-	if err := session.MigrateClaudeProjectDir(home, oldPath, newPath, *copyHistory); err != nil {
+
+	// Resolve the target group (empty when --group wasn't passed) BEFORE
+	// migrating, so the destination config dir below reflects where the
+	// session will live after this invocation, not where it lives now.
+	// The selector resolves exactly as for add/launch/fork, and a new group
+	// is created up front so the config dir is looked up by its real path.
+	targetGroupPath := *group
+	if targetGroupPath == "root" {
+		targetGroupPath = session.DefaultGroupPath
+	} else if targetGroupPath != "" {
+		resolved, gErr := resolveGroupPathForAdd(groupTree, targetGroupPath)
+		if gErr != nil {
+			out.Error(gErr.Error(), ErrCodeInvalidOperation)
+			exitCLI(1)
+		}
+		targetGroupPath = resolved
+		if _, ok := groupTree.Groups[targetGroupPath]; !ok && targetGroupPath != session.DefaultGroupPath {
+			targetGroupPath = groupTree.CreateGroup(targetGroupPath).Path
+		}
+	}
+
+	// Resolve the effective Claude config dirs the way launch/start do rather
+	// than hardcoding ~/.claude, so history under a per-account or per-group
+	// config_dir override is actually migrated (#2086). Source and destination
+	// are resolved separately and can differ: a --group retarget in this same
+	// invocation can cross a config_dir boundary, and migrating into the OLD
+	// config dir would leave the restarted session unable to see its own
+	// history (cross-config-dir follow-up to #2086).
+	srcConfigDir := session.GetClaudeConfigDirForInstance(inst)
+	dstConfigDir := session.GetClaudeConfigDirForInstanceInGroup(inst, targetGroupPath)
+	historyFilesMoved, err := session.MigrateClaudeProjectDir(srcConfigDir, dstConfigDir, oldPath, newPath, *copyHistory)
+	if err != nil {
 		out.Error(fmt.Sprintf("migrate claude history: %v", err), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	inst.ProjectPath = newPath
 
-	groupTree := session.NewGroupTreeWithGroups(instances, groups)
-	moveCfg, _ := session.LoadUserConfig()
-	groupTree.DefaultMaxConcurrent = moveCfg.GroupDefaults.MaxConcurrent
-	if *group != "" {
-		targetGroupPath := *group
-		if targetGroupPath == "root" {
-			targetGroupPath = session.DefaultGroupPath
-		}
-		if _, ok := groupTree.Groups[targetGroupPath]; !ok && targetGroupPath != session.DefaultGroupPath {
-			created := groupTree.CreateGroup(targetGroupPath)
-			targetGroupPath = created.Path
-		}
+	if targetGroupPath != "" {
 		groupTree.MoveSessionToGroup(inst, targetGroupPath)
 	}
 
 	if err := storage.SaveWithGroups(groupTree.GetAllInstances(), groupTree); err != nil {
 		out.Error(fmt.Sprintf("failed to save: %v", err), ErrCodeInvalidOperation)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	restarted := false
 	if !*noRestart && inst.Exists() {
 		if err := inst.Restart(); err != nil {
 			out.Error(fmt.Sprintf("session moved, but restart failed: %v", err), ErrCodeInvalidOperation)
-			os.Exit(1)
+			exitCLI(1)
 		}
 		if session.IsClaudeCompatible(inst.Tool) && inst.ClaudeSessionID == "" {
 			inst.PostStartSync(3 * time.Second)
 		}
 		if err := saveSessionData(storage, instances, groups); err != nil {
 			out.Error(fmt.Sprintf("failed to save after restart: %v", err), ErrCodeInvalidOperation)
-			os.Exit(1)
+			exitCLI(1)
 		}
 		restarted = true
 	}
 
-	out.Success(fmt.Sprintf("Moved %q: %s → %s", inst.Title, oldPath, newPath), map[string]interface{}{
-		"success":   true,
-		"id":        inst.ID,
-		"title":     inst.Title,
-		"old_path":  oldPath,
-		"new_path":  newPath,
-		"old_group": oldGroup,
-		"new_group": inst.GroupPath,
-		"restarted": restarted,
-		"copied":    *copyHistory,
+	message := fmt.Sprintf("Moved %q: %s → %s", inst.Title, oldPath, newPath)
+	if historyFilesMoved > 0 {
+		message = fmt.Sprintf("%s (%d history file%s)", message, historyFilesMoved, plural(historyFilesMoved))
+		if srcConfigDir != dstConfigDir {
+			message = fmt.Sprintf("%s [%s → %s]", message, srcConfigDir, dstConfigDir)
+		}
+	}
+	out.Success(message, map[string]interface{}{
+		"success":                  true,
+		"id":                       inst.ID,
+		"title":                    inst.Title,
+		"old_path":                 oldPath,
+		"new_path":                 newPath,
+		"old_group":                oldGroup,
+		"new_group":                inst.GroupPath,
+		"restarted":                restarted,
+		"copied":                   *copyHistory,
+		"history_files_moved":      historyFilesMoved,
+		"source_claude_config_dir": srcConfigDir,
+		"target_claude_config_dir": dstConfigDir,
 	})
 }
 
@@ -204,7 +234,7 @@ func handleSessionMoveToProfile(sourceProfile, targetProfile, identifier string,
 	_, srcInstances, _, err := loadSessionData(sourceProfile)
 	if err != nil {
 		out.Error(err.Error(), ErrCodeNotFound)
-		os.Exit(1)
+		exitCLI(1)
 	}
 	inst, errMsg, errCode := ResolveSession(identifier, srcInstances)
 	if inst == nil {
@@ -227,9 +257,9 @@ func handleSessionMoveToProfile(sourceProfile, targetProfile, identifier string,
 	if inst == nil {
 		out.Error(errMsg, errCode)
 		if errCode == ErrCodeNotFound {
-			os.Exit(2)
+			exitCLI(2)
 		}
-		os.Exit(1)
+		exitCLI(1)
 		return
 	}
 
@@ -249,7 +279,7 @@ func handleSessionMoveToProfile(sourceProfile, targetProfile, identifier string,
 			hint = " (stop the session with `agent-deck session stop`, or re-run with --force)"
 		}
 		out.Error(fmt.Sprintf("%v%s", err, hint), exitCode)
-		os.Exit(1)
+		exitCLI(1)
 	}
 
 	out.Success(fmt.Sprintf("Migrated %q: profile %s → %s", inst.Title, sourceProfile, targetProfile), map[string]interface{}{

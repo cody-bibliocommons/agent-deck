@@ -17,7 +17,7 @@ func TestSettingsGET(t *testing.T) {
 	})
 	srv.menuData = &fakeMenuDataLoader{snapshot: &MenuSnapshot{}}
 
-	req := httptest.NewRequest(http.MethodGet, "/api/settings", nil)
+	req := newLocalRequest(http.MethodGet, "/api/settings", nil)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -48,7 +48,7 @@ func TestSettingsMethodNotAllowed(t *testing.T) {
 	})
 	srv.menuData = &fakeMenuDataLoader{snapshot: &MenuSnapshot{}}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/settings", nil)
+	req := newLocalRequest(http.MethodPost, "/api/settings", nil)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -67,7 +67,7 @@ func TestSettingsUnauthorized(t *testing.T) {
 	})
 	srv.menuData = &fakeMenuDataLoader{snapshot: &MenuSnapshot{}}
 
-	req := httptest.NewRequest(http.MethodGet, "/api/settings", nil)
+	req := newLocalRequest(http.MethodGet, "/api/settings", nil)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -86,7 +86,7 @@ func TestSettingsWebMutationsTrue(t *testing.T) {
 	})
 	srv.menuData = &fakeMenuDataLoader{snapshot: &MenuSnapshot{}}
 
-	req := httptest.NewRequest(http.MethodGet, "/api/settings", nil)
+	req := newLocalRequest(http.MethodGet, "/api/settings", nil)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -105,7 +105,7 @@ func TestProfilesGET(t *testing.T) {
 	})
 	srv.menuData = &fakeMenuDataLoader{snapshot: &MenuSnapshot{}}
 
-	req := httptest.NewRequest(http.MethodGet, "/api/profiles", nil)
+	req := newLocalRequest(http.MethodGet, "/api/profiles", nil)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -130,7 +130,7 @@ func TestProfilesMethodNotAllowed(t *testing.T) {
 	})
 	srv.menuData = &fakeMenuDataLoader{snapshot: &MenuSnapshot{}}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/profiles", nil)
+	req := newLocalRequest(http.MethodPost, "/api/profiles", nil)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -149,7 +149,7 @@ func TestProfilesUnauthorized(t *testing.T) {
 	})
 	srv.menuData = &fakeMenuDataLoader{snapshot: &MenuSnapshot{}}
 
-	req := httptest.NewRequest(http.MethodGet, "/api/profiles", nil)
+	req := newLocalRequest(http.MethodGet, "/api/profiles", nil)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -169,7 +169,7 @@ func TestSettingsLinkPolicy_DefaultsToConfirmOn(t *testing.T) {
 	srv := NewServer(Config{ListenAddr: "127.0.0.1:0", Profile: "default"})
 	srv.menuData = &fakeMenuDataLoader{snapshot: &MenuSnapshot{}}
 
-	req := httptest.NewRequest(http.MethodGet, "/api/settings", nil)
+	req := newLocalRequest(http.MethodGet, "/api/settings", nil)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -198,7 +198,7 @@ func TestSettingsLinkPolicy_ServesConfiguredAllowlistAndToggle(t *testing.T) {
 	})
 	srv.menuData = &fakeMenuDataLoader{snapshot: &MenuSnapshot{}}
 
-	req := httptest.NewRequest(http.MethodGet, "/api/settings", nil)
+	req := newLocalRequest(http.MethodGet, "/api/settings", nil)
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
 
@@ -219,6 +219,34 @@ func TestSettingsLinkPolicy_ServesConfiguredAllowlistAndToggle(t *testing.T) {
 	for i := range want {
 		if got.TrustedDomains[i] != want[i] {
 			t.Errorf("trustedDomains[%d] = %q, want %q", i, got.TrustedDomains[i], want[i])
+		}
+	}
+}
+
+// Issue #2676: the client needs the roots to decide whether a file:// link
+// opens through /api/files or only copies its path.
+func TestSettingsFileLinkRoots(t *testing.T) {
+	for _, tc := range []struct {
+		roots []string
+		want  string
+	}{
+		{nil, `[]`},
+		{[]string{"/home/me/projects", "/srv/reports"}, `["/home/me/projects","/srv/reports"]`},
+	} {
+		srv := NewServer(Config{ListenAddr: "127.0.0.1:0", Profile: "default", FileLinkRoots: tc.roots})
+		srv.menuData = &fakeMenuDataLoader{snapshot: &MenuSnapshot{}}
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, newLocalRequest(http.MethodGet, "/api/settings", nil))
+		var got map[string]json.RawMessage
+		if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+			t.Fatalf("decode settings: %v", err)
+		}
+		if string(got["fileLinkRoots"]) != tc.want {
+			t.Errorf("fileLinkRoots = %s, want %s", got["fileLinkRoots"], tc.want)
+		}
+		var host string
+		if err := json.Unmarshal(got["fileLinkHost"], &host); err != nil {
+			t.Errorf("fileLinkHost = %s, want a string", got["fileLinkHost"])
 		}
 	}
 }

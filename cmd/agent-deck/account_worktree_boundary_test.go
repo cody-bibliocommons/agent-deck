@@ -18,6 +18,7 @@ import (
 // Exercise real Git branches, worktrees and setup scripts so a rejected
 // account cannot appear safe merely because the fixture never reached setup.
 func TestAccountWorktreeBoundary(t *testing.T) {
+	parallelSubprocessTest(t)
 	cases := []struct {
 		name, command, flagAccount, envAccount string
 		valid                                  bool
@@ -58,6 +59,9 @@ func TestAccountWorktreeBoundary(t *testing.T) {
 					defer cancel()
 					cmd := exec.CommandContext(ctx, channelsCLIBinary(t), args...)
 					cmd.Env = env
+					// A tmux server the CLI started may hold the output pipe after
+					// the timeout kills the CLI; bound that wait too (#2937).
+					cmd.WaitDelay = 5 * time.Second
 					out, err := cmd.CombinedOutput()
 					return string(out), err
 				}

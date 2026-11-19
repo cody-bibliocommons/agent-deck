@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/testutil"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
@@ -33,7 +34,8 @@ func TestStartupNameExactArgv(t *testing.T) {
 	startupNameConfig(t, "")
 	for _, title := range []string{"Team A", "team-a", "team_a", "日本語", "🚀", "a'b;$(touch MUST_NOT_EXIST)`id`", strings.Repeat("long", 30) + "A", strings.Repeat("long", 30) + "B"} {
 		t.Run(title, func(t *testing.T) {
-			inst := &Instance{Tool: "claude", Title: title}
+			// Identity injection adds its own flag; this test pins --name alone.
+			inst := &Instance{Tool: "claude", Title: title, IdentityInjectionDisabled: true}
 			args := startupArgs(t, inst.buildClaudeExtraFlags(nil))
 			if len(args) != 2 || args[0] != "--name" || args[1] != title {
 				t.Fatalf("argv=%q, want --name %q", args, title)
@@ -168,6 +170,7 @@ func TestStartupNameAccountCommand(t *testing.T) {
 }
 
 func TestStartupNamePermissionChangeFailsClosed(t *testing.T) {
+	testutil.SkipIfRoot(t, "root reads a mode 0 config file")
 	path := startupNameConfig(t, "push_title=true")
 	inst := &Instance{Tool: "claude", Title: "Title"}
 	if inst.ClaudeLaunchName() == "" {

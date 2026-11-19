@@ -1,6 +1,7 @@
 package clipboard
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"os"
@@ -17,10 +18,33 @@ type CopyResult struct {
 	LineCount int    // Number of lines in the content
 }
 
+// Seams for tests: the native tool, the OSC 52 write and the environment.
+var (
+	nativeCopyFn = copyNative
+	osc52WriteFn = copyOSC52
+	getenv       = os.Getenv
+)
+
+// overSSH reports whether this process runs in an SSH login. The terminal the
+// user looks at is then on the other machine, so a native clipboard tool here
+// (xclip, xsel, wl-copy, pbcopy) writes the host's clipboard, which the user
+// never sees.
+func overSSH() bool {
+	return getenv("SSH_CONNECTION") != "" || getenv("SSH_CLIENT") != "" || getenv("SSH_TTY") != ""
+}
+
 // Copy copies text to the system clipboard using platform-appropriate methods.
 // The fallback chain is: native clipboard tool → OSC 52 escape sequence.
+// Over SSH the order is reversed: OSC 52 first (it reaches the user's own
+// terminal), then the native tool.
 // supportsOSC52 should come from tmux.GetTerminalInfo().SupportsOSC52.
 func Copy(text string, supportsOSC52 bool) (*CopyResult, error) {
+	return CopyContext(context.Background(), text, supportsOSC52)
+}
+
+// CopyContext copies text like Copy, but cancels native clipboard subprocesses
+// when ctx expires. OSC 52 fallback remains a direct terminal write.
+func CopyContext(ctx context.Context, text string, supportsOSC52 bool) (*CopyResult, error) {
 	if text == "" {
 		return nil, fmt.Errorf("no content to copy")
 	}
@@ -28,8 +52,19 @@ func Copy(text string, supportsOSC52 bool) (*CopyResult, error) {
 	lineCount := countLines(text)
 	byteSize := len(text)
 
+	// Over SSH, OSC 52 is the only route to the user's clipboard.
+	if supportsOSC52 && overSSH() {
+		if err := osc52WriteFn(text); err == nil {
+			return &CopyResult{
+				Method:    "osc52",
+				ByteSize:  byteSize,
+				LineCount: lineCount,
+			}, nil
+		}
+	}
+
 	// Try native clipboard command first
-	method, err := copyNative(text)
+	method, err := nativeCopyFn(ctx, text)
 	if err == nil {
 		return &CopyResult{
 			Method:    method,
@@ -40,7 +75,7 @@ func Copy(text string, supportsOSC52 bool) (*CopyResult, error) {
 
 	// Fall back to OSC 52 if terminal supports it
 	if supportsOSC52 {
-		if err := copyOSC52(text); err != nil {
+		if err := osc52WriteFn(text); err != nil {
 			return nil, fmt.Errorf("OSC 52 clipboard failed: %w", err)
 		}
 		return &CopyResult{
@@ -53,31 +88,41 @@ func Copy(text string, supportsOSC52 bool) (*CopyResult, error) {
 	return nil, fmt.Errorf("no clipboard method available (install pbcopy, xclip, xsel, or wl-copy)")
 }
 
+// CopyOSC52 copies text only through the OSC 52 escape sequence, i.e. to the
+// clipboard of the terminal the user is looking at (also over SSH). The
+// terminal may ignore the sequence, so success means "sent", not "stored".
+func CopyOSC52(text string) error {
+	if text == "" {
+		return fmt.Errorf("no content to copy")
+	}
+	return osc52WriteFn(text)
+}
+
 // copyNative attempts to copy using a platform-native clipboard command.
 // Returns the method name on success.
-func copyNative(text string) (string, error) {
+func copyNative(ctx context.Context, text string) (string, error) {
 	p := platform.Detect()
 
 	switch p {
 	case platform.PlatformMacOS:
-		return "pbcopy", runClipCmd("pbcopy", nil, text)
+		return "pbcopy", runClipCmd(ctx, "pbcopy", nil, text)
 
 	case platform.PlatformWSL1, platform.PlatformWSL2:
-		return "clip.exe", runClipCmd("clip.exe", nil, text)
+		return "clip.exe", runClipCmd(ctx, "clip.exe", nil, text)
 
 	case platform.PlatformLinux:
 		// Wayland takes priority over X11
 		if os.Getenv("WAYLAND_DISPLAY") != "" {
 			if path, err := exec.LookPath("wl-copy"); err == nil {
-				return "wl-copy", runClipCmd(path, nil, text)
+				return "wl-copy", runClipCmd(ctx, path, nil, text)
 			}
 		}
 		// X11: try xclip first, then xsel
 		if path, err := exec.LookPath("xclip"); err == nil {
-			return "xclip", runClipCmd(path, []string{"-selection", "clipboard"}, text)
+			return "xclip", runClipCmd(ctx, path, []string{"-selection", "clipboard"}, text)
 		}
 		if path, err := exec.LookPath("xsel"); err == nil {
-			return "xsel", runClipCmd(path, []string{"--clipboard", "--input"}, text)
+			return "xsel", runClipCmd(ctx, path, []string{"--clipboard", "--input"}, text)
 		}
 		return "", fmt.Errorf("no clipboard command found on Linux")
 
@@ -87,15 +132,15 @@ func copyNative(text string) (string, error) {
 }
 
 // runClipCmd executes a clipboard command, piping text to its stdin.
-func runClipCmd(name string, args []string, text string) error {
-	cmd := exec.Command(name, args...)
+func runClipCmd(ctx context.Context, name string, args []string, text string) error {
+	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Stdin = strings.NewReader(text)
 	return cmd.Run()
 }
 
 // copyOSC52 copies text using the OSC 52 terminal escape sequence.
 // Inside tmux, wraps the sequence in a DCS passthrough.
-func copyOSC52(text string) error {
+func copyOSC52(text string) (err error) {
 	encoded := base64.StdEncoding.EncodeToString([]byte(text))
 	seq := generateOSC52(encoded, os.Getenv("TMUX") != "")
 
@@ -104,19 +149,34 @@ func copyOSC52(text string) error {
 	if err != nil {
 		return fmt.Errorf("cannot open /dev/tty: %w", err)
 	}
-	defer tty.Close()
+	defer func() {
+		if cerr := tty.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
 
 	_, err = tty.WriteString(seq)
 	return err
 }
 
 // generateOSC52 builds the OSC 52 escape sequence.
-// If inTmux is true, wraps it in a DCS passthrough for tmux compatibility.
+//
+// Inside tmux it sends the sequence twice, plain and wrapped in a DCS
+// passthrough, because each form needs a different tmux option and either
+// may be off:
+//   - plain OSC 52 reaches the attached terminals only with set-clipboard on
+//     (tmux's default "external" drops it);
+//   - the DCS form reaches them only with allow-passthrough on for the pane
+//     the TUI runs in (default off; agent-deck turns it on only in the panes
+//     it creates).
+//
+// Both carry the same text, so a terminal that gets both just sets its
+// clipboard twice. Claude Code does the same inside tmux.
 func generateOSC52(base64Content string, inTmux bool) string {
 	osc := "\x1b]52;c;" + base64Content + "\x07"
 	if inTmux {
 		// tmux DCS passthrough: \ePtmux;\e{OSC}\e\\
-		return "\x1bPtmux;\x1b" + osc + "\x1b\\"
+		return osc + "\x1bPtmux;\x1b" + osc + "\x1b\\"
 	}
 	return osc
 }
