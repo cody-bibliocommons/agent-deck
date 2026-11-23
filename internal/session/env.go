@@ -683,6 +683,8 @@ func (i *Instance) getToolEnvFile() string {
 		return config.Muse.EnvFile
 	case "omp":
 		return config.OMP.EnvFile
+	case "kiro-cli":
+		return config.Kiro.EnvFile
 	case "cursor":
 		return config.Cursor.EnvFile
 	case "hermes":

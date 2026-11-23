@@ -140,3 +140,18 @@ func TestKiroBuiltin(t *testing.T) {
 		t.Errorf("build(non-kiro) = %q, want \"claude\"", got)
 	}
 }
+
+// [kiro-cli].env_file is documented on KiroSettings but was never returned by
+// getToolEnvFile, so it was silently ignored at launch.
+func TestGetToolEnvFile_Kiro(t *testing.T) {
+	oldCache := userConfigCache
+	defer func() { userConfigCache = oldCache }()
+	userConfigCache = &UserConfig{
+		Kiro: KiroSettings{EnvFile: "/tmp/kiro.env"},
+	}
+
+	inst := &Instance{Tool: "kiro-cli"}
+	if got := inst.getToolEnvFile(); got != "/tmp/kiro.env" {
+		t.Errorf("getToolEnvFile() for kiro-cli = %q, want %q", got, "/tmp/kiro.env")
+	}
+}
