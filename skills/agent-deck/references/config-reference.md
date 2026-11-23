@@ -17,6 +17,7 @@ All options for `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/ag
 - [[cursor] Section](#cursor-section)
 - [[hermes] Section](#hermes-section)
 - [[muse] Section](#muse-section)
+- [[kiro-cli] Section](#kiro-cli-section)
 - [[docker] Section](#docker-section)
 - [[worktree] Section](#worktree-section)
 - [[fork] Section](#fork-section)
@@ -446,6 +447,31 @@ yolo_mode = false
 This command override applies to fresh launches and restart-resume. An explicit per-session `yolo_mode = false` overrides a global `yolo_mode = true`.
 
 Status detection: pane content patterns (busy `◈ Thinking (… · esc to interrupt)`, idle prompt placeholder). Restart re-discovers the workspace's newest session in the muse store (`~/.local/share/muse/sessions`, `runtime.session.metadata` workspace binding) and resumes it via `muse resume <uuid>`; a pruned store boots fresh. Plain `start` always boots a fresh session, never resumes.
+
+## [kiro-cli] Section
+
+Kiro CLI (AWS) integration settings. The tool is named `kiro-cli` after its binary; a `kiro` shell alias is still recognised as Kiro CLI when it appears in a command.
+
+```toml
+[kiro-cli]
+command = "kiro-cli chat"
+env_file = "~/.kiro.env"
+agent = "my-agent"
+trust_all_tools = false
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `command` | string | `"kiro-cli chat"` | Override the binary/invocation. Keep the `chat` subcommand: bare `kiro-cli` opens a help/menu screen, not an agent. |
+| `env_file` | string | `""` | A .env file sourced for Kiro CLI sessions only. See [Path Resolution](#path-resolution). |
+| `agent` | string | `""` | Maps to `kiro-cli chat --agent <name>` (start with a specific agent/context profile). |
+| `trust_all_tools` | bool | `false` | Maps to `kiro-cli chat --trust-all-tools` (run tools without confirmation prompts). |
+
+`agent` and `trust_all_tools` are appended to the configured `command`. A per-session custom command is used verbatim and does not receive them.
+
+Restart resumes the directory's most recent conversation by adding `--resume` (Kiro CLI scopes conversations by working directory, so no session ID is stored). It is added only when the command runs the `chat` subcommand and does not already pass `--resume`, including for a per-session custom command. Plain `start` always begins a new conversation.
+
+Status detection: pane content patterns (busy `Kiro is working`, `esc to cancel`, `Type to steer`, `Ctrl+S to queue`, or a braille spinner followed by `Thinking`; idle input placeholder `ask a question or describe a task`).
 
 ## [docker] Section
 
